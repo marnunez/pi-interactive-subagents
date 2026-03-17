@@ -1,4 +1,7 @@
-import { execSync } from "node:child_process";
+import { execSync, execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 import { basename } from "node:path";
 
 export function isCmuxAvailable(): boolean {
@@ -79,13 +82,26 @@ export function sendCommand(surface: string, command: string): void {
 }
 
 /**
- * Read the screen contents of a cmux surface.
+ * Read the screen contents of a cmux surface (sync).
  */
 export function readScreen(surface: string, lines = 50): string {
   return execSync(
     `cmux read-screen --surface ${shellEscape(surface)} --lines ${lines}`,
     { encoding: "utf8" }
   );
+}
+
+/**
+ * Read the screen contents of a cmux surface (async).
+ * Does not block the event loop, so UI updates (setStatus, etc.) can render.
+ */
+export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
+  const { stdout } = await execFileAsync(
+    "cmux",
+    ["read-screen", "--surface", surface, "--lines", String(lines)],
+    { encoding: "utf8" }
+  );
+  return stdout;
 }
 
 /**
@@ -114,7 +130,7 @@ export async function pollForExit(
       throw new Error("Aborted while waiting for subagent to finish");
     }
 
-    const screen = readScreen(surface, 5);
+    const screen = await readScreenAsync(surface, 5);
     const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
     if (match) {
       return parseInt(match[1], 10);

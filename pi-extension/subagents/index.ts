@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { Text } from "@mariozechner/pi-tui";
 import { basename, dirname, join } from "node:path";
@@ -304,12 +305,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Send to surface
         sendCommand(surface, command);
 
-        // Emit initial progress and yield to the event loop so pi can
-        // render it before we enter the blocking poll loop.
-        // Without this await, process.nextTick renders never fire because
-        // the setup code is fully synchronous.
-        const skillDesc = skillNames.length > 0 ? ` · skills: ${skillNames.join(", ")}` : "";
-        const contextDesc = `${artifactName} (${formatBytes(contextBytes)})${skillDesc}`;
+        // Emit progress via onUpdate so renderResult(isPartial) can show it.
+        // This works now because pollForExit uses async readScreen, keeping
+        // the event loop free for process.nextTick renders.
         onUpdate?.({
           content: [{ type: "text", text: "starting…" }],
           details: {
@@ -317,15 +315,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             interactive,
             task: params.task,
             startTime,
-            phase: "starting",
-            contextDesc,
+            contextBytes,
           },
         });
-        await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
         // Poll for exit
         const interval = interactive ? 3000 : 1000;
-        let sessionDetected = false;
 
         const exitCode = await pollForExit(surface, signal ?? new AbortController().signal, {
           interval,
@@ -333,33 +328,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             const elapsed = formatElapsed(Math.floor((Date.now() - startTime) / 1000));
             const progress = measureSessionProgress(sessionDir, existingSessionFiles, forkedSessionFile);
 
-            if (progress) {
-              sessionDetected = true;
-              onUpdate?.({
-                content: [{ type: "text", text: `${elapsed} elapsed` }],
-                details: {
-                  name: params.name,
-                  interactive,
-                  task: params.task,
-                  startTime,
-                  phase: "running",
-                  sessionEntries: progress.entries,
-                  sessionBytes: progress.bytes,
-                },
-              });
-            } else {
-              onUpdate?.({
-                content: [{ type: "text", text: `${elapsed} elapsed` }],
-                details: {
-                  name: params.name,
-                  interactive,
-                  task: params.task,
-                  startTime,
-                  phase: "loading",
-                  contextDesc,
-                },
-              });
-            }
+            onUpdate?.({
+              content: [{ type: "text", text: `${elapsed} elapsed` }],
+              details: {
+                name: params.name,
+                interactive,
+                task: params.task,
+                startTime,
+                contextBytes,
+                sessionEntries: progress?.entries,
+                sessionBytes: progress?.bytes,
+              },
+            });
           },
         });
 
@@ -410,6 +390,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           content: [{ type: "text", text: resultText }],
           details: {
             name: params.name,
+            task: params.task,
             sessionFile: subSessionFile?.path,
             interactive,
             exitCode,
@@ -425,7 +406,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }
           surface = null;
         }
-
         if (signal?.aborted) {
           return {
             content: [{ type: "text", text: "Subagent cancelled." }],
@@ -445,10 +425,29 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const interactive = args.interactive !== false;
       const icon = interactive ? "▸" : "▹";
       const mode = interactive ? "interactive session" : "autonomous";
-      const text =
+      const agent = args.agent ? theme.fg("dim", ` (${args.agent})`) : "";
+      let text =
         `${icon} ` +
         theme.fg("toolTitle", theme.bold(args.name ?? "(unnamed)")) +
-        theme.fg("dim", ` — ${mode}`);
+        theme.fg("dim", ` — ${mode}`) +
+        agent;
+
+      // Show a one-line task preview. renderCall is called repeatedly as the
+      // LLM generates tool arguments, so args.task grows token by token.
+      // We keep it compact here — Ctrl+O on renderResult expands the full content.
+      const task = args.task ?? "";
+      if (task) {
+        const firstLine = task.split("\n").find((l: string) => l.trim()) ?? "";
+        const preview = firstLine.length > 100 ? firstLine.slice(0, 100) + "…" : firstLine;
+        if (preview) {
+          text += "\n" + theme.fg("toolOutput", preview);
+        }
+        const totalLines = task.split("\n").length;
+        if (totalLines > 1) {
+          text += theme.fg("muted", ` (${totalLines} lines)`);
+        }
+      }
+
       return new Text(text, 0, 0);
     },
 
@@ -458,29 +457,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const interactive = details?.interactive !== false;
 
       if (isPartial) {
-        // renderCall is always shown above — don't repeat name/icon here.
-        // Just show progress details below the call line.
         const startTime: number | undefined = details?.startTime;
-        const phase: string | undefined = details?.phase;
         const sessionEntries: number | undefined = details?.sessionEntries;
         const sessionBytes: number | undefined = details?.sessionBytes;
-        const contextDesc: string | undefined = details?.contextDesc;
 
         const elapsedText = startTime
           ? formatElapsed(Math.floor((Date.now() - startTime) / 1000))
           : "…";
 
-        // Build progress line with phase-appropriate info
         let progressParts: string[] = [elapsedText];
-        if (phase === "starting" || phase === "loading") {
-          // Before the session file appears — show context size so user
-          // knows work is happening
-          if (contextDesc) {
-            progressParts.push(contextDesc);
-          }
-          progressParts.push(phase === "starting" ? "starting…" : "loading…");
-        } else if (sessionEntries != null && sessionBytes != null) {
-          progressParts.push(`${sessionEntries} messages (${formatBytes(sessionBytes)})`);
+        if (sessionEntries != null && sessionBytes != null) {
+          progressParts.push(`${sessionEntries} msgs (${formatBytes(sessionBytes)})`);
+        } else {
+          progressParts.push("loading…");
         }
 
         let text = theme.fg("dim", progressParts.join(" · "));
@@ -513,23 +502,38 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       // Strip session path from summary for the preview (it's shown separately)
       const sessionPath: string | undefined = details?.sessionFile;
       const cleanSummary = summaryText.replace(/\n\nSession: .+\nResume: .+$/, "").replace(/\n\nSession: .+$/, "");
-      const preview =
-        expanded || cleanSummary.length <= 120
-          ? cleanSummary
-          : cleanSummary.slice(0, 120) + "…";
 
-      const sessionLine = sessionPath
-        ? "\n" + theme.fg("dim", `Session: ${sessionPath}`) +
-          "\n" + theme.fg("dim", `Resume:  pi --session ${sessionPath}`)
-        : "";
-
-      const text =
+      let text =
         theme.fg("success", "✓") +
         " " +
         theme.fg("toolTitle", theme.bold(name)) +
-        theme.fg("dim", ` — completed (${elapsed})`) +
-        (preview ? "\n" + theme.fg("text", preview) : "") +
-        sessionLine;
+        theme.fg("dim", ` — completed (${elapsed})`);
+
+      if (expanded) {
+        // Full view: task + summary + session info
+        const task: string | undefined = details?.task;
+        if (task) {
+          text += "\n" + theme.fg("dim", "─── task ───");
+          text += "\n" + theme.fg("toolOutput", task);
+          text += "\n" + theme.fg("dim", "─── result ───");
+        }
+        if (cleanSummary) {
+          text += "\n" + theme.fg("text", cleanSummary);
+        }
+        if (sessionPath) {
+          text += "\n" + theme.fg("dim", `Session: ${sessionPath}`);
+          text += "\n" + theme.fg("dim", `Resume:  pi --session ${sessionPath}`);
+        }
+      } else {
+        // Collapsed: one-line preview + expand hint
+        const preview = cleanSummary.length > 120
+          ? cleanSummary.slice(0, 120) + "…"
+          : cleanSummary;
+        if (preview) {
+          text += "\n" + theme.fg("text", preview);
+        }
+        text += " " + theme.fg("muted", `(${keyHint("expandTools", "to expand")})`);
+      }
 
       return new Text(text, 0, 0);
     },
@@ -674,22 +678,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const name = details?.name ?? "Resume";
 
       if (isPartial) {
-        // renderCall is always shown above — just show progress here.
-        const startTime: number | undefined = details?.startTime;
-        const sessionEntries: number | undefined = details?.sessionEntries;
-        const sessionBytes: number | undefined = details?.sessionBytes;
-        const elapsedText = startTime
-          ? formatElapsed(Math.floor((Date.now() - startTime) / 1000))
-          : "running…";
-
-        let progressParts: string[] = [elapsedText];
-        if (sessionEntries != null && sessionBytes != null) {
-          progressParts.push(`${sessionEntries} messages (${formatBytes(sessionBytes)})`);
-        }
-
-        let text = theme.fg("dim", progressParts.join(" · "));
-        text +=
-          "\n" +
+        const text =
           theme.fg("accent", `Switch to the "${name}" terminal. `) +
           theme.fg("dim", "Exit (Ctrl+D) to return.");
         return new Text(text, 0, 0);
