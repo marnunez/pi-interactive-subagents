@@ -16,7 +16,7 @@ import {
   mergeNewEntries,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape, isCmuxAvailable } from "../pi-extension/subagents/cmux.ts";
+import { shellEscape, isCmuxAvailable, isWezTermAvailable } from "../pi-extension/subagents/cmux.ts";
 import {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
@@ -398,6 +398,13 @@ describe("cmux.ts", () => {
     it("returns boolean based on CMUX_SOCKET_PATH", () => {
       // Can't easily mock env in node:test, just verify it returns a boolean
       const result = isCmuxAvailable();
+      assert.equal(typeof result, "boolean");
+    });
+  });
+
+  describe("isWezTermAvailable", () => {
+    it("returns boolean based on WEZTERM_UNIX_SOCKET", () => {
+      const result = isWezTermAvailable();
       assert.equal(typeof result, "boolean");
     });
   });

@@ -6,7 +6,7 @@ import { basename, join } from "node:path";
 
 const execFileAsync = promisify(execFile);
 
-export type MuxBackend = "cmux" | "tmux" | "zellij";
+export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm";
 
 const commandAvailability = new Map<string, boolean>();
 
@@ -29,7 +29,7 @@ function hasCommand(command: string): boolean {
 
 function muxPreference(): MuxBackend | null {
   const pref = (process.env.PI_SUBAGENT_MUX ?? "").trim().toLowerCase();
-  if (pref === "cmux" || pref === "tmux" || pref === "zellij") return pref;
+  if (pref === "cmux" || pref === "tmux" || pref === "zellij" || pref === "wezterm") return pref;
   return null;
 }
 
@@ -45,6 +45,10 @@ function isZellijRuntimeAvailable(): boolean {
   return !!(process.env.ZELLIJ || process.env.ZELLIJ_SESSION_NAME) && hasCommand("zellij");
 }
 
+function isWezTermRuntimeAvailable(): boolean {
+  return !!process.env.WEZTERM_UNIX_SOCKET && hasCommand("wezterm");
+}
+
 export function isCmuxAvailable(): boolean {
   return isCmuxRuntimeAvailable();
 }
@@ -57,15 +61,21 @@ export function isZellijAvailable(): boolean {
   return isZellijRuntimeAvailable();
 }
 
+export function isWezTermAvailable(): boolean {
+  return isWezTermRuntimeAvailable();
+}
+
 export function getMuxBackend(): MuxBackend | null {
   const pref = muxPreference();
   if (pref === "cmux") return isCmuxRuntimeAvailable() ? "cmux" : null;
   if (pref === "tmux") return isTmuxRuntimeAvailable() ? "tmux" : null;
   if (pref === "zellij") return isZellijRuntimeAvailable() ? "zellij" : null;
+  if (pref === "wezterm") return isWezTermRuntimeAvailable() ? "wezterm" : null;
 
   if (isCmuxRuntimeAvailable()) return "cmux";
   if (isTmuxRuntimeAvailable()) return "tmux";
   if (isZellijRuntimeAvailable()) return "zellij";
+  if (isWezTermRuntimeAvailable()) return "wezterm";
   return null;
 }
 
@@ -84,7 +94,10 @@ export function muxSetupHint(): string {
   if (pref === "zellij") {
     return "Start pi inside zellij (`zellij --session pi`, then run `pi`).";
   }
-  return "Start pi inside cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), or zellij (`zellij --session pi`, then run `pi`).";
+  if (pref === "wezterm") {
+    return "Start pi inside WezTerm.";
+  }
+  return "Start pi inside cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), or WezTerm.";
 }
 
 function requireMuxBackend(): MuxBackend {
@@ -162,7 +175,7 @@ async function zellijActionAsync(args: string[], surface?: string): Promise<stri
 
 /**
  * Create a new terminal pane as a right split and set its title.
- * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij).
+ * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
  */
 export function createSurface(name: string): string {
   return createSurfaceSplit(name, "right");
@@ -170,7 +183,7 @@ export function createSurface(name: string): string {
 
 /**
  * Create a new split in the given direction from an optional source pane.
- * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij).
+ * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
  */
 export function createSurfaceSplit(
   name: string,
@@ -221,6 +234,30 @@ export function createSurfaceSplit(
       // Optional.
     }
     return pane;
+  }
+
+  if (backend === "wezterm") {
+    const args = ["cli", "split-pane"];
+    if (direction === "left") args.push("--left");
+    else if (direction === "right") args.push("--right");
+    else if (direction === "top") args.push("--top");
+    else args.push("--bottom");
+    args.push("--cwd", process.cwd());
+    if (fromSurface) {
+      args.push("--pane-id", fromSurface);
+    }
+    const paneId = execFileSync("wezterm", args, { encoding: "utf8" }).trim();
+    if (!paneId || !/^\d+$/.test(paneId)) {
+      throw new Error(`Unexpected wezterm split-pane output: ${paneId || "(empty)"}`);
+    }
+    try {
+      execFileSync("wezterm", ["cli", "set-tab-title", "--pane-id", paneId, name], {
+        encoding: "utf8",
+      });
+    } catch {
+      // Optional — tab title is cosmetic.
+    }
+    return paneId;
   }
 
   // zellij
@@ -300,6 +337,15 @@ export function renameCurrentTab(title: string): void {
     return;
   }
 
+  if (backend === "wezterm") {
+    const paneId = process.env.WEZTERM_PANE;
+    const args = ["cli", "set-tab-title"];
+    if (paneId) args.push("--pane-id", paneId);
+    args.push(title);
+    execFileSync("wezterm", args, { encoding: "utf8" });
+    return;
+  }
+
   zellijActionSync(["rename-tab", title]);
 }
 
@@ -334,6 +380,19 @@ export function renameWorkspace(title: string): void {
     return;
   }
 
+  if (backend === "wezterm") {
+    const paneId = process.env.WEZTERM_PANE;
+    const args = ["cli", "set-window-title"];
+    if (paneId) args.push("--pane-id", paneId);
+    args.push(title);
+    try {
+      execFileSync("wezterm", args, { encoding: "utf8" });
+    } catch {
+      // Optional — window title is cosmetic.
+    }
+    return;
+  }
+
   // Skip session rename for zellij. rename-session renames the socket file
   // but the ZELLIJ_SESSION_NAME env var in the parent process keeps the old
   // name, so all subsequent `zellij action ...` CLI calls fail with
@@ -362,6 +421,13 @@ export function sendCommand(surface: string, command: string): void {
     return;
   }
 
+  if (backend === "wezterm") {
+    execFileSync("wezterm", ["cli", "send-text", "--pane-id", surface, "--no-paste", command + "\n"], {
+      encoding: "utf8",
+    });
+    return;
+  }
+
   zellijActionSync(["write-chars", command], surface);
   zellijActionSync(["write", "13"], surface);
 }
@@ -386,6 +452,15 @@ export function readScreen(surface: string, lines = 50): string {
         encoding: "utf8",
       },
     );
+  }
+
+  if (backend === "wezterm") {
+    const raw = execFileSync(
+      "wezterm",
+      ["cli", "get-text", "--pane-id", surface],
+      { encoding: "utf8" },
+    );
+    return tailLines(raw, lines);
   }
 
   // Zellij 0.44+: use --pane-id flag + stdout instead of env var + temp file.
@@ -424,6 +499,15 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
     return stdout;
   }
 
+  if (backend === "wezterm") {
+    const { stdout } = await execFileAsync(
+      "wezterm",
+      ["cli", "get-text", "--pane-id", surface],
+      { encoding: "utf8" },
+    );
+    return tailLines(stdout, lines);
+  }
+
   // Zellij 0.44+: use --pane-id flag + stdout instead of env var + temp file.
   const paneId = zellijPaneId(surface);
   const { stdout } = await execFileAsync(
@@ -449,6 +533,13 @@ export function closeSurface(surface: string): void {
 
   if (backend === "tmux") {
     execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
+    return;
+  }
+
+  if (backend === "wezterm") {
+    execFileSync("wezterm", ["cli", "kill-pane", "--pane-id", surface], {
+      encoding: "utf8",
+    });
     return;
   }
 
