@@ -425,7 +425,11 @@ async function launchSubagent(
     : `As your FIRST action, set the tab title using set_tab_title. ` +
       `The title MUST start with [${agentType}] followed by a short description of your current task. ` +
       `Example: "[${agentType}] Analyzing auth module". Keep it concise.`;
-  const identity = agentDefs?.body ?? params.systemPrompt ?? null;
+  // Combine agent body and user-provided systemPrompt (both are optional).
+  // The agent body provides the base role/identity; systemPrompt layers on
+  // additional instructions from the caller.
+  const identityParts = [agentDefs?.body, params.systemPrompt].filter(Boolean);
+  const identity = identityParts.length > 0 ? identityParts.join("\n\n") : null;
   const roleBlock = identity ? `\n\n${identity}` : "";
   const fullTask = params.fork
     ? params.task
@@ -435,9 +439,10 @@ async function launchSubagent(
   const parts: string[] = ["pi"];
   parts.push("--session", shellEscape(subagentSessionFile));
 
-  // For fork mode, create a clean copy of the session that excludes
-  // the "Use subagent..." meta-message and tool call that triggered this.
-  // The forked session sees only the original conversation + the user's actual task.
+  // For fork mode, create a clean copy of the parent session (excluding
+  // the meta-message that triggered this) and write it directly to the
+  // subagent's session file. Using --session with pre-populated history
+  // is equivalent to a fork and avoids the --fork + --session conflict.
   let forkCleanupFile: string | undefined;
   if (params.fork) {
     const raw = readFileSync(sessionFile, "utf8");
@@ -457,9 +462,10 @@ async function launchSubagent(
     }
 
     const cleanLines = lines.slice(0, truncateAt);
-    forkCleanupFile = join(tmpdir(), `pi-fork-clean-${Date.now()}.jsonl`);
-    writeFileSync(forkCleanupFile, cleanLines.join("\n") + "\n", "utf8");
-    parts.push("--fork", shellEscape(forkCleanupFile));
+    // Write the cleaned history directly into the subagent session file.
+    // pi will open it via --session and see the full prior conversation.
+    mkdirSync(dirname(subagentSessionFile), { recursive: true });
+    writeFileSync(subagentSessionFile, cleanLines.join("\n") + "\n", "utf8");
   }
 
   const subagentDonePath = join(dirname(new URL(import.meta.url).pathname), "subagent-done.ts");
