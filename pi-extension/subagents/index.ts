@@ -73,7 +73,7 @@ interface AgentDefaults {
 }
 
 /** Tools that are gated by `spawning: false` */
-const SPAWNING_TOOLS = new Set(["subagent", "subagents_list", "subagent_resume"]);
+const SPAWNING_TOOLS = new Set(["subagent", "subagents_list", "subagent_resume", "subagent_kill"]);
 
 /**
  * Resolve the effective set of denied tool names from agent defaults.
@@ -371,7 +371,7 @@ function startWidgetRefresh() {
  */
 async function launchSubagent(
   params: typeof SubagentParams.static,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string }; cwd: string },
+  ctx: { sessionManager: { getSessionFile(): string | undefined; getSessionId(): string }; cwd: string },
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
@@ -847,7 +847,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Fallback (shouldn't happen)
-        const text = typeof result.content?.[0]?.text === "string" ? result.content[0].text : "";
+        const first = result.content?.[0];
+        const text = first && "text" in first ? first.text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
     });
@@ -957,7 +958,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }),
       }),
 
-      async execute(_toolCallId, params) {
+      async execute(_toolCallId, params): Promise<any> {
         if (!isMuxAvailable()) {
           return muxUnavailableResult("tab-title");
         }
@@ -965,12 +966,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           renameCurrentTab(params.title);
           renameWorkspace(params.title);
           return {
-            content: [{ type: "text", text: `Title set to: ${params.title}` }],
+            content: [{ type: "text" as const, text: `Title set to: ${params.title}` }],
             details: { title: params.title },
           };
         } catch (err: any) {
           return {
-            content: [{ type: "text", text: `Failed to set title: ${err?.message}` }],
+            content: [{ type: "text" as const, text: `Failed to set title: ${err?.message}` }],
             details: { error: err?.message },
           };
         }
@@ -1027,7 +1028,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Fallback
-        const text = typeof result.content?.[0]?.text === "string" ? result.content[0].text : "";
+        const first = result.content?.[0];
+        const text = first && "text" in first ? first.text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
 
@@ -1139,6 +1141,150 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
+  // ── subagent_kill tool ──
+  if (shouldRegister("subagent_kill"))
+    pi.registerTool({
+      name: "subagent_kill",
+      label: "Kill Subagent",
+      description:
+        "Kill one or all running sub-agents. Use without parameters to list running sub-agents. " +
+        "Pass an id or name to kill a specific one, or 'all' to kill them all.",
+      promptSnippet:
+        "Kill one or all running sub-agents. Use without parameters to list running sub-agents. " +
+        "Pass an id or name to kill a specific one, or 'all' to kill them all.",
+      parameters: Type.Object({
+        target: Type.Optional(
+          Type.String({
+            description:
+              "Subagent to kill: an id, a name (case-insensitive partial match), or 'all'. Omit to list running subagents.",
+          }),
+        ),
+      }),
+
+      renderCall(args, theme) {
+        const target = args.target ?? "(list)";
+        return new Text(
+          "▸ " + theme.fg("toolTitle", theme.bold("Kill Subagent")) + theme.fg("dim", ` — ${target}`),
+          0,
+          0,
+        );
+      },
+
+      renderResult(result, _opts, theme) {
+        const first = result.content?.[0];
+        const text = first && "text" in first ? first.text : "";
+        const details = result.details as any;
+        if (details?.killed) {
+          const names = details.killed.map((k: any) => k.name).join(", ");
+          return new Text(
+            theme.fg("error", "✗") + " Killed: " + theme.fg("toolTitle", names),
+            0,
+            0,
+          );
+        }
+        return new Text(theme.fg("dim", text), 0, 0);
+      },
+
+      async execute(_toolCallId, params) {
+        const agents = Array.from(runningSubagents.values());
+
+        // No target: list running subagents
+        if (!params.target) {
+          if (agents.length === 0) {
+            return {
+              content: [{ type: "text", text: "No sub-agents currently running." }],
+              details: { running: [] },
+            };
+          }
+          const lines = agents.map((a) => {
+            const elapsed = formatElapsedMMSS(a.startTime);
+            const agentTag = a.agent ? ` (${a.agent})` : "";
+            return `• ${a.name}${agentTag} [id: ${a.id}] — running for ${elapsed}`;
+          });
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Running sub-agents (${agents.length}):\n${lines.join("\n")}\n\nPass a name, id, or 'all' to kill.`,
+              },
+            ],
+            details: {
+              running: agents.map((a) => ({ id: a.id, name: a.name, agent: a.agent })),
+            },
+          };
+        }
+
+        // Resolve targets
+        let targets: RunningSubagent[];
+        if (params.target.toLowerCase() === "all") {
+          targets = agents;
+        } else {
+          const query = params.target.toLowerCase();
+          targets = agents.filter(
+            (a) =>
+              a.id === params.target ||
+              a.name.toLowerCase().includes(query) ||
+              (a.agent && a.agent.toLowerCase().includes(query)),
+          );
+        }
+
+        if (targets.length === 0) {
+          const available =
+            agents.length > 0
+              ? `\nRunning: ${agents.map((a) => `${a.name} [${a.id}]`).join(", ")}`
+              : "\nNo sub-agents currently running.";
+          return {
+            content: [
+              {
+                type: "text",
+                text: `No sub-agent matching "${params.target}".${available}`,
+              },
+            ],
+            details: { error: "not found" },
+          };
+        }
+
+        // Kill each target
+        const killed: { id: string; name: string; agent?: string; elapsed: number }[] = [];
+        for (const agent of targets) {
+          const elapsed = Math.floor((Date.now() - agent.startTime) / 1000);
+          // Abort the watcher (triggers cleanup in watchSubagent catch block)
+          agent.abortController?.abort();
+          // Close the mux pane
+          try {
+            closeSurface(agent.surface);
+          } catch {}
+          // Clean up fork temp file
+          if (agent.forkCleanupFile) {
+            try {
+              unlinkSync(agent.forkCleanupFile);
+            } catch {}
+          }
+          runningSubagents.delete(agent.id);
+          killed.push({ id: agent.id, name: agent.name, agent: agent.agent, elapsed });
+        }
+
+        updateWidget();
+
+        const summary = killed
+          .map((k) => {
+            const agentTag = k.agent ? ` (${k.agent})` : "";
+            return `• ${k.name}${agentTag} — killed after ${formatElapsed(k.elapsed)}`;
+          })
+          .join("\n");
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Killed ${killed.length} sub-agent${killed.length !== 1 ? "s" : ""}:\n${summary}`,
+            },
+          ],
+          details: { killed },
+        };
+      },
+    });
+
   // /iterate command — fork the session into a subagent
   pi.registerCommand("iterate", {
     description: "Fork session into a subagent for focused work (bugfixes, iteration)",
@@ -1187,6 +1333,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (!details) return undefined;
 
     return {
+      invalidate() {},
       render(width: number): string[] {
         const name = details.name ?? "subagent";
         const exitCode = details.exitCode ?? 0;
