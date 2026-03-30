@@ -240,7 +240,7 @@ export function createSurfaceSplit(
     const args = ["cli", "split-pane"];
     if (direction === "left") args.push("--left");
     else if (direction === "right") args.push("--right");
-    else if (direction === "top") args.push("--top");
+    else if (direction === "up") args.push("--top");
     else args.push("--bottom");
     args.push("--cwd", process.cwd());
     if (fromSurface) {
