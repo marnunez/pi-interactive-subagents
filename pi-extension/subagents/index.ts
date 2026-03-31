@@ -942,7 +942,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     });
 
   // ── set_tab_title tool ──
-  if (shouldRegister("set_tab_title"))
+  // Only useful for sub-agents reporting progress to the orchestrator.
+  if (shouldRegister("set_tab_title") && !!process.env.PI_SUBAGENT_NAME)
     pi.registerTool({
       name: "set_tab_title",
       label: "Set Tab Title",

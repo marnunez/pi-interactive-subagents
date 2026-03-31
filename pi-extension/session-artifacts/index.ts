@@ -9,6 +9,11 @@ import { homedir } from "node:os";
 const PREVIEW_LINES = 10;
 
 export default function (pi: ExtensionAPI) {
+  const isSubagent = !!process.env.PI_SUBAGENT_NAME;
+
+  // write_artifact is only useful for sub-agents passing results back to the orchestrator.
+  // The main session should communicate directly with the user.
+  if (isSubagent)
   pi.registerTool({
     name: "write_artifact",
     label: "Write Artifact",
@@ -234,6 +239,7 @@ export default function (pi: ExtensionAPI) {
         return {
           content: [{ type: "text", text: msg }],
           isError: true,
+          details: {},
         };
       }
 
