@@ -10,6 +10,9 @@ export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm";
 
 const commandAvailability = new Map<string, boolean>();
 
+/** Track the last WezTerm subagent pane that doesn't have a buddy yet. */
+let unpairedPane: string | null = null;
+
 function hasCommand(command: string): boolean {
   if (commandAvailability.has(command)) {
     return commandAvailability.get(command)!;
@@ -178,6 +181,41 @@ async function zellijActionAsync(args: string[], surface?: string): Promise<stri
  * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
  */
 export function createSurface(name: string): string {
+  const backend = getMuxBackend();
+
+  // WezTerm: use tabs with max 2 panes each
+  if (backend === "wezterm") {
+    // Try to split from an unpaired pane (fill the tab to 2)
+    if (unpairedPane) {
+      try {
+        const args = ["cli", "split-pane", "--right", "--pane-id", unpairedPane, "--cwd", process.cwd()];
+        const paneId = execFileSync("wezterm", args, { encoding: "utf8" }).trim();
+        if (paneId && /^\d+$/.test(paneId)) {
+          unpairedPane = null;
+          try {
+            execFileSync("wezterm", ["cli", "set-tab-title", "--pane-id", paneId, name], { encoding: "utf8" });
+          } catch {}
+          return paneId;
+        }
+      } catch {
+        // Unpaired pane died — fall through to spawn
+        unpairedPane = null;
+      }
+    }
+
+    // Spawn a new tab
+    const paneId = execFileSync("wezterm", ["cli", "spawn", "--cwd", process.cwd()], { encoding: "utf8" }).trim();
+    if (!paneId || !/^\d+$/.test(paneId)) {
+      throw new Error(`Unexpected wezterm spawn output: ${paneId || "(empty)"}`);
+    }
+    unpairedPane = paneId;
+    try {
+      execFileSync("wezterm", ["cli", "set-tab-title", "--pane-id", paneId, name], { encoding: "utf8" });
+    } catch {}
+    return paneId;
+  }
+
+  // Other backends: split right as before
   return createSurfaceSplit(name, "right");
 }
 
@@ -537,6 +575,9 @@ export function closeSurface(surface: string): void {
   }
 
   if (backend === "wezterm") {
+    if (unpairedPane === surface) {
+      unpairedPane = null;
+    }
     execFileSync("wezterm", ["cli", "kill-pane", "--pane-id", surface], {
       encoding: "utf8",
     });
