@@ -10,8 +10,11 @@ export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm";
 
 const commandAvailability = new Map<string, boolean>();
 
-/** Track the last WezTerm subagent pane that doesn't have a buddy yet. */
-let unpairedPane: string | null = null;
+/** Max panes per WezTerm tab before opening a new one. */
+const maxPanesPerTab = Math.max(1, parseInt(process.env.PI_SUBAGENT_MAX_PANES_PER_TAB ?? "2", 10));
+
+/** Panes in the current (not yet full) WezTerm tab. */
+let currentTabPanes: string[] = [];
 
 function hasCommand(command: string): boolean {
   if (commandAvailability.has(command)) {
@@ -183,23 +186,23 @@ async function zellijActionAsync(args: string[], surface?: string): Promise<stri
 export function createSurface(name: string): string {
   const backend = getMuxBackend();
 
-  // WezTerm: use tabs with max 2 panes each
+  // WezTerm: use tabs with max N panes each
   if (backend === "wezterm") {
-    // Try to split from an unpaired pane (fill the tab to 2)
-    if (unpairedPane) {
+    // Try to split into the current tab if it has room
+    if (currentTabPanes.length > 0 && currentTabPanes.length < maxPanesPerTab) {
       try {
-        const args = ["cli", "split-pane", "--right", "--pane-id", unpairedPane, "--cwd", process.cwd()];
+        const args = ["cli", "split-pane", "--right", "--pane-id", currentTabPanes[0], "--cwd", process.cwd()];
         const paneId = execFileSync("wezterm", args, { encoding: "utf8" }).trim();
         if (paneId && /^\d+$/.test(paneId)) {
-          unpairedPane = null;
+          currentTabPanes.push(paneId);
           try {
             execFileSync("wezterm", ["cli", "set-tab-title", "--pane-id", paneId, name], { encoding: "utf8" });
           } catch {}
           return paneId;
         }
       } catch {
-        // Unpaired pane died — fall through to spawn
-        unpairedPane = null;
+        // Pane died — reset and fall through to spawn
+        currentTabPanes = [];
       }
     }
 
@@ -208,7 +211,7 @@ export function createSurface(name: string): string {
     if (!paneId || !/^\d+$/.test(paneId)) {
       throw new Error(`Unexpected wezterm spawn output: ${paneId || "(empty)"}`);
     }
-    unpairedPane = paneId;
+    currentTabPanes = [paneId];
     try {
       execFileSync("wezterm", ["cli", "set-tab-title", "--pane-id", paneId, name], { encoding: "utf8" });
     } catch {}
@@ -575,9 +578,8 @@ export function closeSurface(surface: string): void {
   }
 
   if (backend === "wezterm") {
-    if (unpairedPane === surface) {
-      unpairedPane = null;
-    }
+    const idx = currentTabPanes.indexOf(surface);
+    if (idx !== -1) currentTabPanes.splice(idx, 1);
     execFileSync("wezterm", ["cli", "kill-pane", "--pane-id", surface], {
       encoding: "utf8",
     });
