@@ -10,8 +10,8 @@ export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm";
 
 const commandAvailability = new Map<string, boolean>();
 
-/** Max panes per WezTerm tab before opening a new one. */
-const maxPanesPerTab = Math.max(1, parseInt(process.env.PI_SUBAGENT_MAX_PANES_PER_TAB ?? "2", 10));
+/** Max panes per WezTerm tab. 0 = no tabs, just split right (legacy). Default: 2. */
+const maxPanesPerTab = Math.max(0, parseInt(process.env.PI_SUBAGENT_MAX_PANES_PER_TAB ?? "2", 10));
 
 /** Panes in the current (not yet full) WezTerm tab. */
 let currentTabPanes: string[] = [];
@@ -188,6 +188,11 @@ export function createSurface(name: string): string {
 
   // WezTerm: use tabs with max N panes each
   if (backend === "wezterm") {
+    // 0 = no tabs, split right from current pane (legacy behavior)
+    if (maxPanesPerTab === 0) {
+      return createSurfaceSplit(name, "right");
+    }
+
     // Try to split into the current tab if it has room
     if (currentTabPanes.length > 0 && currentTabPanes.length < maxPanesPerTab) {
       try {
