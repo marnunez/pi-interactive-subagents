@@ -498,12 +498,19 @@ async function launchSubagent(
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
-  // Use pre-created surface (parallel mode) or create a new one.
-  // For new surfaces, pause briefly so the shell is ready before sending the command.
-  const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name);
-  if (!surfacePreCreated) {
-    await new Promise<void>((resolve) => setTimeout(resolve, 500));
+  // Determine workspace mode early — if set, skip mux surface creation entirely.
+  const effectiveWorkspace = params.workspace ?? agentDefs?.workspace ?? null;
+
+  // Use pre-created surface (parallel mode), create a new one, or skip for workspace mode.
+  let surface: string;
+  if (effectiveWorkspace && !options?.surface) {
+    surface = `workspace:${effectiveWorkspace}`; // placeholder, not a real mux surface
+  } else {
+    const surfacePreCreated = !!options?.surface;
+    surface = options?.surface ?? createSurface(params.name);
+    if (!surfacePreCreated) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 500));
+    }
   }
 
   // Build the task message
@@ -642,9 +649,6 @@ async function launchSubagent(
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
-
-  // Determine workspace mode: param overrides agent default
-  const effectiveWorkspace = params.workspace ?? agentDefs?.workspace ?? null;
 
   if (effectiveWorkspace && !options?.surface) {
     // ── Workspace mode: launch in a WezTerm window on a dedicated Sway workspace ──
