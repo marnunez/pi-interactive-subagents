@@ -12,6 +12,7 @@ import {
   mkdirSync,
   unlinkSync,
 } from "node:fs";
+import { ChildProcess, spawn as nodeSpawn, execSync as nodeExecSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import {
   isMuxAvailable,
@@ -58,6 +59,14 @@ const SubagentParams = Type.Object({
         "Fork the current session — sub-agent gets full conversation context. Use for iterate/bugfix patterns.",
     }),
   ),
+  workspace: Type.Optional(
+    Type.String({
+      description:
+        "Launch on a dedicated Sway workspace instead of a mux pane. " +
+        "Value is the workspace name (e.g. '🌐 Browse'). The subagent runs in a " +
+        "WezTerm window on that workspace. Switches back when done.",
+    }),
+  ),
 });
 
 interface AgentDefaults {
@@ -69,6 +78,7 @@ interface AgentDefaults {
   spawning?: boolean;
   autoExit?: boolean;
   cwd?: string;
+  workspace?: string;
   body?: string;
 }
 
@@ -131,6 +141,7 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
       spawning: spawningRaw != null ? spawningRaw === "true" : undefined,
       autoExit: autoExitRaw != null ? autoExitRaw === "true" : undefined,
       cwd: get("cwd"),
+      workspace: get("workspace"),
       body: body || undefined,
     };
   }
@@ -221,6 +232,9 @@ interface RunningSubagent {
   bytes?: number;
   forkCleanupFile?: string;
   abortController?: AbortController;
+  workspace?: string;
+  previousWorkspace?: string;
+  workspaceProcess?: ChildProcess;
 }
 
 /** All currently running subagents, keyed by id. */
@@ -361,6 +375,90 @@ function startWidgetRefresh() {
   widgetInterval = setInterval(() => {
     updateWidget();
   }, 1000);
+}
+
+// ── Sway workspace helpers ──────────────────────────────────────────
+
+function getCurrentSwayWorkspace(): string | null {
+  try {
+    const out = nodeExecSync(`swaymsg -t get_workspaces`, { encoding: "utf8" });
+    const workspaces = JSON.parse(out);
+    const focused = workspaces.find((w: any) => w.focused);
+    return focused?.name ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function switchSwayWorkspace(name: string): void {
+  try { nodeExecSync(`swaymsg workspace "${name}"`, { stdio: "ignore" }); } catch {}
+}
+
+/**
+ * Launch a subagent on a dedicated Sway workspace with a WezTerm window.
+ * Returns the WezTerm process and the command it should run (pi command).
+ */
+function launchWorkspaceSurface(
+  workspaceName: string,
+  name: string,
+  command: string,
+  cwd: string,
+): { process: ChildProcess; previousWorkspace: string | null } {
+  const previousWorkspace = getCurrentSwayWorkspace();
+
+  // Switch to the target workspace
+  switchSwayWorkspace(workspaceName);
+
+  // Launch WezTerm window on this workspace
+  const proc = nodeSpawn("wezterm", [
+    "start",
+    "--class", `pi-subagent-${name.toLowerCase().replace(/[^a-z0-9]/g, "-")}`,
+    "--cwd", cwd,
+    "--",
+    "bash", "-c", command,
+  ], { detached: true, stdio: "ignore" });
+  proc.unref();
+
+  return { process: proc, previousWorkspace };
+}
+
+/**
+ * Poll for a WezTerm process to exit.
+ */
+async function pollProcessExit(
+  proc: ChildProcess,
+  signal: AbortSignal,
+  options: { interval: number; onTick?: () => void },
+): Promise<number> {
+  return new Promise((resolve, reject) => {
+    // If process already exited
+    if (proc.exitCode !== null) {
+      resolve(proc.exitCode);
+      return;
+    }
+
+    const checkInterval = setInterval(() => {
+      if (signal.aborted) {
+        clearInterval(checkInterval);
+        reject(new Error("Aborted"));
+        return;
+      }
+      options.onTick?.();
+      // Check if process is still running
+      try {
+        process.kill(proc.pid!, 0);
+      } catch {
+        // Process is dead
+        clearInterval(checkInterval);
+        resolve(0);
+      }
+    }, options.interval);
+
+    signal.addEventListener("abort", () => {
+      clearInterval(checkInterval);
+      reject(new Error("Aborted"));
+    }, { once: true });
+  });
 }
 
 /**
@@ -544,6 +642,39 @@ async function launchSubagent(
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
+
+  // Determine workspace mode: param overrides agent default
+  const effectiveWorkspace = params.workspace ?? agentDefs?.workspace ?? null;
+
+  if (effectiveWorkspace && !options?.surface) {
+    // ── Workspace mode: launch in a WezTerm window on a dedicated Sway workspace ──
+    const command = `${piCommand}; echo '__SUBAGENT_DONE__'`;
+    const { process: wezProc, previousWorkspace: prevWs } = launchWorkspaceSurface(
+      effectiveWorkspace,
+      params.name,
+      command,
+      effectiveCwd ?? process.cwd(),
+    );
+
+    const running: RunningSubagent = {
+      id,
+      name: params.name,
+      task: params.task,
+      agent: params.agent,
+      surface: `workspace:${effectiveWorkspace}`,
+      startTime,
+      sessionFile: subagentSessionFile,
+      forkCleanupFile,
+      workspace: effectiveWorkspace,
+      previousWorkspace: prevWs ?? undefined,
+      workspaceProcess: wezProc,
+    };
+
+    runningSubagents.set(id, running);
+    return running;
+  }
+
+  // ── Normal mode: multiplexer pane ──
   const command = `${piCommand}; echo '__SUBAGENT_DONE_'${exitStatusVar()}'__'`;
   sendCommand(surface, command);
 
@@ -574,20 +705,39 @@ async function watchSubagent(
   const { name, task, surface, startTime, sessionFile, forkCleanupFile } = running;
 
   try {
-    const exitCode = await pollForExit(surface, signal, {
-      interval: 1000,
-      onTick() {
-        // Update entries/bytes for widget display
-        try {
-          if (existsSync(sessionFile)) {
-            const stat = statSync(sessionFile);
-            const raw = readFileSync(sessionFile, "utf8");
-            running.entries = raw.split("\n").filter((l) => l.trim()).length;
-            running.bytes = stat.size;
-          }
-        } catch {}
-      },
-    });
+    let exitCode: number;
+
+    if (running.workspace && running.workspaceProcess) {
+      // ── Workspace mode: poll the WezTerm process ──
+      exitCode = await pollProcessExit(running.workspaceProcess, signal, {
+        interval: 1000,
+        onTick() {
+          try {
+            if (existsSync(sessionFile)) {
+              const stat = statSync(sessionFile);
+              const raw = readFileSync(sessionFile, "utf8");
+              running.entries = raw.split("\n").filter((l) => l.trim()).length;
+              running.bytes = stat.size;
+            }
+          } catch {}
+        },
+      });
+    } else {
+      // ── Normal mode: poll mux screen for sentinel ──
+      exitCode = await pollForExit(surface, signal, {
+        interval: 1000,
+        onTick() {
+          try {
+            if (existsSync(sessionFile)) {
+              const stat = statSync(sessionFile);
+              const raw = readFileSync(sessionFile, "utf8");
+              running.entries = raw.split("\n").filter((l) => l.trim()).length;
+              running.bytes = stat.size;
+            }
+          } catch {}
+        },
+      });
+    }
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 
@@ -607,7 +757,14 @@ async function watchSubagent(
           : "Sub-agent exited without output";
     }
 
-    closeSurface(surface);
+    // Cleanup: workspace mode switches back, normal mode closes surface
+    if (running.workspace) {
+      if (running.previousWorkspace) {
+        switchSwayWorkspace(running.previousWorkspace);
+      }
+    } else {
+      closeSurface(surface);
+    }
     runningSubagents.delete(running.id);
 
     // Clean up temp fork file
@@ -1251,10 +1408,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const elapsed = Math.floor((Date.now() - agent.startTime) / 1000);
           // Abort the watcher (triggers cleanup in watchSubagent catch block)
           agent.abortController?.abort();
-          // Close the mux pane
-          try {
-            closeSurface(agent.surface);
-          } catch {}
+          // Workspace mode: kill WezTerm process, switch back
+          if (agent.workspace && agent.workspaceProcess) {
+            try { process.kill(agent.workspaceProcess.pid!, "SIGTERM"); } catch {}
+            if (agent.previousWorkspace) switchSwayWorkspace(agent.previousWorkspace);
+          } else {
+            // Close the mux pane
+            try { closeSurface(agent.surface); } catch {}
+          }
           // Clean up fork temp file
           if (agent.forkCleanupFile) {
             try {
