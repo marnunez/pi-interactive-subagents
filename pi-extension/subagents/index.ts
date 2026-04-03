@@ -663,13 +663,15 @@ async function launchSubagent(
     parts.push(`@${artifactPath}`);
   }
 
-  // Resolve cwd — param overrides agent default, supports absolute and relative paths
+  // Resolve cwd — param overrides agent default, supports absolute, relative, and ~ paths
   const rawCwd = params.cwd ?? agentDefs?.cwd ?? null;
-  const effectiveCwd = rawCwd
-    ? rawCwd.startsWith("/")
-      ? rawCwd
-      : join(process.cwd(), rawCwd)
-    : null;
+  let effectiveCwd: string | null = null;
+  if (rawCwd) {
+    const expanded = rawCwd.startsWith("~") ? rawCwd.replace(/^~/, homedir()) : rawCwd;
+    effectiveCwd = expanded.startsWith("/") ? expanded : join(process.cwd(), expanded);
+    // Ensure the directory exists (e.g. sandbox dirs)
+    try { mkdirSync(effectiveCwd, { recursive: true }); } catch {}
+  }
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
