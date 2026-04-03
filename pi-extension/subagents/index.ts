@@ -78,6 +78,7 @@ interface AgentDefaults {
   allowTools?: string;
   spawning?: boolean;
   autoExit?: boolean;
+  maxInstances?: number;
   cwd?: string;
   workspace?: string;
   body?: string;
@@ -160,6 +161,7 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
       thinking: get("thinking"),
       denyTools: get("deny-tools"),
       allowTools: get("allow-tools"),
+      maxInstances: get("max-instances") ? parseInt(get("max-instances")!, 10) : undefined,
       spawning: spawningRaw != null ? spawningRaw === "true" : undefined,
       autoExit: autoExitRaw != null ? autoExitRaw === "true" : undefined,
       cwd: get("cwd"),
@@ -893,6 +895,28 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             ],
             details: { error: "self-spawn blocked" },
           };
+        }
+
+        // Enforce max-instances limit
+        if (params.agent) {
+          const agentDefs = loadAgentDefaults(params.agent);
+          if (agentDefs?.maxInstances != null) {
+            const running = Array.from(runningSubagents.values()).filter(
+              (a) => a.agent === params.agent,
+            );
+            if (running.length >= agentDefs.maxInstances) {
+              const names = running.map((a) => a.name).join(", ");
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Cannot spawn another ${params.agent} agent — max ${agentDefs.maxInstances} instance${agentDefs.maxInstances !== 1 ? "s" : ""} allowed (running: ${names}). Wait for it to finish or kill it first.`,
+                  },
+                ],
+                details: { error: "max-instances reached", running: running.map((a) => a.id) },
+              };
+            }
+          }
         }
 
         // Validate prerequisites
