@@ -75,6 +75,7 @@ interface AgentDefaults {
   skills?: string;
   thinking?: string;
   denyTools?: string;
+  allowTools?: string;
   spawning?: boolean;
   autoExit?: boolean;
   cwd?: string;
@@ -87,19 +88,39 @@ const SPAWNING_TOOLS = new Set(["subagent", "subagents_list", "subagent_resume",
 
 /**
  * Resolve the effective set of denied tool names from agent defaults.
- * `spawning: false` expands to all SPAWNING_TOOLS.
- * `deny-tools` adds individual tool names on top.
+ *
+ * If `allow-tools` is present, it acts as a whitelist: all tools NOT in the
+ * list are denied. This takes priority over `deny-tools`.
+ *
+ * Otherwise, `deny-tools` is used as a blacklist, and `spawning: false`
+ * expands to all SPAWNING_TOOLS.
+ *
+ * @param allToolNames - all currently registered tool names (from pi.getAllTools())
  */
-function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
+function resolveDenyTools(agentDefs: AgentDefaults | null, allToolNames?: string[]): Set<string> {
   const denied = new Set<string>();
   if (!agentDefs) return denied;
+
+  // allow-tools (whitelist) takes priority when present
+  if (agentDefs.allowTools && allToolNames) {
+    const allowed = new Set(
+      agentDefs.allowTools
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
+    );
+    for (const tool of allToolNames) {
+      if (!allowed.has(tool)) denied.add(tool);
+    }
+    return denied;
+  }
 
   // spawning: false → deny all spawning tools
   if (agentDefs.spawning === false) {
     for (const t of SPAWNING_TOOLS) denied.add(t);
   }
 
-  // deny-tools: explicit list
+  // deny-tools: explicit blacklist
   if (agentDefs.denyTools) {
     for (const t of agentDefs.denyTools
       .split(",")
@@ -138,6 +159,7 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
       skills: get("skill") ?? get("skills"),
       thinking: get("thinking"),
       denyTools: get("deny-tools"),
+      allowTools: get("allow-tools"),
       spawning: spawningRaw != null ? spawningRaw === "true" : undefined,
       autoExit: autoExitRaw != null ? autoExitRaw === "true" : undefined,
       cwd: get("cwd"),
@@ -470,7 +492,7 @@ async function pollProcessExit(
 async function launchSubagent(
   params: typeof SubagentParams.static,
   ctx: { sessionManager: { getSessionFile(): string | undefined; getSessionId(): string }; cwd: string },
-  options?: { surface?: string },
+  options?: { surface?: string; allToolNames?: string[] },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
@@ -523,7 +545,7 @@ async function launchSubagent(
   const summaryInstruction = agentDefs?.autoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
-  const denySet = resolveDenyTools(agentDefs);
+  const denySet = resolveDenyTools(agentDefs, options?.allToolNames);
   const agentType = params.agent ?? params.name;
   const tabTitleInstruction = denySet.has("set_tab_title")
     ? ""
@@ -891,7 +913,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Launch the subagent (creates pane, sends command)
-        const running = await launchSubagent(params, ctx);
+        const allToolNames = pi.getAllTools().map((t: any) => t.name);
+        const running = await launchSubagent(params, ctx, { allToolNames });
 
         // Create a separate AbortController for the watcher
         // (the tool's signal completes when we return)
