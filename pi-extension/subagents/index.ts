@@ -81,6 +81,7 @@ interface AgentDefaults {
   maxInstances?: number;
   cwd?: string;
   workspace?: string;
+  env?: string;
   body?: string;
 }
 
@@ -166,6 +167,7 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
       autoExit: autoExitRaw != null ? autoExitRaw === "true" : undefined,
       cwd: get("cwd"),
       workspace: get("workspace"),
+      env: get("env"),
       body: body || undefined,
     };
   }
@@ -636,6 +638,12 @@ async function launchSubagent(
   }
   if (agentDefs?.autoExit) {
     envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
+  }
+  // Custom env vars from agent frontmatter (e.g. "PI_PERMISSION_LEVEL=low PI_FOO=bar")
+  if (agentDefs?.env) {
+    for (const pair of agentDefs.env.split(/\s+/).filter(Boolean)) {
+      if (pair.includes("=")) envParts.push(pair);
+    }
   }
   const envPrefix = envParts.join(" ") + " ";
 
