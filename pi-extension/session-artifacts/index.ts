@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { highlightCode, getLanguageFromPath, keyHint } from "@mariozechner/pi-coding-agent";
+import { highlightCode, getLanguageFromPath, keyHint, defineTool } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
+import { Type } from "@mariozechner/pi-ai";
 import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -14,7 +14,7 @@ export default function (pi: ExtensionAPI) {
   // write_artifact is only useful for sub-agents passing results back to the orchestrator.
   // The main session should communicate directly with the user.
   if (isSubagent)
-  pi.registerTool({
+  pi.registerTool(defineTool({
     name: "write_artifact",
     label: "Write Artifact",
     description:
@@ -112,7 +112,7 @@ export default function (pi: ExtensionAPI) {
         details: { path: filePath, name: params.name, sessionId, content: params.content },
       };
     },
-  });
+  }));
 
   /**
    * Find an artifact by name across all session artifact directories for the current project.
@@ -152,7 +152,7 @@ export default function (pi: ExtensionAPI) {
     return null;
   }
 
-  pi.registerTool({
+  pi.registerTool(defineTool({
     name: "read_artifact",
     label: "Read Artifact",
     description:
@@ -259,7 +259,6 @@ export default function (pi: ExtensionAPI) {
 
         return {
           content: [{ type: "text", text: msg }],
-          isError: true,
           details: {},
         };
       }
@@ -276,5 +275,5 @@ export default function (pi: ExtensionAPI) {
         details: { path: found, name: params.name, sessionId, content },
       };
     },
-  });
+  }));
 }

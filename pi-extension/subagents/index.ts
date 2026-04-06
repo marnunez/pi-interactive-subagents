@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { keyHint } from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { keyHint, defineTool } from "@mariozechner/pi-coding-agent";
+import { Type } from "@mariozechner/pi-ai";
 import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { basename, dirname, join } from "node:path";
 import {
@@ -875,7 +875,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // ── subagent tool ──
   if (shouldRegister("subagent"))
-    pi.registerTool({
+    pi.registerTool(defineTool({
       name: "subagent",
       label: "Subagent",
       description:
@@ -1069,11 +1069,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const text = first && "text" in first ? first.text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
-    });
+    }));
 
   // ── subagents_list tool ──
   if (shouldRegister("subagents_list"))
-    pi.registerTool({
+    pi.registerTool(defineTool({
       name: "subagents_list",
       label: "List Subagents",
       description:
@@ -1157,12 +1157,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         });
         return new Text(lines.join("\n"), 0, 0);
       },
-    });
+    }));
 
   // ── set_tab_title tool ──
   // Only useful for sub-agents reporting progress to the orchestrator.
   if (shouldRegister("set_tab_title") && !!process.env.PI_SUBAGENT_NAME)
-    pi.registerTool({
+    pi.registerTool(defineTool({
       name: "set_tab_title",
       label: "Set Tab Title",
       description:
@@ -1195,11 +1195,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
       },
-    });
+    }));
 
   // ── subagent_resume tool ──
   if (shouldRegister("subagent_resume"))
-    pi.registerTool({
+    pi.registerTool(defineTool({
       name: "subagent_resume",
       label: "Resume Subagent",
       description:
@@ -1358,11 +1358,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           details: { id, name, sessionPath: params.sessionPath, status: "started" },
         };
       },
-    });
+    }));
 
   // ── subagent_kill tool ──
   if (shouldRegister("subagent_kill"))
-    pi.registerTool({
+    pi.registerTool(defineTool({
       name: "subagent_kill",
       label: "Kill Subagent",
       description:
@@ -1506,7 +1506,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           details: { killed },
         };
       },
-    });
+    }));
 
   // /iterate command — fork the session into a subagent
   pi.registerCommand("iterate", {

@@ -5,7 +5,8 @@
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
+import { defineTool } from "@mariozechner/pi-coding-agent";
+import { Type } from "@mariozechner/pi-ai";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -147,7 +148,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  pi.registerTool(defineTool({
     name: "subagent_done",
     label: "Subagent Done",
     description:
@@ -162,5 +163,5 @@ export default function (pi: ExtensionAPI) {
         details: {},
       };
     },
-  });
+  }));
 }
