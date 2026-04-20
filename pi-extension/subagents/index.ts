@@ -174,6 +174,47 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
   return null;
 }
 
+function readJsonFile<T>(path: string): T | null {
+  try {
+    if (!existsSync(path)) return null;
+    return JSON.parse(readFileSync(path, "utf8")) as T;
+  } catch {
+    return null;
+  }
+}
+
+function getPreferredDefaultModel(cwd: string): { defaultProvider?: string; defaultModel?: string } {
+  const globalSettings = readJsonFile<{ defaultProvider?: string; defaultModel?: string }>(
+    join(homedir(), ".pi", "agent", "settings.json"),
+  );
+  const projectSettings = readJsonFile<{ defaultProvider?: string; defaultModel?: string }>(
+    join(cwd, ".pi", "settings.json"),
+  );
+
+  return {
+    defaultProvider: projectSettings?.defaultProvider ?? globalSettings?.defaultProvider,
+    defaultModel: projectSettings?.defaultModel ?? globalSettings?.defaultModel,
+  };
+}
+
+function qualifyModelWithProvider(
+  model: string,
+  ctx: { cwd: string; model?: { id: string; provider: string } | undefined },
+): string {
+  if (model.includes("/")) return model;
+
+  const { defaultProvider, defaultModel } = getPreferredDefaultModel(ctx.cwd);
+  if (defaultProvider && defaultModel === model) {
+    return `${defaultProvider}/${model}`;
+  }
+
+  if (ctx.model?.id === model && ctx.model.provider) {
+    return `${ctx.model.provider}/${model}`;
+  }
+
+  return model;
+}
+
 function formatElapsed(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
   const m = Math.floor(seconds / 60);
@@ -393,6 +434,7 @@ function updateWidget() {
 export const __test__ = {
   borderLine,
   renderSubagentWidgetLines,
+  qualifyModelWithProvider,
 };
 
 function startWidgetRefresh() {
@@ -603,7 +645,8 @@ async function launchSubagent(
   parts.push("-e", shellEscape(subagentDonePath));
 
   if (effectiveModel) {
-    const model = effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel;
+    const qualifiedModel = qualifyModelWithProvider(effectiveModel, ctx);
+    const model = effectiveThinking ? `${qualifiedModel}:${effectiveThinking}` : qualifiedModel;
     parts.push("--model", shellEscape(model));
   }
 

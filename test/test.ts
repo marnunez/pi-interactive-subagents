@@ -280,6 +280,74 @@ describe("subagent-done.ts", () => {
     });
   });
 });
+describe("subagent model qualification", () => {
+  it("qualifies the configured default model with its default provider", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.equal(typeof testApi.qualifyModelWithProvider, "function");
+
+    const home = createTestDir();
+    const cwd = createTestDir();
+    const originalHome = process.env.HOME;
+
+    try {
+      process.env.HOME = home;
+      mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+      writeFileSync(
+        join(home, ".pi", "agent", "settings.json"),
+        JSON.stringify({ defaultProvider: "openai-codex", defaultModel: "gpt-5.4" }),
+      );
+
+      const qualified = testApi.qualifyModelWithProvider("gpt-5.4", { cwd });
+      assert.equal(qualified, "openai-codex/gpt-5.4");
+    } finally {
+      process.env.HOME = originalHome;
+      rmSync(home, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not rewrite unrelated bare models just because a default provider exists", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.equal(typeof testApi.qualifyModelWithProvider, "function");
+
+    const home = createTestDir();
+    const cwd = createTestDir();
+    const originalHome = process.env.HOME;
+
+    try {
+      process.env.HOME = home;
+      mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+      writeFileSync(
+        join(home, ".pi", "agent", "settings.json"),
+        JSON.stringify({ defaultProvider: "openai-codex", defaultModel: "gpt-5.4" }),
+      );
+
+      const qualified = testApi.qualifyModelWithProvider("claude-sonnet-4-5", { cwd });
+      assert.equal(qualified, "claude-sonnet-4-5");
+    } finally {
+      process.env.HOME = originalHome;
+      rmSync(home, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to the current session model provider for matching bare ids", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.equal(typeof testApi.qualifyModelWithProvider, "function");
+
+    const cwd = createTestDir();
+    try {
+      const qualified = testApi.qualifyModelWithProvider("gpt-5.4", {
+        cwd,
+        model: { id: "gpt-5.4", provider: "openai-codex" },
+      });
+      assert.equal(qualified, "openai-codex/gpt-5.4");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("subagents widget rendering", () => {
   it("keeps every rendered line within a very narrow width", () => {
     const testApi = (subagentsModule as any).__test__;
