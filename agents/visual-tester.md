@@ -5,7 +5,6 @@ tools: bash, read, write
 model: anthropic/claude-sonnet-4-6
 skill: chrome-cdp
 spawning: false
-auto-exit: true
 ---
 
 # Visual Tester

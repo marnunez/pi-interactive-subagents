@@ -54,7 +54,7 @@ Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm` to force a specific bac
 
 ### Extensions
 
-**Subagents** — 4 tools + 3 commands:
+**Subagents** — 5 parent tools, 1 child lifecycle tool + 3 commands:
 
 | Tool              | Description                                                                     |
 | ----------------- | ------------------------------------------------------------------------------- |
@@ -62,6 +62,8 @@ Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm` to force a specific bac
 | `subagents_list`  | List available agent definitions                                                |
 | `set_tab_title`   | Update tab/window title to show progress                                        |
 | `subagent_resume` | Resume a previous sub-agent session (async)                                     |
+| `subagent_kill`   | Cancel running sub-agents                                                       |
+| `subagent_done`   | Child-only structured completion/shutdown tool                                  |
 
 | Command                    | Description                          |
 | -------------------------- | ------------------------------------ |
@@ -110,7 +112,41 @@ Multiple subagents run concurrently — each steers its result back independentl
 ╰─────────────────────────────────────────────────╯
 ```
 
-Completion messages render with a colored background and are expandable with `Ctrl+O` to show the full summary and session file path.
+Completion messages render with a colored background and are expandable with `Ctrl+O` to show the full report, artifact paths, next steps, and session file path.
+
+### Structured Completion Contract
+
+Every sub-agent must finish by calling `subagent_done` exactly once. Exiting without a persisted `subagent_done_result` is a protocol failure, even if the process exits with code 0. A session with more than one completion result is considered corrupt.
+
+```typescript
+subagent_done({
+  status: "success", // or "failed" | "blocked"
+  summary: "Concise orchestration summary, max 2,000 chars.",
+  report: "Optional expanded human-readable report shown with Ctrl+O.",
+  artifacts: [
+    { name: "context/auth-map.md", description: "Detailed auth flow notes" }
+  ],
+  nextSteps: ["Run the integration suite"]
+});
+```
+
+- `status` is the task outcome: `success`, `failed`, or `blocked`.
+- `summary` is required and bounded for orchestration/collapsed UI.
+- `report` is optional and shown in the expanded result card; large material belongs in artifacts.
+- `artifacts` reference files previously written with `write_artifact`; names are validated and rendered as paths only.
+- `nextSteps` are optional structured follow-up actions.
+
+The parent sends a structured `subagent_result` steer message after the child process exits. Its `details` distinguish lifecycle status from task status:
+
+```typescript
+{
+  protocolStatus: "completed" | "failed" | "cancelled",
+  result?: { status, summary, report, artifacts, nextSteps },
+  protocolError?: string,
+  sessionFile?: string,
+  elapsed: number
+}
+```
 
 ---
 
@@ -219,32 +255,7 @@ You are a specialized agent that does X...
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
 | `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
-| `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
-
----
-
-### `auto-exit`
-
-When set to `true`, the agent session shuts down automatically as soon as the agent finishes its turn — no explicit `subagent_done` call is needed.
-
-**Behavior:**
-
-- The session closes after the agent's final message (on the `agent_end` event)
-- If the user sends **any input** before the agent finishes, auto-exit is permanently disabled for that session — the user takes over interactively
-- The modeHint injected into the agent's task is adjusted accordingly: autonomous agents see "Complete your task autonomously." rather than instructions to call `subagent_done`
-
-**When to use:**
-
-- ✅ Autonomous agents (scout, worker, reviewer) that run to completion
-- ❌ Interactive agents (planner, iterate) where the user drives the session
-
-```yaml
----
-name: scout
-auto-exit: true
----
-```
 
 ---
 
@@ -254,7 +265,7 @@ By default, every sub-agent can spawn further sub-agents. Control this with fron
 
 ### `spawning: false`
 
-Denies all spawning tools (`subagent`, `subagents_list`, `subagent_resume`):
+Denies all spawning tools (`subagent`, `subagents_list`, `subagent_resume`, `subagent_kill`):
 
 ```yaml
 ---

@@ -2,6 +2,28 @@ import { readFileSync, appendFileSync, copyFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 
+export const SUBAGENT_DONE_RESULT_TYPE = "subagent_done_result";
+
+export type SubagentTaskStatus = "success" | "failed" | "blocked";
+
+export interface SubagentArtifactRef {
+  name: string;
+  description?: string;
+  /** Absolute path resolved by subagent_done after validation. Not accepted as model input. */
+  path?: string;
+}
+
+export interface SubagentDoneResult {
+  schemaVersion: 1;
+  status: SubagentTaskStatus;
+  summary: string;
+  report?: string;
+  artifacts?: SubagentArtifactRef[];
+  nextSteps?: string[];
+  completedAt: string;
+  artifactBaseDir?: string;
+}
+
 export interface SessionEntry {
   type: string;
   id: string;
@@ -15,6 +37,12 @@ export interface MessageEntry extends SessionEntry {
     role: "user" | "assistant" | "toolResult";
     content: Array<{ type: string; text?: string; [key: string]: unknown }>;
   };
+}
+
+export interface CustomEntry<T = unknown> extends SessionEntry {
+  type: "custom";
+  customType: string;
+  data?: T;
 }
 
 function readEntries(sessionFile: string): SessionEntry[] {
@@ -48,6 +76,35 @@ export function getNewEntries(sessionFile: string, afterLine: number): SessionEn
   const raw = readFileSync(sessionFile, "utf8");
   const lines = raw.split("\n").filter((line) => line.trim());
   return lines.slice(afterLine).map((line) => JSON.parse(line) as SessionEntry);
+}
+
+export function findSubagentDoneResultEntries(entries: SessionEntry[]): CustomEntry<unknown>[] {
+  return entries.filter(
+    (entry): entry is CustomEntry<unknown> =>
+      entry.type === "custom" && entry.customType === SUBAGENT_DONE_RESULT_TYPE,
+  );
+}
+
+export function isSubagentDoneResult(data: unknown): data is SubagentDoneResult {
+  if (!data || typeof data !== "object") return false;
+  const candidate = data as Partial<SubagentDoneResult>;
+  return (
+    candidate.schemaVersion === 1 &&
+    (candidate.status === "success" ||
+      candidate.status === "failed" ||
+      candidate.status === "blocked") &&
+    typeof candidate.summary === "string" &&
+    typeof candidate.completedAt === "string"
+  );
+}
+
+/**
+ * Find valid structured subagent completion results in session entries.
+ */
+export function findSubagentDoneResults(entries: SessionEntry[]): SubagentDoneResult[] {
+  return findSubagentDoneResultEntries(entries)
+    .map((entry) => entry.data)
+    .filter(isSubagentDoneResult);
 }
 
 /**
@@ -121,4 +178,3 @@ export function mergeNewEntries(
   }
   return entries;
 }
-const unused = "hello";

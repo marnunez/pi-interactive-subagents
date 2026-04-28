@@ -1,33 +1,170 @@
 /**
  * Extension loaded into sub-agents.
  * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+J)
- * - Provides a `subagent_done` tool for autonomous agents to self-terminate
+ * - Provides a mandatory structured `subagent_done` lifecycle tool
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
-import { defineTool } from "@mariozechner/pi-coding-agent";
 import { Type } from "@mariozechner/pi-ai";
 
-export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
-  return agentStarted;
+const defineTool = <T>(tool: T): T => tool;
+import { existsSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
+import {
+  SUBAGENT_DONE_RESULT_TYPE,
+  type SessionEntry,
+  type SubagentArtifactRef,
+  type SubagentDoneResult,
+} from "./session.ts";
+
+const MAX_SUMMARY_CHARS = 2_000;
+const MAX_REPORT_CHARS = 50 * 1024;
+const MAX_REPORT_LINES = 2_000;
+const MAX_ARTIFACTS = 20;
+const MAX_ARTIFACT_NAME_CHARS = 512;
+const MAX_ARTIFACT_DESCRIPTION_CHARS = 500;
+const MAX_NEXT_STEPS = 20;
+const MAX_NEXT_STEP_CHARS = 500;
+
+const DoneParams = Type.Object({
+  status: Type.Union(
+    [Type.Literal("success"), Type.Literal("failed"), Type.Literal("blocked")],
+    {
+      description:
+        "Required task status: success = completed as requested; failed = completed the attempt but the objective/check failed; blocked = cannot proceed without external input or environment changes.",
+    },
+  ),
+  summary: Type.String({
+    minLength: 1,
+    maxLength: MAX_SUMMARY_CHARS,
+    description:
+      "Required concise result for orchestration and collapsed UI. Maximum 2,000 characters.",
+  }),
+  report: Type.Optional(
+    Type.String({
+      maxLength: MAX_REPORT_CHARS,
+      description:
+        "Optional full human-readable result shown when the parent expands the subagent result. Maximum 50 KiB / 2,000 lines.",
+    }),
+  ),
+  artifacts: Type.Optional(
+    Type.Array(
+      Type.Object({
+        name: Type.String({
+          minLength: 1,
+          maxLength: MAX_ARTIFACT_NAME_CHARS,
+          description:
+            "Session artifact name previously written with write_artifact, e.g. context/auth-map.md. Must be relative and exist.",
+        }),
+        description: Type.Optional(
+          Type.String({
+            maxLength: MAX_ARTIFACT_DESCRIPTION_CHARS,
+            description: "Optional short description of the artifact.",
+          }),
+        ),
+      }),
+      { maxItems: MAX_ARTIFACTS },
+    ),
+  ),
+  nextSteps: Type.Optional(
+    Type.Array(
+      Type.String({
+        minLength: 1,
+        maxLength: MAX_NEXT_STEP_CHARS,
+        description: "Optional recommended follow-up action.",
+      }),
+      { maxItems: MAX_NEXT_STEPS },
+    ),
+  ),
+});
+
+function hasExistingDoneResult(entries: SessionEntry[]): boolean {
+  return entries.some(
+    (entry) => entry.type === "custom" && entry.customType === SUBAGENT_DONE_RESULT_TYPE,
+  );
 }
 
-export function shouldAutoExitOnAgentEnd(
-  userTookOver: boolean,
-  messages: any[] | undefined,
-): boolean {
-  if (userTookOver) return false;
+function lineCount(text: string): number {
+  return text.split("\n").length;
+}
 
-  if (messages) {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i];
-      if (msg?.role === "assistant") {
-        return msg.stopReason !== "aborted";
-      }
-    }
+function assertBoundedString(value: unknown, label: string, maxChars: number, required = false) {
+  if (value == null) {
+    if (required) throw new Error(`${label} is required.`);
+    return;
+  }
+  if (typeof value !== "string") throw new Error(`${label} must be a string.`);
+  if (required && value.trim() === "") throw new Error(`${label} cannot be empty.`);
+  if (value.length > maxChars) {
+    throw new Error(`${label} is too long (${value.length}/${maxChars} characters).`);
+  }
+}
+
+function resolveArtifact(artifactDir: string, name: string): string {
+  if (isAbsolute(name)) throw new Error(`Artifact name must be relative: ${name}`);
+  const resolved = resolve(artifactDir, name);
+  const rel = relative(artifactDir, resolved);
+  if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) {
+    throw new Error(`Artifact name escapes the artifact directory: ${name}`);
+  }
+  if (!existsSync(resolved)) {
+    throw new Error(`Listed artifact does not exist: ${name}`);
+  }
+  if (!statSync(resolved).isFile()) {
+    throw new Error(`Listed artifact is not a file: ${name}`);
+  }
+  return resolved;
+}
+
+export function validateSubagentDoneParams(
+  params: typeof DoneParams.static,
+  artifactDir: string,
+): Omit<SubagentDoneResult, "completedAt"> {
+  if (params.status !== "success" && params.status !== "failed" && params.status !== "blocked") {
+    throw new Error('status must be one of "success", "failed", or "blocked".');
   }
 
-  return true;
+  assertBoundedString(params.summary, "summary", MAX_SUMMARY_CHARS, true);
+  assertBoundedString(params.report, "report", MAX_REPORT_CHARS);
+  if (params.report && lineCount(params.report) > MAX_REPORT_LINES) {
+    throw new Error(`report has too many lines (${lineCount(params.report)}/${MAX_REPORT_LINES}).`);
+  }
+
+  if (params.artifacts && params.artifacts.length > MAX_ARTIFACTS) {
+    throw new Error(`artifacts has too many entries (${params.artifacts.length}/${MAX_ARTIFACTS}).`);
+  }
+
+  const artifacts: SubagentArtifactRef[] | undefined = params.artifacts?.map((artifact) => {
+    assertBoundedString(artifact.name, "artifact.name", MAX_ARTIFACT_NAME_CHARS, true);
+    assertBoundedString(
+      artifact.description,
+      "artifact.description",
+      MAX_ARTIFACT_DESCRIPTION_CHARS,
+    );
+    return {
+      name: artifact.name,
+      description: artifact.description,
+      path: resolveArtifact(artifactDir, artifact.name),
+    };
+  });
+
+  if (params.nextSteps && params.nextSteps.length > MAX_NEXT_STEPS) {
+    throw new Error(`nextSteps has too many entries (${params.nextSteps.length}/${MAX_NEXT_STEPS}).`);
+  }
+  params.nextSteps?.forEach((step, index) => {
+    assertBoundedString(step, `nextSteps[${index}]`, MAX_NEXT_STEP_CHARS, true);
+  });
+
+  return {
+    schemaVersion: 1,
+    status: params.status,
+    summary: params.summary,
+    report: params.report,
+    artifacts,
+    nextSteps: params.nextSteps,
+    artifactBaseDir: artifactDir,
+  };
 }
 
 export default function (pi: ExtensionAPI) {
@@ -90,8 +227,6 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
-  const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
-
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
     const tools = pi.getAllTools();
@@ -103,41 +238,6 @@ export default function (pi: ExtensionAPI) {
 
     renderWidget(ctx, null);
   });
-
-  // Auto-exit: when the agent loop ends, shut down automatically.
-  // If the user interrupts (Escape) or sends any input, auto-exit is disabled
-  // for that cycle — the user wants to steer. Once they're done and the agent
-  // completes normally again, auto-exit re-engages.
-  // Enabled via `auto-exit: true` in agent frontmatter.
-  if (autoExit) {
-    let userTookOver = false;
-    let agentStarted = false;
-
-    pi.on("agent_start", () => {
-      agentStarted = true;
-    });
-
-    pi.on("input", () => {
-      // Ignore the initial task message that starts an autonomous subagent.
-      // Only inputs after the first agent run has started count as user takeover.
-      if (!shouldMarkUserTookOver(agentStarted)) return;
-      userTookOver = true;
-    });
-
-    pi.on("agent_end", (event, ctx) => {
-      const messages = (event as any).messages as any[] | undefined;
-      const shouldExit = shouldAutoExitOnAgentEnd(userTookOver, messages);
-      if (!shouldExit) {
-        // User sent input after the agent had started, or the run was interrupted
-        // with Escape. Reset takeover so auto-exit can re-engage on the next
-        // normal completion cycle.
-        userTookOver = false;
-        return;
-      }
-
-      ctx.shutdown();
-    });
-  }
 
   // Toggle expand/collapse with Ctrl+J
   pi.registerShortcut("ctrl+j", {
@@ -152,15 +252,37 @@ export default function (pi: ExtensionAPI) {
     name: "subagent_done",
     label: "Subagent Done",
     description:
-      "Call this tool when you have completed your task. " +
-      "It will close this session and return your results to the main session. " +
-      "Your LAST assistant message before calling this becomes the summary returned to the caller.",
-    parameters: Type.Object({}),
-    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-      ctx.shutdown();
+      "Mandatory lifecycle tool for sub-agents. Call exactly once when the task is complete, failed, or blocked. " +
+      "Persists a structured result for the parent orchestrator and then shuts this sub-agent session down. " +
+      "Exiting without calling this tool is a protocol failure.",
+    parameters: DoneParams,
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const entries = ctx.sessionManager.getEntries() as unknown as SessionEntry[];
+      if (hasExistingDoneResult(entries)) {
+        throw new Error("subagent_done has already been called for this session.");
+      }
+
+      const project = basename(ctx.cwd);
+      const sessionId = ctx.sessionManager.getSessionId();
+      const artifactDir = join(homedir(), ".pi", "history", project, "artifacts", sessionId);
+      const validated = validateSubagentDoneParams(params, artifactDir);
+      const result: SubagentDoneResult = {
+        ...validated,
+        completedAt: new Date().toISOString(),
+      };
+
+      pi.appendEntry(SUBAGENT_DONE_RESULT_TYPE, result);
+
+      setTimeout(() => ctx.shutdown(), 0);
+
       return {
-        content: [{ type: "text", text: "Shutting down subagent session." }],
-        details: {},
+        content: [
+          {
+            type: "text",
+            text: `Subagent result persisted with status "${result.status}". Shutting down.`,
+          },
+        ],
+        details: { persisted: true, status: result.status },
       };
     },
   }));

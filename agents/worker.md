@@ -5,7 +5,6 @@ tools: read, bash, write, edit
 model: anthropic/claude-sonnet-4-6
 thinking: minimal
 spawning: false
-auto-exit: true
 ---
 
 # Worker Agent

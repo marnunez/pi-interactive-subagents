@@ -1,6 +1,8 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { keyHint, defineTool } from "@mariozechner/pi-coding-agent";
+import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type } from "@mariozechner/pi-ai";
+
+const defineTool = <T>(tool: T): T => tool;
 import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { basename, dirname, join } from "node:path";
 import {
@@ -26,7 +28,20 @@ import {
   renameCurrentTab,
   renameWorkspace,
 } from "./cmux.ts";
-import { getNewEntries, findLastAssistantMessage } from "./session.ts";
+import {
+  getNewEntries,
+  findLastAssistantMessage,
+  findSubagentDoneResultEntries,
+  isSubagentDoneResult,
+  type SubagentDoneResult,
+} from "./session.ts";
+
+const SUBAGENT_COMPLETION_INSTRUCTION =
+  "Complete your task. When finished, call the subagent_done tool exactly once with a structured result. " +
+  "Set status to success, failed, or blocked; put the concise orchestration result in summary; " +
+  "put the expanded human-readable result in report when useful; list any write_artifact outputs in artifacts; " +
+  "and include recommended follow-up actions in nextSteps. Exiting without subagent_done is a protocol failure. " +
+  "The user can interact with you at any time, but the same completion contract still applies.";
 
 const SubagentParams = Type.Object({
   name: Type.String({ description: "Display name for the subagent" }),
@@ -77,7 +92,6 @@ interface AgentDefaults {
   denyTools?: string;
   allowTools?: string;
   spawning?: boolean;
-  autoExit?: boolean;
   maxInstances?: number;
   cwd?: string;
   workspace?: string;
@@ -154,7 +168,6 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
     // Extract body (everything after frontmatter)
     const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
     const spawningRaw = get("spawning");
-    const autoExitRaw = get("auto-exit");
     return {
       model: get("model"),
       tools: get("tools"),
@@ -164,7 +177,6 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
       allowTools: get("allow-tools"),
       maxInstances: get("max-instances") ? parseInt(get("max-instances")!, 10) : undefined,
       spawning: spawningRaw != null ? spawningRaw === "true" : undefined,
-      autoExit: autoExitRaw != null ? autoExitRaw === "true" : undefined,
       cwd: get("cwd"),
       workspace: get("workspace"),
       env: get("env"),
@@ -261,6 +273,88 @@ function formatBytes(bytes: number): string {
   return `${mb.toFixed(1)}MB`;
 }
 
+function parseSubagentCompletion(
+  sessionFile: string,
+  afterLine: number,
+): { result?: SubagentDoneResult; protocolError?: string; diagnosticSummary?: string } {
+  if (!existsSync(sessionFile)) {
+    return { protocolError: "Subagent session file was not found." };
+  }
+
+  const entries = getNewEntries(sessionFile, afterLine);
+  const doneEntries = findSubagentDoneResultEntries(entries);
+
+  const diagnosticSummary = findLastAssistantMessage(entries) ?? undefined;
+  if (doneEntries.length === 0) {
+    return {
+      protocolError: "Subagent exited without calling subagent_done.",
+      diagnosticSummary,
+    };
+  }
+
+  if (doneEntries.length > 1) {
+    return {
+      protocolError: `Subagent session is corrupt: found ${doneEntries.length} subagent_done_result entries.`,
+      diagnosticSummary,
+    };
+  }
+
+  const result = doneEntries[0].data;
+  if (!isSubagentDoneResult(result)) {
+    return {
+      protocolError: "Subagent session contains a malformed subagent_done_result entry.",
+      diagnosticSummary,
+    };
+  }
+
+  return { result };
+}
+
+function buildSubagentResultContent(details: SubagentResult): string {
+  const lines: string[] = [];
+  const agentTag = details.agent ? ` (${details.agent})` : "";
+
+  if (details.protocolStatus === "completed" && details.result) {
+    lines.push(
+      `Sub-agent "${details.name}"${agentTag} completed with task status "${details.result.status}" (${formatElapsed(details.elapsed)}).`,
+    );
+    lines.push("", `Summary: ${details.result.summary}`);
+
+    if (details.result.artifacts?.length) {
+      lines.push("", "Artifacts:");
+      for (const artifact of details.result.artifacts) {
+        const path = artifact.path ?? artifact.name;
+        const description = artifact.description ? ` — ${artifact.description}` : "";
+        lines.push(`- ${path}${description}`);
+      }
+    }
+
+    if (details.result.nextSteps?.length) {
+      lines.push("", "Next steps:");
+      details.result.nextSteps.forEach((step, i) => lines.push(`${i + 1}. ${step}`));
+    }
+  } else if (details.protocolStatus === "cancelled") {
+    lines.push(
+      `Sub-agent "${details.name}"${agentTag} was cancelled after ${formatElapsed(details.elapsed)}.`,
+    );
+    if (details.protocolError) lines.push("", details.protocolError);
+  } else {
+    lines.push(
+      `Sub-agent "${details.name}"${agentTag} failed the completion protocol after ${formatElapsed(details.elapsed)}.`,
+    );
+    if (details.protocolError) lines.push("", details.protocolError);
+    if (details.diagnosticSummary) {
+      lines.push("", "Last assistant message (diagnostic only):", details.diagnosticSummary);
+    }
+  }
+
+  if (details.sessionFile) {
+    lines.push("", `Session: ${details.sessionFile}`, `Resume: pi --session ${details.sessionFile}`);
+  }
+
+  return lines.join("\n");
+}
+
 /**
  * Try to find and measure a specific session file, or discover
  * the right one from new files in the session directory.
@@ -271,15 +365,24 @@ function formatBytes(bytes: number): string {
  * Returns { file, entries, bytes } — `file` is the path that was measured,
  * so callers can lock onto it for subsequent calls.
  */
+type SubagentProtocolStatus = "completed" | "failed" | "cancelled";
+
 /**
  * Result from running a single subagent.
+ *
+ * `protocolStatus` describes the lifecycle/handshake. `result.status`
+ * describes the child agent's task outcome when the protocol completed.
  */
 interface SubagentResult {
   name: string;
   task: string;
-  summary: string;
+  agent?: string;
+  protocolStatus: SubagentProtocolStatus;
+  protocolError?: string;
+  diagnosticSummary?: string;
+  result?: SubagentDoneResult;
   sessionFile?: string;
-  exitCode: number;
+  exitCode?: number;
   elapsed: number;
   error?: string;
 }
@@ -585,12 +688,7 @@ async function launchSubagent(
   // When forking, the sub-agent already has the full conversation context.
   // Only send the user's task as a clean message — no wrapper instructions
   // that would confuse the agent into thinking it needs to restart.
-  const modeHint = agentDefs?.autoExit
-    ? "Complete your task autonomously."
-    : "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
-  const summaryInstruction = agentDefs?.autoExit
-    ? "Your FINAL assistant message should summarize what you accomplished."
-    : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
+  const modeHint = SUBAGENT_COMPLETION_INSTRUCTION;
   const denySet = resolveDenyTools(agentDefs, options?.allToolNames);
   const agentType = params.agent ?? params.name;
   const tabTitleInstruction = denySet.has("set_tab_title")
@@ -605,8 +703,8 @@ async function launchSubagent(
   const identity = identityParts.length > 0 ? identityParts.join("\n\n") : null;
   const roleBlock = identity ? `\n\n${identity}` : "";
   const fullTask = params.fork
-    ? params.task
-    : `${roleBlock}\n\n${modeHint}\n\n${tabTitleInstruction}\n\n${params.task}\n\n${summaryInstruction}`;
+    ? `${params.task}\n\n${modeHint}`
+    : `${roleBlock}\n\n${modeHint}\n\n${tabTitleInstruction}\n\n${params.task}`;
 
   // Build pi command
   const parts: string[] = ["pi"];
@@ -678,9 +776,6 @@ async function launchSubagent(
   envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
-  }
-  if (agentDefs?.autoExit) {
-    envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
   }
   // Custom env vars from agent frontmatter (e.g. "PI_PERMISSION_LEVEL=low PI_FOO=bar")
   if (agentDefs?.env) {
@@ -782,8 +877,10 @@ async function launchSubagent(
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
+  options: { afterLine?: number } = {},
 ): Promise<SubagentResult> {
-  const { name, task, surface, startTime, sessionFile, forkCleanupFile } = running;
+  const { name, task, agent, surface, startTime, sessionFile, forkCleanupFile } = running;
+  const afterLine = options.afterLine ?? 0;
 
   try {
     let exitCode: number;
@@ -821,22 +918,7 @@ async function watchSubagent(
     }
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
-
-    // Extract summary from the known session file
-    let summary: string;
-    if (existsSync(sessionFile)) {
-      const allEntries = getNewEntries(sessionFile, 0);
-      summary =
-        findLastAssistantMessage(allEntries) ??
-        (exitCode !== 0
-          ? `Sub-agent exited with code ${exitCode}`
-          : "Sub-agent exited without output");
-    } else {
-      summary =
-        exitCode !== 0
-          ? `Sub-agent exited with code ${exitCode}`
-          : "Sub-agent exited without output";
-    }
+    const parsed = parseSubagentCompletion(sessionFile, afterLine);
 
     // Cleanup: workspace mode switches back, normal mode closes surface
     if (running.workspace) {
@@ -855,7 +937,30 @@ async function watchSubagent(
       } catch {}
     }
 
-    return { name, task, summary, sessionFile, exitCode, elapsed };
+    if (parsed.result) {
+      return {
+        name,
+        task,
+        agent,
+        protocolStatus: "completed",
+        result: parsed.result,
+        sessionFile,
+        exitCode,
+        elapsed,
+      };
+    }
+
+    return {
+      name,
+      task,
+      agent,
+      protocolStatus: "failed",
+      protocolError: parsed.protocolError ?? "Subagent completion protocol failed.",
+      diagnosticSummary: parsed.diagnosticSummary,
+      sessionFile,
+      exitCode,
+      elapsed,
+    };
   } catch (err: any) {
     if (forkCleanupFile) {
       try {
@@ -871,7 +976,10 @@ async function watchSubagent(
       return {
         name,
         task,
-        summary: "Subagent cancelled.",
+        agent,
+        protocolStatus: "cancelled",
+        protocolError: "Subagent was cancelled by the parent.",
+        sessionFile,
         exitCode: 1,
         elapsed: Math.floor((Date.now() - startTime) / 1000),
         error: "cancelled",
@@ -880,7 +988,10 @@ async function watchSubagent(
     return {
       name,
       task,
-      summary: `Subagent error: ${err?.message ?? String(err)}`,
+      agent,
+      protocolStatus: "failed",
+      protocolError: `Subagent watcher error: ${err?.message ?? String(err)}`,
+      sessionFile,
       exitCode: 1,
       elapsed: Math.floor((Date.now() - startTime) / 1000),
       error: err?.message ?? String(err),
@@ -1005,39 +1116,34 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
-            const sessionRef = result.sessionFile
-              ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
-              : "";
-            const content =
-              result.exitCode !== 0
-                ? `Sub-agent "${running.name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`
-                : `Sub-agent "${running.name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`;
-
             pi.sendMessage(
               {
                 customType: "subagent_result",
-                content,
+                content: buildSubagentResultContent(result),
                 display: true,
-                details: {
-                  name: running.name,
-                  task: running.task,
-                  agent: running.agent,
-                  exitCode: result.exitCode,
-                  elapsed: result.elapsed,
-                  sessionFile: result.sessionFile,
-                },
+                details: result,
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
           })
           .catch((err) => {
             updateWidget();
+            const result: SubagentResult = {
+              name: running.name,
+              task: running.task,
+              agent: running.agent,
+              protocolStatus: "failed",
+              protocolError: `Sub-agent watcher error: ${err?.message ?? String(err)}`,
+              sessionFile: running.sessionFile,
+              elapsed: Math.floor((Date.now() - running.startTime) / 1000),
+              error: err?.message ?? String(err),
+            };
             pi.sendMessage(
               {
                 customType: "subagent_result",
-                content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
+                content: buildSubagentResultContent(result),
                 display: true,
-                details: { name: running.name, task: running.task, error: err?.message },
+                details: result,
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
@@ -1331,7 +1437,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         let cleanupMsgFile: string | undefined;
         if (params.message) {
           const msgFile = join(tmpdir(), `subagent-resume-${Date.now()}.md`);
-          writeFileSync(msgFile, params.message, "utf8");
+          writeFileSync(msgFile, `${params.message}\n\n${SUBAGENT_COMPLETION_INSTRUCTION}`, "utf8");
           cleanupMsgFile = msgFile;
           parts.push(`@${msgFile}`);
         }
@@ -1356,41 +1462,36 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const watcherAbort = new AbortController();
         running.abortController = watcherAbort;
 
-        watchSubagent(running, watcherAbort.signal)
+        watchSubagent(running, watcherAbort.signal, { afterLine: entryCountBefore })
           .then((result) => {
             updateWidget();
-            const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
-            const summary =
-              findLastAssistantMessage(allEntries) ??
-              (result.exitCode !== 0
-                ? `Resumed session exited with code ${result.exitCode}`
-                : "Resumed session exited without new output");
-            const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
-
             pi.sendMessage(
               {
                 customType: "subagent_result",
-                content: `${summary}${sessionRef}`,
+                content: buildSubagentResultContent(result),
                 display: true,
-                details: {
-                  name,
-                  task: params.message ?? "resumed session",
-                  exitCode: result.exitCode,
-                  elapsed: result.elapsed,
-                  sessionFile: params.sessionPath,
-                },
+                details: result,
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
           })
           .catch((err) => {
             updateWidget();
+            const result: SubagentResult = {
+              name,
+              task: params.message ?? "resumed session",
+              protocolStatus: "failed",
+              protocolError: `Resume watcher error: ${err?.message ?? String(err)}`,
+              sessionFile: params.sessionPath,
+              elapsed: Math.floor((Date.now() - startTime) / 1000),
+              error: err?.message ?? String(err),
+            };
             pi.sendMessage(
               {
                 customType: "subagent_result",
-                content: `Resume error: ${err?.message ?? String(err)}`,
+                content: buildSubagentResultContent(result),
                 display: true,
-                details: { name, error: err?.message },
+                details: result,
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
@@ -1595,60 +1696,107 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // ── subagent_result message renderer ──
   pi.registerMessageRenderer("subagent_result", (message, options, theme) => {
-    const details = message.details as any;
+    const details = message.details as SubagentResult | undefined;
     if (!details) return undefined;
+
+    const fit = (line: string, width: number) => truncateToWidth(line, Math.max(0, width - 6), "…");
+    const pushWrapped = (lines: string[], text: string, width: number, color?: (s: string) => string) => {
+      for (const line of text.split("\n")) {
+        const fitted = fit(line, width);
+        lines.push(color ? color(fitted) : fitted);
+      }
+    };
 
     return {
       invalidate() {},
       render(width: number): string[] {
         const name = details.name ?? "subagent";
-        const exitCode = details.exitCode ?? 0;
         const elapsed = details.elapsed != null ? formatElapsed(details.elapsed) : "?";
-        const bgFn =
-          exitCode === 0
-            ? (text: string) => theme.bg("toolSuccessBg", text)
-            : (text: string) => theme.bg("toolErrorBg", text);
-        const icon = exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
-        const status = exitCode === 0 ? "completed" : `failed (exit ${exitCode})`;
         const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
+        const taskStatus = details.result?.status;
 
-        const header = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "—")} ${status} ${theme.fg("dim", `(${elapsed})`)}`;
-        const rawContent = typeof message.content === "string" ? message.content : "";
+        let icon = theme.fg("success", "✓");
+        let statusText = "completed";
+        let bgFn = (text: string) => theme.bg("toolSuccessBg", text);
 
-        // Clean summary (remove session ref and leading label for display)
-        const summary = rawContent
-          .replace(/\n\nSession: .+\nResume: .+$/, "")
-          .replace(`Sub-agent "${name}" completed (${elapsed}).\n\n`, "")
-          .replace(`Sub-agent "${name}" failed (exit code ${exitCode}).\n\n`, "");
+        if (details.protocolStatus === "failed") {
+          icon = theme.fg("error", "✗");
+          statusText = "protocol failed";
+          bgFn = (text: string) => theme.bg("toolErrorBg", text);
+        } else if (details.protocolStatus === "cancelled") {
+          icon = theme.fg("warning", "■");
+          statusText = "cancelled";
+          bgFn = (text: string) => theme.bg("toolPendingBg", text);
+        } else if (taskStatus === "failed") {
+          icon = theme.fg("error", "✗");
+          statusText = "task failed";
+          bgFn = (text: string) => theme.bg("toolErrorBg", text);
+        } else if (taskStatus === "blocked") {
+          icon = theme.fg("warning", "!");
+          statusText = "blocked";
+          bgFn = (text: string) => theme.bg("toolPendingBg", text);
+        } else if (taskStatus === "success") {
+          statusText = "success";
+        }
 
-        // Build content for the box
+        const header = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "—")} ${statusText} ${theme.fg("dim", `(${elapsed})`)}`;
         const contentLines = [header];
 
-        if (options.expanded) {
-          // Full view: complete summary + session info
-          if (summary) {
-            for (const line of summary.split("\n")) {
-              contentLines.push(line.slice(0, width - 6));
-            }
-          }
-          if (details.sessionFile) {
+        if (details.protocolStatus === "completed" && details.result) {
+          const result = details.result;
+          const expandedText = result.report ?? result.summary;
+
+          if (options.expanded) {
             contentLines.push("");
-            contentLines.push(theme.fg("dim", `Session: ${details.sessionFile}`));
-            contentLines.push(theme.fg("dim", `Resume:  pi --session ${details.sessionFile}`));
+            pushWrapped(contentLines, expandedText, width);
+
+            if (result.artifacts?.length) {
+              contentLines.push("", theme.fg("toolTitle", theme.bold("Artifacts:")));
+              for (const artifact of result.artifacts) {
+                const path = artifact.path ?? artifact.name;
+                const description = artifact.description ? ` — ${artifact.description}` : "";
+                contentLines.push(theme.fg("dim", fit(`- ${path}${description}`, width)));
+              }
+            }
+
+            if (result.nextSteps?.length) {
+              contentLines.push("", theme.fg("toolTitle", theme.bold("Next steps:")));
+              result.nextSteps.forEach((step, i) => {
+                contentLines.push(theme.fg("dim", fit(`${i + 1}. ${step}`, width)));
+              });
+            }
+
+            if (details.sessionFile) {
+              contentLines.push("", theme.fg("dim", fit(`Session: ${details.sessionFile}`, width)));
+              contentLines.push(theme.fg("dim", fit(`Resume:  pi --session ${details.sessionFile}`, width)));
+            }
+          } else {
+            pushWrapped(contentLines, result.summary, width, (line) => theme.fg("dim", line));
+            const extras: string[] = [];
+            if (result.report) extras.push("full report");
+            if (result.artifacts?.length) extras.push(`${result.artifacts.length} artifact${result.artifacts.length === 1 ? "" : "s"}`);
+            if (result.nextSteps?.length) extras.push(`${result.nextSteps.length} next step${result.nextSteps.length === 1 ? "" : "s"}`);
+            if (extras.length) {
+              contentLines.push(theme.fg("muted", fit(`… ${extras.join(", ")}`, width)));
+            }
+            contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
           }
         } else {
-          // Collapsed: preview + expand hint
-          if (summary) {
-            const previewLines = summary.split("\n").slice(0, 5);
-            for (const line of previewLines) {
-              contentLines.push(theme.fg("dim", line.slice(0, width - 6)));
+          const messageText = details.protocolError ?? details.diagnosticSummary ?? "No details available.";
+          if (options.expanded) {
+            pushWrapped(contentLines, messageText, width, (line) => theme.fg("dim", line));
+            if (details.diagnosticSummary && details.protocolError) {
+              contentLines.push("", theme.fg("toolTitle", theme.bold("Diagnostic last assistant message:")));
+              pushWrapped(contentLines, details.diagnosticSummary, width, (line) => theme.fg("dim", line));
             }
-            const totalLines = summary.split("\n").length;
-            if (totalLines > 5) {
-              contentLines.push(theme.fg("muted", `… ${totalLines - 5} more lines`));
+            if (details.sessionFile) {
+              contentLines.push("", theme.fg("dim", fit(`Session: ${details.sessionFile}`, width)));
+              contentLines.push(theme.fg("dim", fit(`Resume:  pi --session ${details.sessionFile}`, width)));
             }
+          } else {
+            pushWrapped(contentLines, messageText.split("\n").slice(0, 3).join("\n"), width, (line) => theme.fg("dim", line));
+            contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
           }
-          contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
         }
 
         // Render via Box for background + padding, with blank line above for separation
@@ -1690,4 +1838,3 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
   });
 }
-// test

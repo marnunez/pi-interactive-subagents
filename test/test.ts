@@ -11,16 +11,15 @@ import {
   getEntryCount,
   getNewEntries,
   findLastAssistantMessage,
+  findSubagentDoneResults,
+  SUBAGENT_DONE_RESULT_TYPE,
   appendBranchSummary,
   copySessionFile,
   mergeNewEntries,
 } from "../pi-extension/subagents/session.ts";
 
 import { shellEscape, isCmuxAvailable, isWezTermAvailable } from "../pi-extension/subagents/cmux.ts";
-import {
-  shouldMarkUserTookOver,
-  shouldAutoExitOnAgentEnd,
-} from "../pi-extension/subagents/subagent-done.ts";
+import { validateSubagentDoneParams } from "../pi-extension/subagents/subagent-done.ts";
 
 // --- Helpers ---
 
@@ -182,6 +181,29 @@ describe("session.ts", () => {
     });
   });
 
+  describe("findSubagentDoneResults", () => {
+    it("finds persisted structured subagent results", () => {
+      const entries = [
+        ASSISTANT_MSG,
+        {
+          type: "custom",
+          id: "done-001",
+          customType: SUBAGENT_DONE_RESULT_TYPE,
+          data: {
+            schemaVersion: 1,
+            status: "success",
+            summary: "Done.",
+            completedAt: "2026-04-28T00:00:00.000Z",
+          },
+        },
+      ] as any[];
+
+      const results = findSubagentDoneResults(entries);
+      assert.equal(results.length, 1);
+      assert.equal(results[0].summary, "Done.");
+    });
+  });
+
   describe("appendBranchSummary", () => {
     it("appends valid branch_summary entry", () => {
       const file = createSessionFile(dir, [SESSION_HEADER, USER_MSG, ASSISTANT_MSG]);
@@ -253,31 +275,64 @@ describe("session.ts", () => {
 });
 
 describe("subagent-done.ts", () => {
-  describe("shouldMarkUserTookOver", () => {
-    it("ignores the initial injected task before the first agent run", () => {
-      assert.equal(shouldMarkUserTookOver(false), false);
-    });
+  let dir: string;
 
-    it("treats later input as manual takeover", () => {
-      assert.equal(shouldMarkUserTookOver(true), true);
-    });
+  before(() => {
+    dir = createTestDir();
   });
 
-  describe("shouldAutoExitOnAgentEnd", () => {
-    it("auto-exits after normal completion when there was no takeover", () => {
-      const messages = [{ role: "assistant", stopReason: "stop" }];
-      assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
-    });
+  after(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
 
-    it("stays open after user takeover for that cycle", () => {
-      const messages = [{ role: "assistant", stopReason: "stop" }];
-      assert.equal(shouldAutoExitOnAgentEnd(true, messages), false);
-    });
+  it("validates structured completion and resolves artifact paths", () => {
+    mkdirSync(join(dir, "context"), { recursive: true });
+    writeFileSync(join(dir, "context", "notes.md"), "details");
 
-    it("stays open after Escape aborts the run", () => {
-      const messages = [{ role: "assistant", stopReason: "aborted" }];
-      assert.equal(shouldAutoExitOnAgentEnd(false, messages), false);
-    });
+    const result = validateSubagentDoneParams(
+      {
+        status: "success",
+        summary: "Done.",
+        report: "Full report.",
+        artifacts: [{ name: "context/notes.md", description: "Implementation notes" }],
+        nextSteps: ["Run CI"],
+      },
+      dir,
+    );
+
+    assert.equal(result.schemaVersion, 1);
+    assert.equal(result.status, "success");
+    assert.equal(result.artifacts?.[0].path, join(dir, "context", "notes.md"));
+  });
+
+  it("rejects missing artifacts", () => {
+    assert.throws(
+      () =>
+        validateSubagentDoneParams(
+          {
+            status: "success",
+            summary: "Done.",
+            artifacts: [{ name: "missing.md" }],
+          },
+          dir,
+        ),
+      /does not exist/,
+    );
+  });
+
+  it("rejects reports above the line limit", () => {
+    assert.throws(
+      () =>
+        validateSubagentDoneParams(
+          {
+            status: "success",
+            summary: "Done.",
+            report: Array.from({ length: 2001 }, () => "line").join("\n"),
+          },
+          dir,
+        ),
+      /too many lines/,
+    );
   });
 });
 describe("subagent model qualification", () => {
