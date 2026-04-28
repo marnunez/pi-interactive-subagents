@@ -256,7 +256,8 @@ export default function (pi: ExtensionAPI) {
       "Persists a structured result for the parent orchestrator and then shuts this sub-agent session down. " +
       "Exiting without calling this tool is a protocol failure.",
     parameters: DoneParams,
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
+      const params = rawParams as typeof DoneParams.static;
       const entries = ctx.sessionManager.getEntries() as unknown as SessionEntry[];
       if (hasExistingDoneResult(entries)) {
         throw new Error("subagent_done has already been called for this session.");

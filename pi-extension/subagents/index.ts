@@ -1046,7 +1046,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "Either wait for the steer message or move on to other work.",
       parameters: SubagentParams,
 
-      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
+        const params = rawParams as typeof SubagentParams.static;
         // Prevent self-spawning (e.g. planner spawning another planner)
         const currentAgent = process.env.PI_SUBAGENT_AGENT;
         if (params.agent && currentAgent && params.agent === currentAgent) {
@@ -1172,7 +1173,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         };
       },
 
-      renderCall(args, theme) {
+      renderCall(rawArgs, theme) {
+        const args = rawArgs as Partial<typeof SubagentParams.static>;
         const agent = args.agent ? theme.fg("dim", ` (${args.agent})`) : "";
         const cwdHint = args.cwd ? theme.fg("dim", ` in ${args.cwd}`) : "";
         let text =
@@ -1326,7 +1328,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }),
       }),
 
-      async execute(_toolCallId, params): Promise<any> {
+      async execute(_toolCallId, rawParams): Promise<any> {
+        const params = rawParams as { title: string };
         if (!isMuxAvailable()) {
           return muxUnavailableResult("tab-title");
         }
@@ -1373,7 +1376,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         ),
       }),
 
-      renderCall(args, theme) {
+      renderCall(rawArgs, theme) {
+        const args = rawArgs as { name?: string };
         const name = args.name ?? "Resume";
         const text =
           "▸ " + theme.fg("toolTitle", theme.bold(name)) + theme.fg("dim", " — resuming session");
@@ -1401,7 +1405,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return new Text(theme.fg("dim", text), 0, 0);
       },
 
-      async execute(_toolCallId, params, _signal, _onUpdate) {
+      async execute(_toolCallId, rawParams, _signal, _onUpdate) {
+        const params = rawParams as { sessionPath: string; name?: string; message?: string };
         const name = params.name ?? "Resume";
         const startTime = Date.now();
 
@@ -1524,7 +1529,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         ),
       }),
 
-      renderCall(args, theme) {
+      renderCall(rawArgs, theme) {
+        const args = rawArgs as { target?: string };
         const target = args.target ?? "(list)";
         return new Text(
           "▸ " + theme.fg("toolTitle", theme.bold("Kill Subagent")) + theme.fg("dim", ` — ${target}`),
@@ -1548,7 +1554,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return new Text(theme.fg("dim", text), 0, 0);
       },
 
-      async execute(_toolCallId, params) {
+      async execute(_toolCallId, rawParams) {
+        const params = rawParams as { target?: string };
         const agents = Array.from(runningSubagents.values());
 
         // No target: list running subagents
