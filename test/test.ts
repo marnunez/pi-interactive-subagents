@@ -403,6 +403,40 @@ describe("subagent model qualification", () => {
   });
 });
 
+describe("subagent tool allow-list", () => {
+  it("keeps child lifecycle tools available when an agent restricts native tools", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const tools = testApi.buildSubagentToolAllowList(
+      "read,bash,edit,write",
+      new Set(),
+      testApi.withChildOnlyTools(["read", "bash", "edit", "write", "write_artifact"]),
+    );
+
+    assert.ok(tools.includes("subagent_done"));
+    assert.ok(tools.includes("write_artifact"));
+    assert.ok(tools.includes("read"));
+  });
+
+  it("never denies the mandatory subagent_done lifecycle tool", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const denySet = testApi.resolveDenyTools(
+      { allowTools: "read,bash" },
+      testApi.withChildOnlyTools(["read", "bash", "write_artifact"]),
+    );
+    denySet.delete("subagent_done");
+
+    const tools = testApi.buildSubagentToolAllowList(
+      "read,bash",
+      denySet,
+      testApi.withChildOnlyTools(["read", "bash", "write_artifact"]),
+    );
+
+    assert.ok(tools.includes("subagent_done"));
+    assert.equal(tools.includes("write_artifact"), false);
+    assert.equal(tools.includes("set_tab_title"), false);
+  });
+});
+
 describe("subagents widget rendering", () => {
   it("keeps every rendered line within a very narrow width", () => {
     const testApi = (subagentsModule as any).__test__;

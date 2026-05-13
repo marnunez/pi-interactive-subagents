@@ -99,8 +99,47 @@ interface AgentDefaults {
   body?: string;
 }
 
+const BUILTIN_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
+
 /** Tools that are gated by `spawning: false` */
 const SPAWNING_TOOLS = new Set(["subagent", "subagents_list", "subagent_resume", "subagent_kill"]);
+
+/** Child-only tools that may not exist in the parent process' tool registry. */
+const CHILD_ONLY_TOOLS = new Set(["subagent_done", "set_tab_title"]);
+
+/** Lifecycle tools that must remain available even under allow/deny filtering. */
+const MANDATORY_CHILD_TOOLS = new Set(["subagent_done"]);
+
+function parseToolCsv(value: string | undefined): string[] {
+  return (value ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function withChildOnlyTools(allToolNames?: string[]): string[] | undefined {
+  if (!allToolNames) return undefined;
+  return [...new Set([...allToolNames, ...CHILD_ONLY_TOOLS])];
+}
+
+function buildSubagentToolAllowList(
+  effectiveTools: string | undefined,
+  denySet: Set<string>,
+  allToolNames?: string[],
+): string[] | undefined {
+  if (!effectiveTools) return undefined;
+
+  const requestedBuiltins = parseToolCsv(effectiveTools).filter((tool) => BUILTIN_TOOLS.has(tool));
+  const extensionTools = (allToolNames ?? [])
+    .filter((tool) => !BUILTIN_TOOLS.has(tool))
+    .filter((tool) => !denySet.has(tool));
+
+  for (const tool of MANDATORY_CHILD_TOOLS) {
+    if (!denySet.has(tool)) extensionTools.push(tool);
+  }
+
+  return [...new Set([...requestedBuiltins, ...extensionTools])];
+}
 
 /**
  * Resolve the effective set of denied tool names from agent defaults.
@@ -538,6 +577,9 @@ export const __test__ = {
   borderLine,
   renderSubagentWidgetLines,
   qualifyModelWithProvider,
+  buildSubagentToolAllowList,
+  resolveDenyTools,
+  withChildOnlyTools,
 };
 
 function startWidgetRefresh() {
@@ -689,7 +731,8 @@ async function launchSubagent(
   // Only send the user's task as a clean message — no wrapper instructions
   // that would confuse the agent into thinking it needs to restart.
   const modeHint = SUBAGENT_COMPLETION_INSTRUCTION;
-  const denySet = resolveDenyTools(agentDefs, options?.allToolNames);
+  const denySet = resolveDenyTools(agentDefs, withChildOnlyTools(options?.allToolNames));
+  for (const tool of MANDATORY_CHILD_TOOLS) denySet.delete(tool);
   const agentType = params.agent ?? params.name;
   const tabTitleInstruction = denySet.has("set_tab_title")
     ? ""
@@ -748,15 +791,9 @@ async function launchSubagent(
     parts.push("--model", shellEscape(model));
   }
 
-  if (effectiveTools) {
-    const BUILTIN_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
-    const builtins = effectiveTools
-      .split(",")
-      .map((t) => t.trim())
-      .filter((t) => BUILTIN_TOOLS.has(t));
-    if (builtins.length > 0) {
-      parts.push("--tools", shellEscape(builtins.join(",")));
-    }
+  const allowedTools = buildSubagentToolAllowList(effectiveTools, denySet, withChildOnlyTools(options?.allToolNames));
+  if (allowedTools && allowedTools.length > 0) {
+    parts.push("--tools", shellEscape(allowedTools.join(",")));
   }
 
   if (effectiveSkills) {
