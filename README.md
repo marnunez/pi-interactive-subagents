@@ -82,11 +82,11 @@ Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm` to force a specific bac
 
 | Agent             | Model                  | Role                                                                                     |
 | ----------------- | ---------------------- | ---------------------------------------------------------------------------------------- |
-| **planner**       | Opus (medium thinking) | Brainstorming — clarifies requirements, explores approaches, writes plans, creates todos |
-| **scout**         | Haiku                  | Fast codebase reconnaissance — maps files, patterns, conventions                         |
-| **worker**        | Sonnet                 | Implements tasks from todos — writes code, runs tests, makes polished commits            |
-| **reviewer**      | Opus (medium thinking) | Reviews code for bugs, security issues, correctness                                      |
-| **visual-tester** | Sonnet                 | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
+| **planner**       | Terra (medium thinking) | Brainstorming — clarifies requirements, explores approaches, writes plans, creates todos |
+| **scout**         | Luna                   | Fast codebase reconnaissance — maps files, patterns, conventions                         |
+| **worker**        | Sol                    | Implements tasks from todos — writes code, runs tests, makes polished commits            |
+| **reviewer**      | Terra (medium thinking) | Reviews code for bugs, security issues, correctness                                      |
+| **visual-tester** | Sol                    | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
 
 Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Override any bundled agent by placing your own version in the higher-priority location.
 
