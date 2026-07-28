@@ -1,10 +1,7 @@
-import { execSync, execFile, execFileSync } from "node:child_process";
-import { promisify } from "node:util";
+import { execSync, execFileSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
-
-const execFileAsync = promisify(execFile);
+import { join } from "node:path";
 
 export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm";
 
@@ -114,30 +111,8 @@ function requireMuxBackend(): MuxBackend {
   return backend;
 }
 
-/**
- * Detect if the user's default shell is fish.
- * Fish uses $status instead of $? for exit codes.
- */
-export function isFishShell(): boolean {
-  const shell = process.env.SHELL ?? "";
-  return basename(shell) === "fish";
-}
-
-/**
- * Return the shell-appropriate exit status variable ($? for bash/zsh, $status for fish).
- */
-export function exitStatusVar(): string {
-  return isFishShell() ? "$status" : "$?";
-}
-
 export function shellEscape(s: string): string {
   return "'" + s.replace(/'/g, "'\\''") + "'";
-}
-
-function tailLines(text: string, lines: number): string {
-  const split = text.split("\n");
-  if (split.length <= lines) return text;
-  return split.slice(-lines).join("\n");
 }
 
 function zellijPaneId(surface: string): string {
@@ -169,14 +144,6 @@ function zellijActionSync(args: string[], surface?: string): string {
     encoding: "utf8",
     env: zellijEnv(surface),
   });
-}
-
-async function zellijActionAsync(args: string[], surface?: string): Promise<string> {
-  const { stdout } = await execFileAsync("zellij", ["action", ...args], {
-    encoding: "utf8",
-    env: zellijEnv(surface),
-  });
-  return stdout;
 }
 
 /**
@@ -479,92 +446,6 @@ export function sendCommand(surface: string, command: string): void {
 }
 
 /**
- * Read the screen contents of a pane (sync).
- */
-export function readScreen(surface: string, lines = 50): string {
-  const backend = requireMuxBackend();
-
-  if (backend === "cmux") {
-    return execSync(`cmux read-screen --surface ${shellEscape(surface)} --lines ${lines}`, {
-      encoding: "utf8",
-    });
-  }
-
-  if (backend === "tmux") {
-    return execFileSync(
-      "tmux",
-      ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
-      {
-        encoding: "utf8",
-      },
-    );
-  }
-
-  if (backend === "wezterm") {
-    const raw = execFileSync(
-      "wezterm",
-      ["cli", "get-text", "--pane-id", surface],
-      { encoding: "utf8" },
-    );
-    return tailLines(raw, lines);
-  }
-
-  // Zellij 0.44+: use --pane-id flag + stdout instead of env var + temp file.
-  // The ZELLIJ_PANE_ID env var doesn't reliably target other panes for dump-screen,
-  // and --path may silently fail to create the file. Stdout capture is robust.
-  const paneId = zellijPaneId(surface);
-  const raw = execFileSync(
-    "zellij",
-    ["action", "dump-screen", "--pane-id", paneId],
-    { encoding: "utf8" },
-  );
-  return tailLines(raw, lines);
-}
-
-/**
- * Read the screen contents of a pane (async).
- */
-export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
-  const backend = requireMuxBackend();
-
-  if (backend === "cmux") {
-    const { stdout } = await execFileAsync(
-      "cmux",
-      ["read-screen", "--surface", surface, "--lines", String(lines)],
-      { encoding: "utf8" },
-    );
-    return stdout;
-  }
-
-  if (backend === "tmux") {
-    const { stdout } = await execFileAsync(
-      "tmux",
-      ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
-      { encoding: "utf8" },
-    );
-    return stdout;
-  }
-
-  if (backend === "wezterm") {
-    const { stdout } = await execFileAsync(
-      "wezterm",
-      ["cli", "get-text", "--pane-id", surface],
-      { encoding: "utf8" },
-    );
-    return tailLines(stdout, lines);
-  }
-
-  // Zellij 0.44+: use --pane-id flag + stdout instead of env var + temp file.
-  const paneId = zellijPaneId(surface);
-  const { stdout } = await execFileAsync(
-    "zellij",
-    ["action", "dump-screen", "--pane-id", paneId],
-    { encoding: "utf8" },
-  );
-  return tailLines(stdout, lines);
-}
-
-/**
  * Close a pane.
  */
 export function closeSurface(surface: string): void {
@@ -592,45 +473,4 @@ export function closeSurface(surface: string): void {
   }
 
   zellijActionSync(["close-pane"], surface);
-}
-
-/**
- * Poll a pane until the __SUBAGENT_DONE_N__ sentinel appears.
- * Returns the process exit code embedded in the sentinel.
- * Throws if the signal is aborted before the sentinel is found.
- */
-export async function pollForExit(
-  surface: string,
-  signal: AbortSignal,
-  options: { interval: number; onTick?: (elapsed: number) => void },
-): Promise<number> {
-  const start = Date.now();
-
-  while (true) {
-    if (signal.aborted) {
-      throw new Error("Aborted while waiting for subagent to finish");
-    }
-
-    const screen = await readScreenAsync(surface, 5);
-    const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
-    if (match) {
-      return parseInt(match[1], 10);
-    }
-
-    const elapsed = Math.floor((Date.now() - start) / 1000);
-    options.onTick?.(elapsed);
-
-    await new Promise<void>((resolve, reject) => {
-      if (signal.aborted) return reject(new Error("Aborted"));
-      const timer = setTimeout(() => {
-        signal.removeEventListener("abort", onAbort);
-        resolve();
-      }, options.interval);
-      function onAbort() {
-        clearTimeout(timer);
-        reject(new Error("Aborted"));
-      }
-      signal.addEventListener("abort", onAbort, { once: true });
-    });
-  }
 }

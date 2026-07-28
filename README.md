@@ -6,7 +6,7 @@ https://github.com/user-attachments/assets/30adb156-cfb4-4c47-84ca-dd4aa80cba9f
 
 ## How It Works
 
-Call `subagent()` and it **returns immediately**. The sub-agent runs in its own terminal pane. A live widget above the input shows all running agents with elapsed time and progress. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the agent can process it.
+Call `subagent()` and it **returns immediately**. The sub-agent runs as a fully interactive Pi TUI in its own terminal pane. A live widget above the input shows all running agents with elapsed time and progress. Parent and child communicate over an authenticated Unix-domain socket; terminal contents are never scraped. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the agent can process it.
 
 ```
 ╭─ Subagents ──────────────────────── 2 running ─╮
@@ -95,12 +95,15 @@ Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global**
 ## Async Subagent Flow
 
 ```
-1. Agent calls subagent()         → returns immediately ("started")
-2. Sub-agent runs in mux pane     → widget shows live progress
-3. User keeps chatting             → main session fully interactive
-4. Sub-agent finishes              → result steered back as interrupt
-5. Main agent processes result     → continues with new context
+1. Agent calls subagent()          → returns immediately ("started")
+2. Child opens a real Pi TUI       → user can watch, type, and steer directly
+3. Child bridge authenticates      → parent/child lifecycle moves over Unix IPC
+4. User keeps chatting             → main session remains fully interactive
+5. Sub-agent finishes              → structured result steered back as interrupt
+6. Main agent processes result     → continues with new context
 ```
+
+The multiplexer is used only to create, focus, rename, and close panes. Lifecycle, progress, completion, cancellation, and parent-issued prompts use framed IPC messages under `$XDG_RUNTIME_DIR/pi-subagents/`; no pane screen contents or shell sentinels are involved. Child connections automatically retry across parent `/reload`, and unresolved launches are reconstructed from non-context session entries.
 
 Multiple subagents run concurrently — each steers its result back independently as it finishes. The live widget above the input tracks all running agents:
 
@@ -116,7 +119,7 @@ Completion messages render with a colored background and are expandable with `Ct
 
 ### Structured Completion Contract
 
-Every sub-agent must finish by calling `subagent_done` exactly once. Exiting without a persisted `subagent_done_result` is a protocol failure, even if the process exits with code 0. A session with more than one completion result is considered corrupt.
+By default, every sub-agent must finish by calling `subagent_done` exactly once. Exiting without a persisted `subagent_done_result` is a protocol failure, even if the process exits cleanly. Agents configured with `auto-exit: true` instead persist a bounded fallback result from their final assistant message and shut down on the first fully settled run when they did not explicitly call `subagent_done`.
 
 ```typescript
 subagent_done({
@@ -256,6 +259,7 @@ You are a specialized agent that does X...
 | `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
+| `auto-exit`   | boolean | When `true`, persist the final assistant response and shut down after the initial task fully settles if `subagent_done` was not called explicitly                                                                                                                            |
 
 ---
 

@@ -3,20 +3,22 @@
  * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+J)
  * - Provides a mandatory structured `subagent_done` lifecycle tool
  */
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Box, Text } from "@mariozechner/pi-tui";
-import { Type } from "@mariozechner/pi-ai";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Box, Text } from "@earendil-works/pi-tui";
+import { Type, type Static } from "typebox";
 
 const defineTool = <T>(tool: T): T => tool;
 import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import {
+  findLastAssistantMessage,
   SUBAGENT_DONE_RESULT_TYPE,
   type SessionEntry,
   type SubagentArtifactRef,
   type SubagentDoneResult,
 } from "./session.ts";
+import { ChildIpcClient, type IpcEnvelope } from "./ipc.ts";
 
 const MAX_SUMMARY_CHARS = 2_000;
 const MAX_REPORT_CHARS = 50 * 1024;
@@ -78,12 +80,7 @@ const DoneParams = Type.Object({
     ),
   ),
 });
-
-function hasExistingDoneResult(entries: SessionEntry[]): boolean {
-  return entries.some(
-    (entry) => entry.type === "custom" && entry.customType === SUBAGENT_DONE_RESULT_TYPE,
-  );
-}
+type DoneParamsValue = Static<typeof DoneParams>;
 
 function lineCount(text: string): number {
   return text.split("\n").length;
@@ -118,7 +115,7 @@ function resolveArtifact(artifactDir: string, name: string): string {
 }
 
 export function validateSubagentDoneParams(
-  params: typeof DoneParams.static,
+  params: DoneParamsValue,
   artifactDir: string,
 ): Omit<SubagentDoneResult, "completedAt"> {
   if (params.status !== "success" && params.status !== "failed" && params.status !== "blocked") {
@@ -171,10 +168,66 @@ export default function (pi: ExtensionAPI) {
   let toolNames: string[] = [];
   let denied: string[] = [];
   let expanded = false;
+  let completionSent = false;
+  let latestCtx: ExtensionContext | null = null;
 
-  // Read subagent identity from env vars (set by parent orchestrator)
+  // Read subagent identity and IPC configuration from env vars set by the parent.
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
+  const childId = process.env.PI_SUBAGENT_ID ?? "";
+  const socketPath = process.env.PI_SUBAGENT_SOCKET ?? "";
+  const token = process.env.PI_SUBAGENT_TOKEN ?? "";
+  const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
+  const lockedModel = process.env.PI_SUBAGENT_MODEL;
+  const lockedThinking = process.env.PI_SUBAGENT_THINKING;
+  const lockedTools = (process.env.PI_SUBAGENT_TOOLS ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  const ipc = childId && socketPath && token
+    ? new ChildIpcClient({
+        socketPath,
+        childId,
+        token,
+        helloPayload: () => ({
+          pid: process.pid,
+          name: subagentName,
+          agent: subagentAgent || undefined,
+          sessionId: latestCtx?.sessionManager.getSessionId(),
+          sessionFile: latestCtx?.sessionManager.getSessionFile(),
+          model: latestCtx?.model
+            ? `${latestCtx.model.provider}/${latestCtx.model.id}`
+            : undefined,
+          autoExit,
+        }),
+        onMessage: (message: IpcEnvelope) => {
+          const payload = message.payload as { text?: string } | undefined;
+          if (message.type === "prompt" && payload?.text) {
+            if (latestCtx?.isIdle()) pi.sendUserMessage(payload.text);
+            else pi.sendUserMessage(payload.text, { deliverAs: "followUp" });
+          } else if (message.type === "steer" && payload?.text) {
+            pi.sendUserMessage(payload.text, { deliverAs: "steer" });
+          } else if (message.type === "follow_up" && payload?.text) {
+            pi.sendUserMessage(payload.text, { deliverAs: "followUp" });
+          } else if (message.type === "abort") {
+            void latestCtx?.abort();
+          } else if (message.type === "shutdown") {
+            void latestCtx?.abort();
+            latestCtx?.shutdown();
+          } else if (message.type === "ping") {
+            ipc?.send("pong", { timestamp: Date.now() });
+          }
+        },
+      })
+    : null;
+
+  function persistAndSendCompletion(result: SubagentDoneResult): void {
+    if (completionSent) throw new Error("subagent_done has already been called for this run.");
+    completionSent = true;
+    pi.appendEntry(SUBAGENT_DONE_RESULT_TYPE, result);
+    ipc?.send("completion", result);
+  }
 
   function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
     ctx.ui.setWidget(
@@ -227,8 +280,16 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
-  // Show widget + status bar on session start
+  // Show widget + status bar and establish the parent IPC connection.
   pi.on("session_start", (_event, ctx) => {
+    latestCtx = ctx;
+    completionSent = false;
+    ipc?.start();
+    ipc?.send("ready", {
+      sessionId: ctx.sessionManager.getSessionId(),
+      sessionFile: ctx.sessionManager.getSessionFile(),
+    });
+
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
     denied = (process.env.PI_DENY_TOOLS ?? "")
@@ -237,6 +298,65 @@ export default function (pi: ExtensionAPI) {
       .filter(Boolean);
 
     renderWidget(ctx, null);
+  });
+
+  // Reassert parent-selected model and tools after all startup extensions (including presets) ran.
+  pi.on("before_agent_start", async () => {
+    if (lockedModel?.includes("/")) {
+      const slash = lockedModel.indexOf("/");
+      const provider = lockedModel.slice(0, slash);
+      const modelId = lockedModel.slice(slash + 1);
+      const model = latestCtx?.modelRegistry.find(provider, modelId);
+      if (model && (latestCtx?.model?.provider !== provider || latestCtx.model.id !== modelId)) {
+        await pi.setModel(model);
+      }
+    }
+    if (lockedThinking) pi.setThinkingLevel(lockedThinking as any);
+    if (lockedTools.length > 0) pi.setActiveTools(lockedTools);
+  });
+
+  pi.on("agent_start", () => {
+    ipc?.send("running", { timestamp: Date.now() });
+  });
+
+  pi.on("message_end", (_event, ctx) => {
+    ipc?.send("activity", {
+      entries: ctx.sessionManager.getEntries().length,
+      timestamp: Date.now(),
+    });
+  });
+
+  pi.on("agent_settled", (_event, ctx) => {
+    ipc?.send("settled", { timestamp: Date.now(), autoExit });
+    if (!autoExit || completionSent) return;
+
+    const entries = ctx.sessionManager.getEntries() as unknown as SessionEntry[];
+    const report = findLastAssistantMessage(entries) ?? "Subagent settled without a textual final response.";
+    const boundedReport = report
+      .split("\n")
+      .slice(0, MAX_REPORT_LINES)
+      .join("\n")
+      .slice(0, MAX_REPORT_CHARS)
+      .trim();
+    const summary = boundedReport.slice(0, MAX_SUMMARY_CHARS).trim() || "Subagent task settled.";
+    const result: SubagentDoneResult = {
+      schemaVersion: 1,
+      status: "success",
+      summary,
+      report: boundedReport === summary ? undefined : boundedReport,
+      completedAt: new Date().toISOString(),
+    };
+    persistAndSendCompletion(result);
+    setTimeout(() => ctx.shutdown(), 0);
+  });
+
+  pi.on("session_shutdown", (event, ctx) => {
+    ipc?.send("shutdown", {
+      reason: event.reason,
+      sessionId: ctx.sessionManager.getSessionId(),
+      completionSent,
+    });
+    if (event.reason !== "reload") latestCtx = null;
   });
 
   // Toggle expand/collapse with Ctrl+J
@@ -257,10 +377,9 @@ export default function (pi: ExtensionAPI) {
       "Exiting without calling this tool is a protocol failure.",
     parameters: DoneParams,
     async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
-      const params = rawParams as typeof DoneParams.static;
-      const entries = ctx.sessionManager.getEntries() as unknown as SessionEntry[];
-      if (hasExistingDoneResult(entries)) {
-        throw new Error("subagent_done has already been called for this session.");
+      const params = rawParams as DoneParamsValue;
+      if (completionSent) {
+        throw new Error("subagent_done has already been called for this run.");
       }
 
       const project = basename(ctx.cwd);
@@ -272,7 +391,7 @@ export default function (pi: ExtensionAPI) {
         completedAt: new Date().toISOString(),
       };
 
-      pi.appendEntry(SUBAGENT_DONE_RESULT_TYPE, result);
+      persistAndSendCompletion(result);
 
       setTimeout(() => ctx.shutdown(), 0);
 

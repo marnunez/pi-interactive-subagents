@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { visibleWidth } from "@mariozechner/pi-tui";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 import {
@@ -20,6 +20,12 @@ import {
 
 import { shellEscape, isCmuxAvailable, isWezTermAvailable } from "../pi-extension/subagents/cmux.ts";
 import { validateSubagentDoneParams } from "../pi-extension/subagents/subagent-done.ts";
+import {
+  ChildIpcClient,
+  encodeIpcFrame,
+  IpcFrameDecoder,
+  ParentIpcServer,
+} from "../pi-extension/subagents/ipc.ts";
 
 // --- Helpers ---
 
@@ -524,6 +530,99 @@ describe("subagents widget rendering", () => {
         );
       }
     }
+  });
+});
+
+describe("subagent IPC", () => {
+  it("decodes fragmented length-prefixed frames", () => {
+    const frame = encodeIpcFrame({
+      version: 1,
+      type: "activity",
+      childId: "child-1",
+      sequence: 1,
+      payload: { entries: 4 },
+    });
+    const decoder = new IpcFrameDecoder();
+
+    assert.deepEqual(decoder.push(frame.subarray(0, 3)), []);
+    assert.deepEqual(decoder.push(frame.subarray(3, 9)), []);
+    const messages = decoder.push(frame.subarray(9));
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0].type, "activity");
+    assert.deepEqual(messages[0].payload, { entries: 4 });
+  });
+
+  it("authenticates a child and carries bidirectional messages", async () => {
+    const dir = createTestDir();
+    const socketPath = join(dir, "parent.sock");
+    const token = "a".repeat(64);
+    let resolveActivity!: () => void;
+    let resolveCommand!: () => void;
+    const activity = new Promise<void>((resolve) => { resolveActivity = resolve; });
+    const command = new Promise<void>((resolve) => { resolveCommand = resolve; });
+
+    const server = new ParentIpcServer({
+      socketPath,
+      onMessage(message) {
+        if (message.type === "activity") resolveActivity();
+      },
+      onConnect(childId) {
+        server.send(childId, "ping", { timestamp: 1 });
+      },
+    });
+    server.registerChild("child-1", token);
+    await server.start();
+
+    const client = new ChildIpcClient({
+      socketPath,
+      childId: "child-1",
+      token,
+      helloPayload: () => ({ pid: process.pid }),
+      onMessage(message) {
+        if (message.type === "ping") resolveCommand();
+      },
+      reconnectDelayMs: 20,
+    });
+    client.start();
+    client.send("activity", { entries: 1 });
+
+    await Promise.race([
+      Promise.all([activity, command]),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("IPC test timed out")), 2000)),
+    ]);
+
+    client.stop();
+    await server.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("rejects a child with the wrong token", async () => {
+    const dir = createTestDir();
+    const socketPath = join(dir, "parent.sock");
+    let connected = false;
+    const server = new ParentIpcServer({
+      socketPath,
+      onMessage() {},
+      onConnect() { connected = true; },
+    });
+    server.registerChild("child-1", "correct-token");
+    await server.start();
+
+    const client = new ChildIpcClient({
+      socketPath,
+      childId: "child-1",
+      token: "wrong-token",
+      helloPayload: () => ({}),
+      reconnectDelayMs: 1000,
+    });
+    client.start();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    assert.equal(connected, false);
+    assert.equal(server.isConnected("child-1"), false);
+    client.stop();
+    await server.close();
+    rmSync(dir, { recursive: true, force: true });
   });
 });
 

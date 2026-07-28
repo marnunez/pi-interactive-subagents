@@ -1,9 +1,9 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { keyHint } from "@mariozechner/pi-coding-agent";
-import { Type } from "@mariozechner/pi-ai";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { keyHint } from "@earendil-works/pi-coding-agent";
+import { Type, type Static } from "typebox";
 
 const defineTool = <T>(tool: T): T => tool;
-import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { basename, dirname, join } from "node:path";
 import {
   readdirSync,
@@ -21,20 +21,21 @@ import {
   muxSetupHint,
   createSurface,
   sendCommand,
-  pollForExit,
   closeSurface,
   shellEscape,
-  exitStatusVar,
   renameCurrentTab,
   renameWorkspace,
 } from "./cmux.ts";
 import {
-  getNewEntries,
-  findLastAssistantMessage,
-  findSubagentDoneResultEntries,
   isSubagentDoneResult,
   type SubagentDoneResult,
 } from "./session.ts";
+import {
+  createIpcToken,
+  getIpcSocketPath,
+  type IpcEnvelope,
+  ParentIpcServer,
+} from "./ipc.ts";
 
 const SUBAGENT_COMPLETION_INSTRUCTION =
   "Complete your task. When finished, call the subagent_done tool exactly once with a structured result. " +
@@ -83,6 +84,7 @@ const SubagentParams = Type.Object({
     }),
   ),
 });
+type SubagentParamsValue = Static<typeof SubagentParams>;
 
 interface AgentDefaults {
   model?: string;
@@ -96,6 +98,7 @@ interface AgentDefaults {
   cwd?: string;
   workspace?: string;
   env?: string;
+  autoExit?: boolean;
   body?: string;
 }
 
@@ -207,6 +210,7 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
     // Extract body (everything after frontmatter)
     const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
     const spawningRaw = get("spawning");
+    const autoExitRaw = get("auto-exit");
     return {
       model: get("model"),
       tools: get("tools"),
@@ -219,6 +223,7 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
       cwd: get("cwd"),
       workspace: get("workspace"),
       env: get("env"),
+      autoExit: autoExitRaw != null ? autoExitRaw === "true" : undefined,
       body: body || undefined,
     };
   }
@@ -312,43 +317,6 @@ function formatBytes(bytes: number): string {
   return `${mb.toFixed(1)}MB`;
 }
 
-function parseSubagentCompletion(
-  sessionFile: string,
-  afterLine: number,
-): { result?: SubagentDoneResult; protocolError?: string; diagnosticSummary?: string } {
-  if (!existsSync(sessionFile)) {
-    return { protocolError: "Subagent session file was not found." };
-  }
-
-  const entries = getNewEntries(sessionFile, afterLine);
-  const doneEntries = findSubagentDoneResultEntries(entries);
-
-  const diagnosticSummary = findLastAssistantMessage(entries) ?? undefined;
-  if (doneEntries.length === 0) {
-    return {
-      protocolError: "Subagent exited without calling subagent_done.",
-      diagnosticSummary,
-    };
-  }
-
-  if (doneEntries.length > 1) {
-    return {
-      protocolError: `Subagent session is corrupt: found ${doneEntries.length} subagent_done_result entries.`,
-      diagnosticSummary,
-    };
-  }
-
-  const result = doneEntries[0].data;
-  if (!isSubagentDoneResult(result)) {
-    return {
-      protocolError: "Subagent session contains a malformed subagent_done_result entry.",
-      diagnosticSummary,
-    };
-  }
-
-  return { result };
-}
-
 function buildSubagentResultContent(details: SubagentResult): string {
   const lines: string[] = [];
   const agentTag = details.agent ? ` (${details.agent})` : "";
@@ -413,6 +381,8 @@ type SubagentProtocolStatus = "completed" | "failed" | "cancelled";
  * describes the child agent's task outcome when the protocol completed.
  */
 interface SubagentResult {
+  /** Parent-side orchestration id; omitted from older persisted results. */
+  id?: string;
   name: string;
   task: string;
   agent?: string;
@@ -440,14 +410,22 @@ interface RunningSubagent {
   entries?: number;
   bytes?: number;
   forkCleanupFile?: string;
-  abortController?: AbortController;
   workspace?: string;
   previousWorkspace?: string;
   workspaceProcess?: ChildProcess;
+  ipcToken: string;
+  autoExit: boolean;
+  connected?: boolean;
 }
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
+
+const IPC_LAUNCH_ENTRY = "subagent_ipc_launch";
+const IPC_FINISH_ENTRY = "subagent_ipc_finish";
+let parentIpcServer: ParentIpcServer | null = null;
+let parentIpcSocketPath = "";
+let acceptIpcResults = false;
 
 // ── Widget management ──
 
@@ -538,7 +516,9 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
     const right =
       agent.entries != null && agent.bytes != null
         ? ` ${agent.entries} msgs (${formatBytes(agent.bytes)}) `
-        : " starting… ";
+        : agent.connected
+          ? " connected "
+          : " connecting… ";
 
     lines.push(borderLine(left, right, width));
   }
@@ -636,63 +616,31 @@ function launchWorkspaceSurface(
 }
 
 /**
- * Poll for a WezTerm process to exit.
- */
-async function pollProcessExit(
-  proc: ChildProcess,
-  signal: AbortSignal,
-  options: { interval: number; onTick?: () => void },
-): Promise<number> {
-  return new Promise((resolve, reject) => {
-    // If process already exited
-    if (proc.exitCode !== null) {
-      resolve(proc.exitCode);
-      return;
-    }
-
-    const checkInterval = setInterval(() => {
-      if (signal.aborted) {
-        clearInterval(checkInterval);
-        reject(new Error("Aborted"));
-        return;
-      }
-      options.onTick?.();
-      // Check if process is still running
-      try {
-        process.kill(proc.pid!, 0);
-      } catch {
-        // Process is dead
-        clearInterval(checkInterval);
-        resolve(0);
-      }
-    }, options.interval);
-
-    signal.addEventListener("abort", () => {
-      clearInterval(checkInterval);
-      reject(new Error("Aborted"));
-    }, { once: true });
-  });
-}
-
-/**
  * Launch a subagent: creates the multiplexer pane, builds the command, and
  * sends it. Returns a RunningSubagent — does NOT poll.
  *
- * Call watchSubagent() on the returned object to observe completion.
+ * Lifecycle and completion are reported through the child IPC bridge.
  */
 async function launchSubagent(
-  params: typeof SubagentParams.static,
+  params: SubagentParamsValue,
   ctx: { sessionManager: { getSessionFile(): string | undefined; getSessionId(): string }; cwd: string },
   options?: { surface?: string; allToolNames?: string[] },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
+  const ipcToken = createIpcToken();
+
+  if (!parentIpcServer || !parentIpcSocketPath) {
+    throw new Error("Subagent IPC server is not ready");
+  }
+  parentIpcServer.registerChild(id, ipcToken);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   const effectiveModel = params.model ?? agentDefs?.model;
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
+  const effectiveAutoExit = agentDefs?.autoExit ?? false;
 
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
@@ -785,9 +733,10 @@ async function launchSubagent(
   const subagentDonePath = join(dirname(new URL(import.meta.url).pathname), "subagent-done.ts");
   parts.push("-e", shellEscape(subagentDonePath));
 
+  let qualifiedModelForLock: string | undefined;
   if (effectiveModel) {
-    const qualifiedModel = qualifyModelWithProvider(effectiveModel, ctx);
-    const model = effectiveThinking ? `${qualifiedModel}:${effectiveThinking}` : qualifiedModel;
+    qualifiedModelForLock = qualifyModelWithProvider(effectiveModel, ctx);
+    const model = effectiveThinking ? `${qualifiedModelForLock}:${effectiveThinking}` : qualifiedModelForLock;
     parts.push("--model", shellEscape(model));
   }
 
@@ -811,6 +760,19 @@ async function launchSubagent(
     envParts.push(`PI_DENY_TOOLS=${shellEscape([...denySet].join(","))}`);
   }
   envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
+  envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
+  envParts.push(`PI_SUBAGENT_SOCKET=${shellEscape(parentIpcSocketPath)}`);
+  envParts.push(`PI_SUBAGENT_TOKEN=${shellEscape(ipcToken)}`);
+  envParts.push(`PI_SUBAGENT_AUTO_EXIT=${effectiveAutoExit ? "1" : "0"}`);
+  if (qualifiedModelForLock) {
+    envParts.push(`PI_SUBAGENT_MODEL=${shellEscape(qualifiedModelForLock)}`);
+  }
+  if (effectiveThinking) {
+    envParts.push(`PI_SUBAGENT_THINKING=${shellEscape(effectiveThinking)}`);
+  }
+  if (allowedTools?.length) {
+    envParts.push(`PI_SUBAGENT_TOOLS=${shellEscape(allowedTools.join(","))}`);
+  }
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
   }
@@ -861,7 +823,7 @@ async function launchSubagent(
 
   if (effectiveWorkspace && !options?.surface) {
     // ── Workspace mode: launch in a WezTerm window on a dedicated Sway workspace ──
-    const command = `${piCommand}; echo '__SUBAGENT_DONE__'`;
+    const command = piCommand;
     const { process: wezProc, previousWorkspace: prevWs } = launchWorkspaceSurface(
       effectiveWorkspace,
       params.name,
@@ -881,6 +843,8 @@ async function launchSubagent(
       workspace: effectiveWorkspace,
       previousWorkspace: prevWs ?? undefined,
       workspaceProcess: wezProc,
+      ipcToken,
+      autoExit: effectiveAutoExit,
     };
 
     runningSubagents.set(id, running);
@@ -888,8 +852,7 @@ async function launchSubagent(
   }
 
   // ── Normal mode: multiplexer pane ──
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'${exitStatusVar()}'__'`;
-  sendCommand(surface, command);
+  sendCommand(surface, piCommand);
 
   const running: RunningSubagent = {
     id,
@@ -900,158 +863,235 @@ async function launchSubagent(
     startTime,
     sessionFile: subagentSessionFile,
     forkCleanupFile,
+    ipcToken,
+    autoExit: effectiveAutoExit,
   };
 
   runningSubagents.set(id, running);
   return running;
 }
 
-/**
- * Watch a launched subagent until it exits. Polls for completion, extracts
- * the summary from the session file, cleans up the surface and fork file,
- * and removes the entry from runningSubagents.
- */
-async function watchSubagent(
-  running: RunningSubagent,
-  signal: AbortSignal,
-  options: { afterLine?: number } = {},
-): Promise<SubagentResult> {
-  const { name, task, agent, surface, startTime, sessionFile, forkCleanupFile } = running;
-  const afterLine = options.afterLine ?? 0;
-
-  try {
-    let exitCode: number;
-
-    if (running.workspace && running.workspaceProcess) {
-      // ── Workspace mode: poll the WezTerm process ──
-      exitCode = await pollProcessExit(running.workspaceProcess, signal, {
-        interval: 1000,
-        onTick() {
-          try {
-            if (existsSync(sessionFile)) {
-              const stat = statSync(sessionFile);
-              const raw = readFileSync(sessionFile, "utf8");
-              running.entries = raw.split("\n").filter((l) => l.trim()).length;
-              running.bytes = stat.size;
-            }
-          } catch {}
-        },
-      });
-    } else {
-      // ── Normal mode: poll mux screen for sentinel ──
-      exitCode = await pollForExit(surface, signal, {
-        interval: 1000,
-        onTick() {
-          try {
-            if (existsSync(sessionFile)) {
-              const stat = statSync(sessionFile);
-              const raw = readFileSync(sessionFile, "utf8");
-              running.entries = raw.split("\n").filter((l) => l.trim()).length;
-              running.bytes = stat.size;
-            }
-          } catch {}
-        },
-      });
-    }
-
-    const elapsed = Math.floor((Date.now() - startTime) / 1000);
-    const parsed = parseSubagentCompletion(sessionFile, afterLine);
-
-    // Cleanup: workspace mode switches back, normal mode closes surface
-    if (running.workspace) {
-      if (running.previousWorkspace) {
-        switchSwayWorkspace(running.previousWorkspace);
-      }
-    } else {
-      closeSurface(surface);
-    }
-    runningSubagents.delete(running.id);
-
-    // Clean up temp fork file
-    if (forkCleanupFile) {
-      try {
-        unlinkSync(forkCleanupFile);
-      } catch {}
-    }
-
-    if (parsed.result) {
-      return {
-        name,
-        task,
-        agent,
-        protocolStatus: "completed",
-        result: parsed.result,
-        sessionFile,
-        exitCode,
-        elapsed,
-      };
-    }
-
-    return {
-      name,
-      task,
-      agent,
-      protocolStatus: "failed",
-      protocolError: parsed.protocolError ?? "Subagent completion protocol failed.",
-      diagnosticSummary: parsed.diagnosticSummary,
-      sessionFile,
-      exitCode,
-      elapsed,
-    };
-  } catch (err: any) {
-    if (forkCleanupFile) {
-      try {
-        unlinkSync(forkCleanupFile);
-      } catch {}
-    }
-    try {
-      closeSurface(surface);
-    } catch {}
-    runningSubagents.delete(running.id);
-
-    if (signal.aborted) {
-      return {
-        name,
-        task,
-        agent,
-        protocolStatus: "cancelled",
-        protocolError: "Subagent was cancelled by the parent.",
-        sessionFile,
-        exitCode: 1,
-        elapsed: Math.floor((Date.now() - startTime) / 1000),
-        error: "cancelled",
-      };
-    }
-    return {
-      name,
-      task,
-      agent,
-      protocolStatus: "failed",
-      protocolError: `Subagent watcher error: ${err?.message ?? String(err)}`,
-      sessionFile,
-      exitCode: 1,
-      elapsed: Math.floor((Date.now() - startTime) / 1000),
-      error: err?.message ?? String(err),
-    };
-  }
-}
-
 export default function subagentsExtension(pi: ExtensionAPI) {
-  // Capture the UI context for widget updates
-  pi.on("session_start", (_event, ctx) => {
-    latestCtx = ctx;
+  const isChildProcess = !!process.env.PI_SUBAGENT_ID;
+  const connectionFailureTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  const serializeRunning = (running: RunningSubagent) => ({
+    id: running.id,
+    name: running.name,
+    task: running.task,
+    agent: running.agent,
+    surface: running.surface,
+    startTime: running.startTime,
+    sessionFile: running.sessionFile,
+    forkCleanupFile: running.forkCleanupFile,
+    workspace: running.workspace,
+    previousWorkspace: running.previousWorkspace,
+    ipcToken: running.ipcToken,
+    autoExit: running.autoExit,
   });
 
-  // Clean up on session shutdown
-  pi.on("session_shutdown", (_event, _ctx) => {
+  const finishSubagent = (result: SubagentResult) => {
+    if (!acceptIpcResults) return;
+    const running = runningSubagents.get(result.id ?? "");
+    const childId = result.id;
+    if (!childId || !running) return;
+
+    const failureTimer = connectionFailureTimers.get(childId);
+    if (failureTimer) clearTimeout(failureTimer);
+    connectionFailureTimers.delete(childId);
+    parentIpcServer?.unregisterChild(childId);
+    runningSubagents.delete(childId);
+    if (running.workspace) {
+      if (running.previousWorkspace) switchSwayWorkspace(running.previousWorkspace);
+    } else {
+      try { closeSurface(running.surface); } catch {}
+    }
+    if (running.forkCleanupFile) {
+      try { unlinkSync(running.forkCleanupFile); } catch {}
+    }
+    pi.appendEntry(IPC_FINISH_ENTRY, { id: childId, finishedAt: Date.now() });
+    updateWidget();
+    pi.sendMessage(
+      {
+        customType: "subagent_result",
+        content: buildSubagentResultContent(result),
+        display: true,
+        details: result,
+      },
+      { triggerTurn: true, deliverAs: "steer" },
+    );
+  };
+
+  const scheduleConnectionFailure = (childId: string, delayMs: number, reason: string) => {
+    const previous = connectionFailureTimers.get(childId);
+    if (previous) clearTimeout(previous);
+    connectionFailureTimers.set(childId, setTimeout(() => {
+      connectionFailureTimers.delete(childId);
+      const running = runningSubagents.get(childId);
+      if (!running || running.connected || !acceptIpcResults) return;
+      finishSubagent({
+        id: running.id,
+        name: running.name,
+        task: running.task,
+        agent: running.agent,
+        protocolStatus: "failed",
+        protocolError: reason,
+        sessionFile: running.sessionFile,
+        elapsed: Math.floor((Date.now() - running.startTime) / 1000),
+      });
+    }, delayMs));
+  };
+
+  const handleIpcMessage = (message: IpcEnvelope) => {
+    const running = runningSubagents.get(message.childId);
+    if (!running) return;
+    const payload = message.payload as any;
+
+    if (message.type === "hello" || message.type === "ready") {
+      running.connected = true;
+      if (payload?.sessionFile) running.sessionFile = payload.sessionFile;
+      updateWidget();
+      return;
+    }
+    if (message.type === "activity") {
+      if (typeof payload?.entries === "number") running.entries = payload.entries;
+      try {
+        if (existsSync(running.sessionFile)) running.bytes = statSync(running.sessionFile).size;
+      } catch {}
+      updateWidget();
+      return;
+    }
+    if (message.type === "completion") {
+      if (!isSubagentDoneResult(payload)) {
+        finishSubagent({
+          ...running,
+          id: running.id,
+          protocolStatus: "failed",
+          protocolError: "Subagent sent a malformed completion result over IPC.",
+          elapsed: Math.floor((Date.now() - running.startTime) / 1000),
+        } as SubagentResult & { id: string });
+        return;
+      }
+      finishSubagent({
+        id: running.id,
+        name: running.name,
+        task: running.task,
+        agent: running.agent,
+        protocolStatus: "completed",
+        result: payload,
+        sessionFile: running.sessionFile,
+        elapsed: Math.floor((Date.now() - running.startTime) / 1000),
+      } as SubagentResult & { id: string });
+      return;
+    }
+    if (message.type === "shutdown" && payload?.reason !== "reload") {
+      // Explicit completion is sent before shutdown. Give that frame a moment to arrive first.
+      setTimeout(() => {
+        if (!runningSubagents.has(running.id)) return;
+        finishSubagent({
+          id: running.id,
+          name: running.name,
+          task: running.task,
+          agent: running.agent,
+          protocolStatus: "failed",
+          protocolError: "Subagent exited without sending a structured completion result.",
+          sessionFile: running.sessionFile,
+          elapsed: Math.floor((Date.now() - running.startTime) / 1000),
+        } as SubagentResult & { id: string });
+      }, 100);
+    }
+  };
+
+  // Capture UI context, restore unresolved launches, and start the IPC server.
+  pi.on("session_start", async (_event, ctx) => {
+    latestCtx = ctx;
+    if (isChildProcess) return;
+
+    acceptIpcResults = false;
+    await parentIpcServer?.close().catch(() => {});
+    parentIpcSocketPath = getIpcSocketPath(ctx.sessionManager.getSessionId());
+
+    const entries = ctx.sessionManager.getBranch() as Array<{
+      type: string;
+      customType?: string;
+      data?: any;
+    }>;
+    const finished = new Set(
+      entries
+        .filter((entry) => entry.type === "custom" && entry.customType === IPC_FINISH_ENTRY)
+        .map((entry) => entry.data?.id)
+        .filter(Boolean),
+    );
+    runningSubagents.clear();
+    for (const entry of entries) {
+      if (entry.type !== "custom" || entry.customType !== IPC_LAUNCH_ENTRY) continue;
+      const data = entry.data as RunningSubagent | undefined;
+      if (!data?.id || !data.ipcToken || finished.has(data.id)) continue;
+      runningSubagents.set(data.id, { ...data });
+    }
+
+    parentIpcServer = new ParentIpcServer({
+      socketPath: parentIpcSocketPath,
+      onMessage: handleIpcMessage,
+      onConnect: (childId) => {
+        const timer = connectionFailureTimers.get(childId);
+        if (timer) clearTimeout(timer);
+        connectionFailureTimers.delete(childId);
+        const running = runningSubagents.get(childId);
+        if (running) running.connected = true;
+        updateWidget();
+      },
+      onDisconnect: (childId) => {
+        const running = runningSubagents.get(childId);
+        if (running) {
+          running.connected = false;
+          scheduleConnectionFailure(
+            childId,
+            2_000,
+            "Subagent IPC connection closed without a completion result.",
+          );
+        }
+        updateWidget();
+      },
+    });
+    for (const running of runningSubagents.values()) {
+      parentIpcServer.registerChild(running.id, running.ipcToken);
+    }
+    await parentIpcServer.start();
+    acceptIpcResults = true;
+    for (const running of runningSubagents.values()) {
+      scheduleConnectionFailure(
+        running.id,
+        15_000,
+        "Subagent did not reconnect to IPC after the parent session reloaded.",
+      );
+    }
+    if (runningSubagents.size > 0) startWidgetRefresh();
+  });
+
+  // Preserve child processes across /reload; terminate them for real parent-session shutdowns.
+  pi.on("session_shutdown", async (event, _ctx) => {
+    acceptIpcResults = false;
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
     }
-    for (const [_id, agent] of runningSubagents) {
-      agent.abortController?.abort();
+    if (!isChildProcess && event.reason !== "reload") {
+      for (const running of runningSubagents.values()) {
+        parentIpcServer?.send(running.id, "shutdown", { reason: event.reason });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      for (const running of runningSubagents.values()) {
+        if (!running.workspace) {
+          try { closeSurface(running.surface); } catch {}
+        }
+      }
+      runningSubagents.clear();
     }
-    runningSubagents.clear();
+    for (const timer of connectionFailureTimers.values()) clearTimeout(timer);
+    connectionFailureTimers.clear();
+    if (!isChildProcess) await parentIpcServer?.close().catch(() => {});
+    parentIpcServer = null;
   });
 
   // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
@@ -1084,7 +1124,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       parameters: SubagentParams,
 
       async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
-        const params = rawParams as typeof SubagentParams.static;
+        const params = rawParams as SubagentParamsValue;
         // Prevent self-spawning (e.g. planner spawning another planner)
         const currentAgent = process.env.PI_SUBAGENT_AGENT;
         if (params.agent && currentAgent && params.agent === currentAgent) {
@@ -1142,50 +1182,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const allToolNames = pi.getAllTools().map((t: any) => t.name);
         const running = await launchSubagent(params, ctx, { allToolNames });
 
-        // Create a separate AbortController for the watcher
-        // (the tool's signal completes when we return)
-        const watcherAbort = new AbortController();
-        running.abortController = watcherAbort;
+        pi.appendEntry(IPC_LAUNCH_ENTRY, serializeRunning(running));
+        scheduleConnectionFailure(
+          running.id,
+          30_000,
+          "Subagent did not establish its IPC connection during startup.",
+        );
 
-        // Start widget refresh when first agent launches
+        // Start widget refresh when first agent launches. Lifecycle now arrives over IPC.
         startWidgetRefresh();
-
-        // Fire-and-forget: start watching in background
-        watchSubagent(running, watcherAbort.signal)
-          .then((result) => {
-            updateWidget(); // reflect removal from Map immediately
-            pi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: buildSubagentResultContent(result),
-                display: true,
-                details: result,
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          })
-          .catch((err) => {
-            updateWidget();
-            const result: SubagentResult = {
-              name: running.name,
-              task: running.task,
-              agent: running.agent,
-              protocolStatus: "failed",
-              protocolError: `Sub-agent watcher error: ${err?.message ?? String(err)}`,
-              sessionFile: running.sessionFile,
-              elapsed: Math.floor((Date.now() - running.startTime) / 1000),
-              error: err?.message ?? String(err),
-            };
-            pi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: buildSubagentResultContent(result),
-                display: true,
-                details: result,
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          });
 
         // Return immediately
         return {
@@ -1211,7 +1216,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
 
       renderCall(rawArgs, theme) {
-        const args = rawArgs as Partial<typeof SubagentParams.static>;
+        const args = rawArgs as Partial<SubagentParamsValue>;
         const agent = args.agent ? theme.fg("dim", ` (${args.agent})`) : "";
         const cwdHint = args.cwd ? theme.fg("dim", ` in ${args.cwd}`) : "";
         let text =
@@ -1460,16 +1465,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        // Record entry count before resuming so we can extract new messages
-        const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
+        if (!parentIpcServer || !parentIpcSocketPath) {
+          return {
+            content: [{ type: "text", text: "Error: subagent IPC server is not ready." }],
+            details: { error: "ipc unavailable" },
+          };
+        }
 
         const surface = createSurface(name);
         await new Promise<void>((resolve) => setTimeout(resolve, 500));
+        const id = Math.random().toString(16).slice(2, 10);
+        const ipcToken = createIpcToken();
+        parentIpcServer.registerChild(id, ipcToken);
 
-        // Build pi resume command
         const parts = ["pi", "--session", shellEscape(params.sessionPath)];
-
-        // Load subagent-done extension so the agent can self-terminate if needed
         const subagentDonePath = join(
           dirname(new URL(import.meta.url).pathname),
           "subagent-done.ts",
@@ -1484,11 +1493,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           parts.push(`@${msgFile}`);
         }
 
-        const command = `${parts.join(" ")}${cleanupMsgFile ? `; rm -f ${shellEscape(cleanupMsgFile)}` : ""}; echo '__SUBAGENT_DONE_'${exitStatusVar()}'__'`;
+        const envPrefix = [
+          `PI_SUBAGENT_NAME=${shellEscape(name)}`,
+          `PI_SUBAGENT_ID=${shellEscape(id)}`,
+          `PI_SUBAGENT_SOCKET=${shellEscape(parentIpcSocketPath)}`,
+          `PI_SUBAGENT_TOKEN=${shellEscape(ipcToken)}`,
+          "PI_SUBAGENT_AUTO_EXIT=0",
+        ].join(" ") + " ";
+        const command = `${envPrefix}${parts.join(" ")}${cleanupMsgFile ? `; rm -f ${shellEscape(cleanupMsgFile)}` : ""}`;
         sendCommand(surface, command);
 
-        // Register as a running subagent for widget tracking
-        const id = Math.random().toString(16).slice(2, 10);
         const running: RunningSubagent = {
           id,
           name,
@@ -1496,48 +1510,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           surface,
           startTime,
           sessionFile: params.sessionPath,
+          ipcToken,
+          autoExit: false,
         };
         runningSubagents.set(id, running);
+        pi.appendEntry(IPC_LAUNCH_ENTRY, serializeRunning(running));
+        scheduleConnectionFailure(
+          running.id,
+          30_000,
+          "Resumed subagent did not establish its IPC connection during startup.",
+        );
         startWidgetRefresh();
-
-        // Fire-and-forget watcher
-        const watcherAbort = new AbortController();
-        running.abortController = watcherAbort;
-
-        watchSubagent(running, watcherAbort.signal, { afterLine: entryCountBefore })
-          .then((result) => {
-            updateWidget();
-            pi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: buildSubagentResultContent(result),
-                display: true,
-                details: result,
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          })
-          .catch((err) => {
-            updateWidget();
-            const result: SubagentResult = {
-              name,
-              task: params.message ?? "resumed session",
-              protocolStatus: "failed",
-              protocolError: `Resume watcher error: ${err?.message ?? String(err)}`,
-              sessionFile: params.sessionPath,
-              elapsed: Math.floor((Date.now() - startTime) / 1000),
-              error: err?.message ?? String(err),
-            };
-            pi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: buildSubagentResultContent(result),
-                display: true,
-                details: result,
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          });
 
         return {
           content: [{ type: "text", text: `Session "${name}" resumed.` }],
@@ -1655,11 +1638,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const killed: { id: string; name: string; agent?: string; elapsed: number }[] = [];
         for (const agent of targets) {
           const elapsed = Math.floor((Date.now() - agent.startTime) / 1000);
-          // Abort the watcher (triggers cleanup in watchSubagent catch block)
-          agent.abortController?.abort();
+          // Ask the child bridge to abort and shut down gracefully before closing its pane.
+          parentIpcServer?.send(agent.id, "shutdown", { reason: "cancelled" });
+          parentIpcServer?.unregisterChild(agent.id);
           // Workspace mode: kill WezTerm process, switch back
-          if (agent.workspace && agent.workspaceProcess) {
-            try { process.kill(agent.workspaceProcess.pid!, "SIGTERM"); } catch {}
+          if (agent.workspace) {
+            if (agent.workspaceProcess) {
+              try { process.kill(agent.workspaceProcess.pid!, "SIGTERM"); } catch {}
+            }
             if (agent.previousWorkspace) switchSwayWorkspace(agent.previousWorkspace);
           } else {
             // Close the mux pane
@@ -1672,6 +1658,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             } catch {}
           }
           runningSubagents.delete(agent.id);
+          pi.appendEntry(IPC_FINISH_ENTRY, { id: agent.id, finishedAt: Date.now(), cancelled: true });
           killed.push({ id: agent.id, name: agent.name, agent: agent.agent, elapsed });
         }
 
