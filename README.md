@@ -78,6 +78,10 @@ Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm` to force a specific bac
 | `write_artifact` | Write plans, context, notes to a session-scoped directory |
 | `read_artifact`  | Read artifacts from current or previous sessions          |
 
+Durable task, report, and artifact files live beside their owning session at
+`<session-file-without-.jsonl>/artifacts/`. They therefore move with the session
+corpus instead of depending on a separate history tree.
+
 ### Bundled Agents
 
 | Agent             | Model                  | Role                                                                                     |
@@ -104,6 +108,12 @@ Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global**
 ```
 
 The multiplexer is used only to create, focus, rename, and close panes. Lifecycle, progress, completion, cancellation, and parent-issued prompts use framed IPC messages under `$XDG_RUNTIME_DIR/pi-subagents/`; no pane screen contents or shell sentinels are involved. Child connections automatically retry across parent `/reload`, and unresolved launches are reconstructed from non-context session entries.
+
+Every new child session is pre-created with its own Pi v3 session ID, the effective
+child working directory, the official `parentSession` header field, and a
+non-context `subagent_metadata` entry. Forks copy only the validated active parent
+branch (not the parent header or orchestration trigger). Launches, completions,
+and resumed runs retain the child session ID, run correlation, and `sessionFile`.
 
 Multiple subagents run concurrently — each steers its result back independently as it finishes. The live widget above the input tracks all running agents:
 

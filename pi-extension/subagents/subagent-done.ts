@@ -8,9 +8,10 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 
 const defineTool = <T>(tool: T): T => tool;
-import { existsSync, statSync } from "node:fs";
-import { homedir } from "node:os";
-import { basename, isAbsolute, join, relative, resolve } from "node:path";
+import {
+  getSessionArtifactDir,
+  resolveExistingArtifactPath,
+} from "../session-artifacts/paths.ts";
 import {
   findLastAssistantMessage,
   SUBAGENT_DONE_RESULT_TYPE,
@@ -98,22 +99,6 @@ function assertBoundedString(value: unknown, label: string, maxChars: number, re
   }
 }
 
-function resolveArtifact(artifactDir: string, name: string): string {
-  if (isAbsolute(name)) throw new Error(`Artifact name must be relative: ${name}`);
-  const resolved = resolve(artifactDir, name);
-  const rel = relative(artifactDir, resolved);
-  if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) {
-    throw new Error(`Artifact name escapes the artifact directory: ${name}`);
-  }
-  if (!existsSync(resolved)) {
-    throw new Error(`Listed artifact does not exist: ${name}`);
-  }
-  if (!statSync(resolved).isFile()) {
-    throw new Error(`Listed artifact is not a file: ${name}`);
-  }
-  return resolved;
-}
-
 export function validateSubagentDoneParams(
   params: DoneParamsValue,
   artifactDir: string,
@@ -142,7 +127,7 @@ export function validateSubagentDoneParams(
     return {
       name: artifact.name,
       description: artifact.description,
-      path: resolveArtifact(artifactDir, artifact.name),
+      path: resolveExistingArtifactPath(artifactDir, artifact.name),
     };
   });
 
@@ -382,9 +367,11 @@ export default function (pi: ExtensionAPI) {
         throw new Error("subagent_done has already been called for this run.");
       }
 
-      const project = basename(ctx.cwd);
-      const sessionId = ctx.sessionManager.getSessionId();
-      const artifactDir = join(homedir(), ".pi", "history", project, "artifacts", sessionId);
+      const sessionFile = ctx.sessionManager.getSessionFile();
+      if (!sessionFile) {
+        throw new Error("subagent_done requires a persisted session file for artifact validation.");
+      }
+      const artifactDir = getSessionArtifactDir(sessionFile);
       const validated = validateSubagentDoneParams(params, artifactDir);
       const result: SubagentDoneResult = {
         ...validated,

@@ -2,9 +2,15 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { highlightCode, getLanguageFromPath, keyHint, defineTool } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
-import { homedir } from "node:os";
+import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import {
+  ensureSessionArtifactDir,
+  getSessionArtifactDir,
+  writeArtifactFile,
+  resolveArtifactPath,
+  resolveExistingArtifactPath,
+} from "./paths.ts";
 
 const PREVIEW_LINES = 10;
 
@@ -19,11 +25,11 @@ export default function (pi: ExtensionAPI) {
     label: "Write Artifact",
     description:
       "Write a session-scoped artifact file (plan, context, research, notes, etc.). " +
-      "Files are stored under ~/.pi/history/<project>/artifacts/<session-id>/. " +
+      "Files are stored under the owning session's sibling <session-stem>/artifacts/ sidecar. " +
       "Use this instead of writing pi working files directly.",
     promptSnippet:
       "Write a session-scoped artifact file (plan, context, research, notes, etc.). " +
-      "Files are stored under ~/.pi/history/<project>/artifacts/<session-id>/. " +
+      "Files are stored under the owning session's sibling <session-stem>/artifacts/ sidecar. " +
       "Use this instead of writing pi working files directly.",
     promptGuidelines: [
       "Use write_artifact for any pi working file: plans, scout context, research notes, reviews, or other session artifacts.",
@@ -94,62 +100,102 @@ export default function (pi: ExtensionAPI) {
     },
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const project = basename(ctx.cwd);
-      const sessionId = ctx.sessionManager.getSessionId();
-      const artifactDir = join(homedir(), ".pi", "history", project, "artifacts", sessionId);
-      const filePath = resolve(artifactDir, params.name);
-
-      // Safety: ensure we're not escaping the artifact directory
-      if (!filePath.startsWith(artifactDir)) {
-        throw new Error(`Path escapes artifact directory: ${params.name}`);
+      const sessionFile = ctx.sessionManager.getSessionFile();
+      if (!sessionFile) {
+        throw new Error("write_artifact requires a persisted session file.");
       }
-
-      mkdirSync(dirname(filePath), { recursive: true });
-      writeFileSync(filePath, params.content, "utf-8");
+      const artifactDir = ensureSessionArtifactDir(sessionFile);
+      const filePath = writeArtifactFile(artifactDir, params.name, params.content);
 
       return {
         content: [{ type: "text", text: `Artifact written to: ${filePath}` }],
-        details: { path: filePath, name: params.name, sessionId, content: params.content },
+        details: {
+          path: filePath,
+          name: params.name,
+          sessionId: ctx.sessionManager.getSessionId(),
+          sessionFile,
+          content: params.content,
+        },
       };
     },
   }));
 
   /**
-   * Find an artifact by name across all session artifact directories for the current project.
-   * Searches current session first, then other sessions (most recently modified first).
+   * List sibling session artifact directories for this encoded-CWD directory.
+   * The current session is always searched first; older sessions follow by mtime.
    */
-  function findArtifact(
-    projectArtifactsDir: string,
-    currentSessionId: string,
-    name: string,
-  ): string | null {
-    // 1. Check current session first
-    const currentPath = resolve(join(projectArtifactsDir, currentSessionId), name);
-    if (existsSync(currentPath)) return currentPath;
-
-    // 2. Search other session directories, sorted by mtime (newest first)
-    if (!existsSync(projectArtifactsDir)) return null;
-
-    const sessionDirs = readdirSync(projectArtifactsDir)
-      .filter((d) => d !== currentSessionId)
-      .map((d) => {
-        const fullPath = join(projectArtifactsDir, d);
+  function listArtifactDirs(currentSessionFile: string): string[] {
+    const absoluteSessionFile = resolve(currentSessionFile);
+    const sessionDir = dirname(absoluteSessionFile);
+    const currentArtifactDir = getSessionArtifactDir(absoluteSessionFile);
+    const others = readdirSync(sessionDir, { withFileTypes: true })
+      .filter(
+        (entry) =>
+          entry.isFile() &&
+          entry.name.endsWith(".jsonl") &&
+          join(sessionDir, entry.name) !== absoluteSessionFile,
+      )
+      .map((entry) => {
+        const artifactDir = getSessionArtifactDir(join(sessionDir, entry.name));
         try {
-          const stat = statSync(fullPath);
-          return stat.isDirectory() ? { dir: d, mtime: stat.mtimeMs } : null;
+          return existsSync(artifactDir)
+            ? { artifactDir, mtime: statSync(artifactDir).mtimeMs }
+            : null;
         } catch {
           return null;
         }
       })
-      .filter((x): x is { dir: string; mtime: number } => x !== null)
-      .sort((a, b) => b.mtime - a.mtime);
+      .filter((value): value is { artifactDir: string; mtime: number } => value !== null)
+      .sort((a, b) => b.mtime - a.mtime)
+      .map(({ artifactDir }) => artifactDir);
+    return [currentArtifactDir, ...others];
+  }
 
-    for (const { dir } of sessionDirs) {
-      const candidate = resolve(join(projectArtifactsDir, dir), name);
-      if (existsSync(candidate)) return candidate;
+  function findArtifact(currentSessionFile: string, name: string): string | null {
+    const artifactDirs = listArtifactDirs(currentSessionFile);
+    // Validate the relative name even when no artifact directory exists yet.
+    resolveArtifactPath(artifactDirs[0], name);
+    for (let index = 0; index < artifactDirs.length; index++) {
+      const artifactDir = artifactDirs[index];
+      const candidate = resolveArtifactPath(artifactDir, name);
+      if (!existsSync(candidate)) continue;
+      try {
+        return resolveExistingArtifactPath(artifactDir, name);
+      } catch (error) {
+        // The active session's sidecar must be trustworthy. A corrupt or
+        // symlinked older sidecar must not prevent a safe later session from
+        // satisfying the cross-session lookup.
+        if (index === 0) throw error;
+      }
     }
-
     return null;
+  }
+
+  function collectAvailableArtifacts(artifactDirs: string[]): string[] {
+    const available: string[] = [];
+    const collect = (baseDir: string, dir: string, prefix: string) => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (entry.isSymbolicLink()) continue;
+        const relativeName = prefix ? `${prefix}/${entry.name}` : entry.name;
+        const path = join(dir, entry.name);
+        if (entry.isDirectory()) collect(baseDir, path, relativeName);
+        else if (entry.isFile()) {
+          // Revalidate every discovered result before advertising it.
+          resolveExistingArtifactPath(baseDir, relativeName);
+          available.push(relativeName);
+        }
+      }
+    };
+
+    for (const artifactDir of artifactDirs) {
+      if (!existsSync(artifactDir)) continue;
+      try {
+        collect(artifactDir, artifactDir, "");
+      } catch {
+        // Ignore an invalid/symlinked sidecar rather than exposing paths from it.
+      }
+    }
+    return [...new Set(available)].sort();
   }
 
   pi.registerTool(defineTool({
@@ -217,44 +263,18 @@ export default function (pi: ExtensionAPI) {
     },
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const project = basename(ctx.cwd);
-      const sessionId = ctx.sessionManager.getSessionId();
-      const projectArtifactsDir = join(homedir(), ".pi", "history", project, "artifacts");
-
-      const found = findArtifact(projectArtifactsDir, sessionId, params.name);
+      const sessionFile = ctx.sessionManager.getSessionFile();
+      if (!sessionFile) {
+        throw new Error("read_artifact requires a persisted session file.");
+      }
+      const artifactDirs = listArtifactDirs(sessionFile);
+      const found = findArtifact(sessionFile, params.name);
 
       if (!found) {
-        // List available artifacts to help the agent
-        const available: string[] = [];
-        if (existsSync(projectArtifactsDir)) {
-          const collectArtifacts = (dir: string, prefix: string) => {
-            try {
-              for (const entry of readdirSync(dir, { withFileTypes: true })) {
-                if (entry.isDirectory()) {
-                  collectArtifacts(
-                    join(dir, entry.name),
-                    prefix ? `${prefix}/${entry.name}` : entry.name,
-                  );
-                } else {
-                  available.push(prefix ? `${prefix}/${entry.name}` : entry.name);
-                }
-              }
-            } catch {}
-          };
-          for (const sessionDir of readdirSync(projectArtifactsDir)) {
-            const fullPath = join(projectArtifactsDir, sessionDir);
-            try {
-              if (statSync(fullPath).isDirectory()) {
-                collectArtifacts(fullPath, "");
-              }
-            } catch {}
-          }
-        }
-
-        const uniqueNames = [...new Set(available)].sort();
+        const available = collectAvailableArtifacts(artifactDirs);
         let msg = `Artifact not found: ${params.name}`;
-        if (uniqueNames.length > 0) {
-          msg += `\n\nAvailable artifacts:\n${uniqueNames.map((n) => `  - ${n}`).join("\n")}`;
+        if (available.length > 0) {
+          msg += `\n\nAvailable artifacts:\n${available.map((name) => `  - ${name}`).join("\n")}`;
         }
 
         return {
@@ -263,16 +283,17 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // Safety: ensure we're not escaping the artifacts directory
-      if (!found.startsWith(projectArtifactsDir)) {
-        throw new Error(`Path escapes artifact directory: ${params.name}`);
-      }
-
       const content = readFileSync(found, "utf-8");
 
       return {
         content: [{ type: "text", text: content }],
-        details: { path: found, name: params.name, sessionId, content },
+        details: {
+          path: found,
+          name: params.name,
+          sessionId: ctx.sessionManager.getSessionId(),
+          sessionFile,
+          content,
+        },
       };
     },
   }));

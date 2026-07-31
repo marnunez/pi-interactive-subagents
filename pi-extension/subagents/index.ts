@@ -4,18 +4,19 @@ import { Type, type Static } from "typebox";
 
 const defineTool = <T>(tool: T): T => tool;
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { basename, dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { dirname, join, resolve } from "node:path";
 import {
   readdirSync,
   statSync,
   readFileSync,
-  writeFileSync,
   existsSync,
   mkdirSync,
   unlinkSync,
+  rmSync,
 } from "node:fs";
 import { ChildProcess, spawn as nodeSpawn, execSync as nodeExecSync } from "node:child_process";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import {
   isMuxAvailable,
   muxSetupHint,
@@ -27,9 +28,19 @@ import {
   renameWorkspace,
 } from "./cmux.ts";
 import {
+  createSubagentSession,
   isSubagentDoneResult,
+  readSubagentSessionCorrelation,
+  selectForkHistory,
+  type SessionEntry,
   type SubagentDoneResult,
+  type SubagentSessionMode,
 } from "./session.ts";
+import {
+  ensureSessionArtifactDir,
+  getSessionArtifactDir,
+  writeArtifactFile,
+} from "../session-artifacts/paths.ts";
 import {
   createIpcToken,
   getIpcSocketPath,
@@ -271,6 +282,33 @@ function qualifyModelWithProvider(
   return model;
 }
 
+function resolveEffectiveChildCwd(rawCwd: string | undefined, parentCwd: string): string {
+  if (!rawCwd) return resolve(parentCwd);
+  if (rawCwd === "~") return homedir();
+  if (rawCwd.startsWith("~/")) return resolve(homedir(), rawCwd.slice(2));
+  if (rawCwd.startsWith("~")) {
+    throw new Error(`Unsupported home-relative cwd: ${rawCwd}`);
+  }
+  return resolve(parentCwd, rawCwd);
+}
+
+const PROFILE_ENV_NAMES = ["PI_PROFILE", "PI_CODING_AGENT_DIR"] as const;
+
+function inheritedProfileEnvParts(): string[] {
+  return PROFILE_ENV_NAMES.flatMap((name) => {
+    const value = process.env[name];
+    return value == null ? [] : [`${name}=${shellEscape(value)}`];
+  });
+}
+
+/**
+ * Multiplexer servers retain their own environment. Explicitly remove profile
+ * selectors absent from this parent before applying the selectors it does have.
+ */
+function inheritedProfileEnvUnsets(): string[] {
+  return PROFILE_ENV_NAMES.flatMap((name) => (process.env[name] == null ? ["-u", name] : []));
+}
+
 function formatElapsed(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
   const m = Math.floor(seconds / 60);
@@ -297,16 +335,6 @@ function muxUnavailableResult(kind: "subagents" | "tab-title" = "subagents") {
     ],
     details: { error: "mux not available" },
   };
-}
-
-/**
- * Build the artifact directory path for the current session.
- * Same convention as the write_artifact tool:
- *   ~/.pi/history/<project>/artifacts/<session-id>/
- */
-function getArtifactDir(cwd: string, sessionId: string): string {
-  const project = basename(cwd);
-  return join(homedir(), ".pi", "history", project, "artifacts", sessionId);
 }
 
 function formatBytes(bytes: number): string {
@@ -383,6 +411,10 @@ type SubagentProtocolStatus = "completed" | "failed" | "cancelled";
 interface SubagentResult {
   /** Parent-side orchestration id; omitted from older persisted results. */
   id?: string;
+  runId?: string;
+  childSessionId?: string;
+  resumeOfRunId?: string;
+  mode?: SubagentSessionMode | "resume";
   name: string;
   task: string;
   agent?: string;
@@ -400,7 +432,12 @@ interface SubagentResult {
  * State for a launched (but not yet completed) subagent.
  */
 interface RunningSubagent {
+  /** Backward-compatible alias of runId used by IPC and parent entries. */
   id: string;
+  runId: string;
+  childSessionId: string;
+  resumeOfRunId?: string;
+  mode: SubagentSessionMode | "resume";
   name: string;
   task: string;
   agent?: string;
@@ -560,6 +597,9 @@ export const __test__ = {
   buildSubagentToolAllowList,
   resolveDenyTools,
   withChildOnlyTools,
+  resolveEffectiveChildCwd,
+  inheritedProfileEnvParts,
+  inheritedProfileEnvUnsets,
 };
 
 function startWidgetRefresh() {
@@ -623,17 +663,24 @@ function launchWorkspaceSurface(
  */
 async function launchSubagent(
   params: SubagentParamsValue,
-  ctx: { sessionManager: { getSessionFile(): string | undefined; getSessionId(): string }; cwd: string },
+  ctx: {
+    sessionManager: {
+      getSessionFile(): string | undefined;
+      getSessionId(): string;
+      getLeafId(): string | null;
+      getBranch(): unknown[];
+    };
+    cwd: string;
+  },
   options?: { surface?: string; allToolNames?: string[] },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
-  const id = Math.random().toString(16).slice(2, 10);
+  const runId = randomUUID();
   const ipcToken = createIpcToken();
 
   if (!parentIpcServer || !parentIpcSocketPath) {
     throw new Error("Subagent IPC server is not ready");
   }
-  parentIpcServer.registerChild(id, ipcToken);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   const effectiveModel = params.model ?? agentDefs?.model;
@@ -642,28 +689,41 @@ async function launchSubagent(
   const effectiveThinking = agentDefs?.thinking;
   const effectiveAutoExit = agentDefs?.autoExit ?? false;
 
-  const sessionFile = ctx.sessionManager.getSessionFile();
-  if (!sessionFile) throw new Error("No session file");
+  const parentSessionFile = ctx.sessionManager.getSessionFile();
+  if (!parentSessionFile) throw new Error("No session file");
 
-  const sessionDir = dirname(sessionFile);
+  // Resolve and create the actual child cwd before the child session header is written.
+  const rawCwd = params.cwd ?? agentDefs?.cwd;
+  const effectiveCwd = resolveEffectiveChildCwd(rawCwd, ctx.cwd);
+  mkdirSync(effectiveCwd, { recursive: true });
 
-  // Generate a deterministic session file path for this subagent.
-  // This eliminates race conditions when multiple agents launch simultaneously —
-  // each agent knows exactly which file is theirs.
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 23) + "Z";
-  const uuid = [
-    id,
-    Math.random().toString(16).slice(2, 10),
-    Math.random().toString(16).slice(2, 10),
-    Math.random().toString(16).slice(2, 6),
-  ].join("-");
-  const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
+  const mode: SubagentSessionMode = params.fork ? "fork" : "fresh";
+  const historyEntries = params.fork
+    ? selectForkHistory(ctx.sessionManager.getBranch() as SessionEntry[])
+    : [];
+  const createdSession = createSubagentSession({
+    sessionDir: dirname(parentSessionFile),
+    cwd: effectiveCwd,
+    parentSessionId: ctx.sessionManager.getSessionId(),
+    parentSessionFile,
+    parentLeafId: ctx.sessionManager.getLeafId(),
+    runId,
+    name: params.name,
+    agent: params.agent,
+    mode,
+    task: params.task,
+    historyEntries,
+  });
+  const { sessionFile: subagentSessionFile, childSessionId } = createdSession;
+  let surface = "";
+  let workspaceProcess: ChildProcess | undefined;
+  let registeredWithIpc = false;
 
+  try {
   // Determine workspace mode early — if set, skip mux surface creation entirely.
   const effectiveWorkspace = params.workspace ?? agentDefs?.workspace ?? null;
 
   // Use pre-created surface (parallel mode), create a new one, or skip for workspace mode.
-  let surface: string;
   if (effectiveWorkspace && !options?.surface) {
     surface = `workspace:${effectiveWorkspace}`; // placeholder, not a real mux surface
   } else {
@@ -701,35 +761,6 @@ async function launchSubagent(
   const parts: string[] = ["pi"];
   parts.push("--session", shellEscape(subagentSessionFile));
 
-  // For fork mode, create a clean copy of the parent session (excluding
-  // the meta-message that triggered this) and write it directly to the
-  // subagent's session file. Using --session with pre-populated history
-  // is equivalent to a fork and avoids the --fork + --session conflict.
-  let forkCleanupFile: string | undefined;
-  if (params.fork) {
-    const raw = readFileSync(sessionFile, "utf8");
-    const lines = raw.split("\n").filter((l) => l.trim());
-
-    // Walk backwards to find the last user message (the meta-instruction)
-    // and truncate everything from there onwards
-    let truncateAt = lines.length;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      try {
-        const entry = JSON.parse(lines[i]);
-        if (entry.type === "message" && entry.message?.role === "user") {
-          truncateAt = i;
-          break;
-        }
-      } catch {}
-    }
-
-    const cleanLines = lines.slice(0, truncateAt);
-    // Write the cleaned history directly into the subagent session file.
-    // pi will open it via --session and see the full prior conversation.
-    mkdirSync(dirname(subagentSessionFile), { recursive: true });
-    writeFileSync(subagentSessionFile, cleanLines.join("\n") + "\n", "utf8");
-  }
-
   const subagentDonePath = join(dirname(new URL(import.meta.url).pathname), "subagent-done.ts");
   parts.push("-e", shellEscape(subagentDonePath));
 
@@ -760,7 +791,7 @@ async function launchSubagent(
     envParts.push(`PI_DENY_TOOLS=${shellEscape([...denySet].join(","))}`);
   }
   envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
-  envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
+  envParts.push(`PI_SUBAGENT_ID=${shellEscape(runId)}`);
   envParts.push(`PI_SUBAGENT_SOCKET=${shellEscape(parentIpcSocketPath)}`);
   envParts.push(`PI_SUBAGENT_TOKEN=${shellEscape(ipcToken)}`);
   envParts.push(`PI_SUBAGENT_AUTO_EXIT=${effectiveAutoExit ? "1" : "0"}`);
@@ -782,44 +813,20 @@ async function launchSubagent(
       if (pair.includes("=")) envParts.push(pair);
     }
   }
-  const envPrefix = envParts.join(" ") + " ";
+  // Multiplexer server environments can lag behind the invoking Pi process.
+  // Reassert profile selectors last so agent frontmatter cannot cross profiles.
+  envParts.push(...inheritedProfileEnvParts());
+  const envPrefix = ["env", ...inheritedProfileEnvUnsets(), ...envParts].join(" ") + " ";
 
-  // Pass task to the sub-agent.
-  // For fork mode, pass as a plain quoted argument — the forked session already
-  // has the full conversation context, so the message arrives as if the user typed it.
-  // For non-fork mode, write to an artifact file and pass via @file to handle
-  // long task descriptions with role/instructions safely.
-  if (params.fork) {
-    parts.push(shellEscape(fullTask));
-  } else {
-    const sessionId = ctx.sessionManager.getSessionId();
-    const artifactDir = getArtifactDir(ctx.cwd, sessionId);
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const safeName = params.name
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "") // strip everything except alphanumeric, spaces, hyphens
-      .replace(/\s+/g, "-") // spaces to hyphens
-      .replace(/-+/g, "-") // collapse multiple hyphens
-      .replace(/^-|-$/g, ""); // trim leading/trailing hyphens
-    const artifactName = `context/${safeName || "subagent"}-${timestamp}.md`;
-    const artifactPath = join(artifactDir, artifactName);
-    mkdirSync(dirname(artifactPath), { recursive: true });
-    writeFileSync(artifactPath, fullTask, "utf8");
-    parts.push(`@${artifactPath}`);
-  }
+  // Keep the launch task with the child session so it moves atomically with the transcript.
+  const artifactDir = ensureSessionArtifactDir(subagentSessionFile);
+  const taskPath = writeArtifactFile(artifactDir, "context/subagent-task.md", fullTask);
+  parts.push(`@${shellEscape(taskPath)}`);
 
-  // Resolve cwd — param overrides agent default, supports absolute, relative, and ~ paths
-  const rawCwd = params.cwd ?? agentDefs?.cwd ?? null;
-  let effectiveCwd: string | null = null;
-  if (rawCwd) {
-    const expanded = rawCwd.startsWith("~") ? rawCwd.replace(/^~/, homedir()) : rawCwd;
-    effectiveCwd = expanded.startsWith("/") ? expanded : join(process.cwd(), expanded);
-    // Ensure the directory exists (e.g. sandbox dirs)
-    try { mkdirSync(effectiveCwd, { recursive: true }); } catch {}
-  }
-  const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-
+  const cdPrefix = `cd ${shellEscape(effectiveCwd)} && `;
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
+  parentIpcServer.registerChild(runId, ipcToken);
+  registeredWithIpc = true;
 
   if (effectiveWorkspace && !options?.surface) {
     // ── Workspace mode: launch in a WezTerm window on a dedicated Sway workspace ──
@@ -828,18 +835,21 @@ async function launchSubagent(
       effectiveWorkspace,
       params.name,
       command,
-      effectiveCwd ?? process.cwd(),
+      effectiveCwd,
     );
+    workspaceProcess = wezProc;
 
     const running: RunningSubagent = {
-      id,
+      id: runId,
+      runId,
+      childSessionId,
+      mode,
       name: params.name,
       task: params.task,
       agent: params.agent,
       surface: `workspace:${effectiveWorkspace}`,
       startTime,
       sessionFile: subagentSessionFile,
-      forkCleanupFile,
       workspace: effectiveWorkspace,
       previousWorkspace: prevWs ?? undefined,
       workspaceProcess: wezProc,
@@ -847,7 +857,7 @@ async function launchSubagent(
       autoExit: effectiveAutoExit,
     };
 
-    runningSubagents.set(id, running);
+    runningSubagents.set(runId, running);
     return running;
   }
 
@@ -855,20 +865,35 @@ async function launchSubagent(
   sendCommand(surface, piCommand);
 
   const running: RunningSubagent = {
-    id,
+    id: runId,
+    runId,
+    childSessionId,
+    mode,
     name: params.name,
     task: params.task,
     agent: params.agent,
     surface,
     startTime,
     sessionFile: subagentSessionFile,
-    forkCleanupFile,
     ipcToken,
     autoExit: effectiveAutoExit,
   };
 
-  runningSubagents.set(id, running);
+  runningSubagents.set(runId, running);
   return running;
+  } catch (error) {
+    if (registeredWithIpc) parentIpcServer?.unregisterChild(runId);
+    if (workspaceProcess) {
+      try { process.kill(workspaceProcess.pid!, "SIGTERM"); } catch {}
+    } else if (surface && !surface.startsWith("workspace:")) {
+      try { closeSurface(surface); } catch {}
+    }
+    // No launch entry was persisted yet, so remove the transcript bundle rather
+    // than leaving an unresumable orphan after pane/artifact setup failed.
+    try { rmSync(subagentSessionFile, { force: true }); } catch {}
+    try { rmSync(dirname(getSessionArtifactDir(subagentSessionFile)), { recursive: true, force: true }); } catch {}
+    throw error;
+  }
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
@@ -877,6 +902,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   const serializeRunning = (running: RunningSubagent) => ({
     id: running.id,
+    runId: running.runId,
+    childSessionId: running.childSessionId,
+    resumeOfRunId: running.resumeOfRunId,
+    mode: running.mode,
     name: running.name,
     task: running.task,
     agent: running.agent,
@@ -895,6 +924,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     const running = runningSubagents.get(result.id ?? "");
     const childId = result.id;
     if (!childId || !running) return;
+    const correlatedResult: SubagentResult = {
+      ...result,
+      id: running.id,
+      runId: running.runId,
+      childSessionId: running.childSessionId,
+      resumeOfRunId: running.resumeOfRunId,
+      mode: running.mode,
+      sessionFile: running.sessionFile,
+    };
 
     const failureTimer = connectionFailureTimers.get(childId);
     if (failureTimer) clearTimeout(failureTimer);
@@ -909,14 +947,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (running.forkCleanupFile) {
       try { unlinkSync(running.forkCleanupFile); } catch {}
     }
-    pi.appendEntry(IPC_FINISH_ENTRY, { id: childId, finishedAt: Date.now() });
+    pi.appendEntry(IPC_FINISH_ENTRY, {
+      id: childId,
+      runId: running.runId,
+      childSessionId: running.childSessionId,
+      sessionFile: running.sessionFile,
+      finishedAt: Date.now(),
+    });
     updateWidget();
     pi.sendMessage(
       {
         customType: "subagent_result",
-        content: buildSubagentResultContent(result),
+        content: buildSubagentResultContent(correlatedResult),
         display: true,
-        details: result,
+        details: correlatedResult,
       },
       { triggerTurn: true, deliverAs: "steer" },
     );
@@ -931,6 +975,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       if (!running || running.connected || !acceptIpcResults) return;
       finishSubagent({
         id: running.id,
+        runId: running.runId,
+        childSessionId: running.childSessionId,
+        resumeOfRunId: running.resumeOfRunId,
+        mode: running.mode,
         name: running.name,
         task: running.task,
         agent: running.agent,
@@ -949,7 +997,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
     if (message.type === "hello" || message.type === "ready") {
       running.connected = true;
-      if (payload?.sessionFile) running.sessionFile = payload.sessionFile;
+      if (
+        typeof payload?.sessionFile === "string" &&
+        resolve(payload.sessionFile) === resolve(running.sessionFile)
+      ) {
+        running.sessionFile = resolve(payload.sessionFile);
+      }
       updateWidget();
       return;
     }
@@ -1025,9 +1078,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     runningSubagents.clear();
     for (const entry of entries) {
       if (entry.type !== "custom" || entry.customType !== IPC_LAUNCH_ENTRY) continue;
-      const data = entry.data as RunningSubagent | undefined;
-      if (!data?.id || !data.ipcToken || finished.has(data.id)) continue;
-      runningSubagents.set(data.id, { ...data });
+      const data = entry.data as Partial<RunningSubagent> | undefined;
+      if (!data?.id || !data.ipcToken || !data.sessionFile || finished.has(data.id)) continue;
+      let sessionCorrelation: ReturnType<typeof readSubagentSessionCorrelation> | undefined;
+      try {
+        sessionCorrelation = readSubagentSessionCorrelation(data.sessionFile);
+      } catch {}
+      const restored = {
+        ...data,
+        runId: data.runId ?? data.id,
+        childSessionId: data.childSessionId ?? sessionCorrelation?.childSessionId ?? data.id,
+        mode: data.mode ?? "fresh",
+      } as RunningSubagent;
+      runningSubagents.set(restored.id, restored);
     }
 
     parentIpcServer = new ParentIpcServer({
@@ -1206,6 +1269,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ],
           details: {
             id: running.id,
+            runId: running.runId,
+            childSessionId: running.childSessionId,
+            mode: running.mode,
             name: params.name,
             task: params.task,
             agent: params.agent,
@@ -1472,48 +1538,71 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        const surface = createSurface(name);
-        await new Promise<void>((resolve) => setTimeout(resolve, 500));
-        const id = Math.random().toString(16).slice(2, 10);
+        const sessionFile = resolve(params.sessionPath);
+        const correlation = readSubagentSessionCorrelation(sessionFile);
+        const runId = randomUUID();
         const ipcToken = createIpcToken();
-        parentIpcServer.registerChild(id, ipcToken);
+        let surface: string | undefined;
+        let resumeMessagePath: string | undefined;
 
-        const parts = ["pi", "--session", shellEscape(params.sessionPath)];
+        const parts = ["pi", "--session", shellEscape(sessionFile)];
         const subagentDonePath = join(
           dirname(new URL(import.meta.url).pathname),
           "subagent-done.ts",
         );
         parts.push("-e", shellEscape(subagentDonePath));
 
-        let cleanupMsgFile: string | undefined;
         if (params.message) {
-          const msgFile = join(tmpdir(), `subagent-resume-${Date.now()}.md`);
-          writeFileSync(msgFile, `${params.message}\n\n${SUBAGENT_COMPLETION_INSTRUCTION}`, "utf8");
-          cleanupMsgFile = msgFile;
-          parts.push(`@${msgFile}`);
+          const artifactDir = ensureSessionArtifactDir(sessionFile);
+          resumeMessagePath = writeArtifactFile(
+            artifactDir,
+            `context/resume-${runId}.md`,
+            `${params.message}\n\n${SUBAGENT_COMPLETION_INSTRUCTION}`,
+          );
+          parts.push(`@${shellEscape(resumeMessagePath)}`);
         }
 
-        const envPrefix = [
+        const envParts = [
           `PI_SUBAGENT_NAME=${shellEscape(name)}`,
-          `PI_SUBAGENT_ID=${shellEscape(id)}`,
+          `PI_SUBAGENT_ID=${shellEscape(runId)}`,
           `PI_SUBAGENT_SOCKET=${shellEscape(parentIpcSocketPath)}`,
           `PI_SUBAGENT_TOKEN=${shellEscape(ipcToken)}`,
           "PI_SUBAGENT_AUTO_EXIT=0",
-        ].join(" ") + " ";
-        const command = `${envPrefix}${parts.join(" ")}${cleanupMsgFile ? `; rm -f ${shellEscape(cleanupMsgFile)}` : ""}`;
-        sendCommand(surface, command);
+          ...inheritedProfileEnvParts(),
+        ];
+        const envPrefix = ["env", ...inheritedProfileEnvUnsets(), ...envParts].join(" ") + " ";
+        const command = `cd ${shellEscape(correlation.cwd)} && ${envPrefix}${parts.join(" ")}`;
+        try {
+          surface = createSurface(name);
+          await new Promise<void>((resolve) => setTimeout(resolve, 500));
+          parentIpcServer.registerChild(runId, ipcToken);
+          sendCommand(surface, command);
+        } catch (error) {
+          parentIpcServer.unregisterChild(runId);
+          if (surface) {
+            try { closeSurface(surface); } catch {}
+          }
+          if (resumeMessagePath) {
+            try { unlinkSync(resumeMessagePath); } catch {}
+          }
+          throw error;
+        }
 
         const running: RunningSubagent = {
-          id,
+          id: runId,
+          runId,
+          childSessionId: correlation.childSessionId,
+          resumeOfRunId: correlation.originatingRunId,
+          mode: "resume",
           name,
           task: params.message ?? "resumed session",
           surface,
           startTime,
-          sessionFile: params.sessionPath,
+          sessionFile,
           ipcToken,
           autoExit: false,
         };
-        runningSubagents.set(id, running);
+        runningSubagents.set(runId, running);
         pi.appendEntry(IPC_LAUNCH_ENTRY, serializeRunning(running));
         scheduleConnectionFailure(
           running.id,
@@ -1524,7 +1613,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         return {
           content: [{ type: "text", text: `Session "${name}" resumed.` }],
-          details: { id, name, sessionPath: params.sessionPath, status: "started" },
+          details: {
+            id: runId,
+            runId,
+            childSessionId: correlation.childSessionId,
+            resumeOfRunId: correlation.originatingRunId,
+            mode: "resume",
+            name,
+            sessionPath: sessionFile,
+            sessionFile,
+            status: "started",
+          },
         };
       },
     }));
@@ -1658,7 +1757,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             } catch {}
           }
           runningSubagents.delete(agent.id);
-          pi.appendEntry(IPC_FINISH_ENTRY, { id: agent.id, finishedAt: Date.now(), cancelled: true });
+          pi.appendEntry(IPC_FINISH_ENTRY, {
+            id: agent.id,
+            runId: agent.runId,
+            childSessionId: agent.childSessionId,
+            sessionFile: agent.sessionFile,
+            finishedAt: Date.now(),
+            cancelled: true,
+          });
           killed.push({ id: agent.id, name: agent.name, agent: agent.agent, elapsed });
         }
 

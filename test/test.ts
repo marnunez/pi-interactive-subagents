@@ -1,8 +1,17 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import {
+  mkdtempSync,
+  writeFileSync,
+  readFileSync,
+  mkdirSync,
+  rmSync,
+  symlinkSync,
+  existsSync,
+} from "node:fs";
+import { basename, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
@@ -16,10 +25,23 @@ import {
   appendBranchSummary,
   copySessionFile,
   mergeNewEntries,
+  createSubagentSession,
+  digestSubagentTask,
+  readSubagentSessionCorrelation,
+  selectForkHistory,
+  SUBAGENT_METADATA_TYPE,
 } from "../pi-extension/subagents/session.ts";
 
 import { shellEscape, isCmuxAvailable, isWezTermAvailable } from "../pi-extension/subagents/cmux.ts";
 import { validateSubagentDoneParams } from "../pi-extension/subagents/subagent-done.ts";
+import {
+  ensureSessionArtifactDir,
+  getSessionArtifactDir,
+  prepareArtifactWritePath,
+  writeArtifactFile,
+  resolveArtifactPath,
+  resolveExistingArtifactPath,
+} from "../pi-extension/session-artifacts/paths.ts";
 import {
   ChildIpcClient,
   encodeIpcFrame,
@@ -280,6 +302,291 @@ describe("session.ts", () => {
   });
 });
 
+describe("subagent session lineage", () => {
+  let dir: string;
+
+  before(() => {
+    dir = createTestDir();
+  });
+
+  after(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const timestamp = "2026-07-31T22:30:00.000Z";
+  const rootEntry = {
+    type: "model_change",
+    id: "root-001",
+    parentId: null,
+    timestamp,
+    provider: "openai-codex",
+    modelId: "gpt-5.6-sol",
+  };
+  const priorUser = {
+    type: "message",
+    id: "user-prior",
+    parentId: "root-001",
+    timestamp,
+    message: { role: "user", content: [{ type: "text", text: "Prior context" }] },
+  };
+  const priorAssistant = {
+    type: "message",
+    id: "assistant-prior",
+    parentId: "user-prior",
+    timestamp,
+    message: { role: "assistant", content: [{ type: "text", text: "Prior answer" }] },
+  };
+  const orchestrationTrigger = {
+    type: "message",
+    id: "user-trigger",
+    parentId: "assistant-prior",
+    timestamp,
+    message: { role: "user", content: [{ type: "text", text: "Launch a worker" }] },
+  };
+  const triggerSuffix = {
+    type: "thinking_level_change",
+    id: "trigger-suffix",
+    parentId: "user-trigger",
+    timestamp,
+    thinkingLevel: "high",
+  };
+
+  it("pre-creates a fresh valid Pi v3 child with unique lineage metadata", () => {
+    const sessionDir = join(dir, "fresh-sessions");
+    const childCwd = join(dir, "child-cwd");
+    mkdirSync(childCwd, { recursive: true });
+    const parentFile = join(dir, "parent.jsonl");
+    writeFileSync(parentFile, "{}\n");
+
+    const created = createSubagentSession({
+      sessionDir,
+      cwd: childCwd,
+      parentSessionId: "parent-session-id",
+      parentSessionFile: parentFile,
+      parentLeafId: "parent-leaf",
+      runId: "run-001",
+      name: "Worker",
+      agent: "worker",
+      mode: "fresh",
+      task: "Implement the task",
+      createdAt: timestamp,
+    });
+
+    const manager = SessionManager.open(created.sessionFile);
+    const header = manager.getHeader();
+    assert.equal(header?.version, 3);
+    assert.equal(header?.id, created.childSessionId);
+    assert.match(created.childSessionId, /^[0-9a-f]{8}-[0-9a-f-]{27}$/);
+    assert.equal(header?.cwd, resolve(childCwd));
+    assert.equal(header?.parentSession, resolve(parentFile));
+
+    const metadataEntry = manager
+      .getEntries()
+      .find((entry) => entry.type === "custom" && entry.customType === SUBAGENT_METADATA_TYPE) as any;
+    assert.equal(metadataEntry.parentId, null);
+    assert.match(metadataEntry.id, /^[0-9a-f]{8}$/);
+    assert.deepEqual(metadataEntry.data, created.metadata);
+    assert.equal(created.metadata.parentSessionId, "parent-session-id");
+    assert.equal(created.metadata.parentLeafId, "parent-leaf");
+    assert.equal(created.metadata.childSessionId, created.childSessionId);
+    assert.equal(created.metadata.runId, "run-001");
+    assert.equal(created.metadata.mode, "fresh");
+    assert.equal(created.metadata.taskDigest, digestSubagentTask("Implement the task"));
+    assert.equal("ipcToken" in created.metadata, false);
+    assert.doesNotMatch(readFileSync(created.sessionFile, "utf8"), /PI_SUBAGENT_TOKEN|ipcToken/);
+  });
+
+  it("creates collision-resistant child IDs and paths for parallel launches", () => {
+    const sessionDir = join(dir, "parallel-sessions");
+    const options = {
+      sessionDir,
+      cwd: dir,
+      parentSessionId: "parent-session-id",
+      parentSessionFile: join(dir, "parallel-parent.jsonl"),
+      runId: "placeholder",
+      name: "Parallel",
+      mode: "fresh" as const,
+      task: "Parallel task",
+      createdAt: timestamp,
+    };
+    const first = createSubagentSession({ ...options, runId: "run-a" });
+    const second = createSubagentSession({ ...options, runId: "run-b" });
+
+    assert.notEqual(first.childSessionId, second.childSessionId);
+    assert.notEqual(first.sessionFile, second.sessionFile);
+    assert.ok(existsSync(first.sessionFile));
+    assert.ok(existsSync(second.sessionFile));
+  });
+
+  it("forks only the validated active history and excludes the orchestration trigger", () => {
+    const activeBranch = [
+      rootEntry,
+      priorUser,
+      priorAssistant,
+      orchestrationTrigger,
+      triggerSuffix,
+    ] as any[];
+    const history = selectForkHistory(activeBranch);
+    assert.deepEqual(history.map((entry) => entry.id), ["root-001", "user-prior", "assistant-prior"]);
+
+    const parentFile = join(dir, "fork-parent.jsonl");
+    writeFileSync(
+      parentFile,
+      [
+        { type: "session", version: 3, id: "parent-header-id", timestamp, cwd: dir },
+        ...activeBranch,
+      ].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
+    );
+    const created = createSubagentSession({
+      sessionDir: join(dir, "fork-sessions"),
+      cwd: dir,
+      parentSessionId: "parent-header-id",
+      parentSessionFile: parentFile,
+      parentLeafId: "user-trigger",
+      runId: "fork-run",
+      name: "Iterate",
+      mode: "fork",
+      task: "Fix the issue",
+      historyEntries: history,
+      createdAt: timestamp,
+    });
+
+    const lines = readFileSync(created.sessionFile, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.equal(lines[0].type, "session");
+    assert.notEqual(lines[0].id, "parent-header-id");
+    assert.equal(lines.filter((entry) => entry.type === "session").length, 1);
+    assert.deepEqual(lines.slice(1, 4).map((entry) => entry.id), history.map((entry) => entry.id));
+    assert.equal(lines.some((entry) => entry.id === "user-trigger"), false);
+    assert.equal(lines.at(-1).customType, SUBAGENT_METADATA_TYPE);
+    assert.equal(lines.at(-1).parentId, "assistant-prior");
+  });
+
+  it("rejects broken or non-branch fork history", () => {
+    assert.throws(
+      () => selectForkHistory([rootEntry, { ...priorUser, parentId: "wrong-parent" }] as any[]),
+      /Broken parent chain/,
+    );
+    assert.throws(
+      () => selectForkHistory([{ type: "session", id: "copied-header", timestamp }] as any[]),
+      /Invalid entry/,
+    );
+  });
+
+  it("round-trips stable child and originating-run correlation for resume", () => {
+    const created = createSubagentSession({
+      sessionDir: join(dir, "resume-sessions"),
+      cwd: dir,
+      parentSessionId: "parent-session-id",
+      parentSessionFile: join(dir, "resume-parent.jsonl"),
+      runId: "origin-run-id",
+      name: "Worker",
+      mode: "fresh",
+      task: "Initial work",
+    });
+
+    assert.deepEqual(readSubagentSessionCorrelation(created.sessionFile), {
+      childSessionId: created.childSessionId,
+      cwd: resolve(dir),
+      originatingRunId: "origin-run-id",
+    });
+  });
+
+  it("rejects forged metadata rather than losing child/run correlation", () => {
+    const file = join(dir, "forged-metadata.jsonl");
+    writeFileSync(file, [
+      JSON.stringify({ type: "session", version: 3, id: "child-id", timestamp, cwd: dir }),
+      JSON.stringify({
+        type: "custom",
+        id: "metadata-id",
+        parentId: null,
+        timestamp,
+        customType: SUBAGENT_METADATA_TYPE,
+        data: {
+          schemaVersion: 1,
+          childSessionId: "different-child-id",
+          runId: "run-id",
+          parentSessionId: "parent-id",
+          parentSessionFile: join(dir, "parent.jsonl"),
+        },
+      }),
+    ].join("\n") + "\n");
+
+    assert.throws(() => readSubagentSessionCorrelation(file), /invalid subagent metadata/);
+  });
+});
+
+describe("session artifact sidecars", () => {
+  let dir: string;
+
+  before(() => {
+    dir = createTestDir();
+  });
+
+  after(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("places artifacts under the owning session sibling sidecar", () => {
+    const sessionFile = join(dir, "2026-07-31_session-id.jsonl");
+    writeFileSync(sessionFile, "{}\n");
+    const artifactDir = ensureSessionArtifactDir(sessionFile);
+    assert.equal(
+      artifactDir,
+      join(dir, "2026-07-31_session-id", "artifacts"),
+    );
+    assert.equal(getSessionArtifactDir(sessionFile), artifactDir);
+
+    const artifact = prepareArtifactWritePath(artifactDir, "context/notes.md");
+    writeFileSync(artifact, "notes");
+    assert.equal(resolveExistingArtifactPath(artifactDir, "context/notes.md"), artifact);
+  });
+
+  it("rejects absolute paths, traversal, and sibling-prefix escapes", () => {
+    const artifactDir = ensureSessionArtifactDir(join(dir, "containment.jsonl"));
+    assert.throws(() => resolveArtifactPath(artifactDir, "/tmp/escape.md"), /relative path/);
+    assert.throws(() => resolveArtifactPath(artifactDir, "../escape.md"), /escapes/);
+    assert.throws(
+      () => resolveArtifactPath(artifactDir, `../${basename(artifactDir)}-other/escape.md`),
+      /escapes/,
+    );
+  });
+
+  it("rejects symlink traversal for writes and reads", () => {
+    const artifactDir = ensureSessionArtifactDir(join(dir, "symlink.jsonl"));
+    const outside = join(dir, "outside");
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, "secret.md"), "secret");
+    symlinkSync(outside, join(artifactDir, "linked"), "dir");
+
+    assert.throws(
+      () => prepareArtifactWritePath(artifactDir, "linked/new.md"),
+      /symbolic link/,
+    );
+    assert.throws(
+      () => resolveExistingArtifactPath(artifactDir, "linked/secret.md"),
+      /symbolic link/,
+    );
+  });
+
+  it("atomically replaces ordinary artifacts without following a leaf symlink", () => {
+    const artifactDir = ensureSessionArtifactDir(join(dir, "atomic.jsonl"));
+    const artifact = writeArtifactFile(artifactDir, "context/task.md", "first");
+    assert.equal(readFileSync(artifact, "utf8"), "first");
+    assert.equal(writeArtifactFile(artifactDir, "context/task.md", "second"), artifact);
+    assert.equal(readFileSync(artifact, "utf8"), "second");
+
+    const outside = join(dir, "atomic-outside.md");
+    writeFileSync(outside, "secret");
+    rmSync(artifact);
+    symlinkSync(outside, artifact);
+    assert.throws(() => writeArtifactFile(artifactDir, "context/task.md", "blocked"), /symbolic link/);
+    assert.equal(readFileSync(outside, "utf8"), "secret");
+  });
+});
+
 describe("subagent-done.ts", () => {
   let dir: string;
 
@@ -323,6 +630,28 @@ describe("subagent-done.ts", () => {
           dir,
         ),
       /does not exist/,
+    );
+  });
+
+  it("rejects artifact references that traverse symlinks", () => {
+    const artifactDir = join(dir, "symlink-artifacts");
+    const outside = join(dir, "symlink-outside");
+    mkdirSync(artifactDir, { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, "report.md"), "report");
+    symlinkSync(outside, join(artifactDir, "linked"), "dir");
+
+    assert.throws(
+      () =>
+        validateSubagentDoneParams(
+          {
+            status: "success",
+            summary: "Done.",
+            artifacts: [{ name: "linked/report.md" }],
+          },
+          artifactDir,
+        ),
+      /symbolic link/,
     );
   });
 
@@ -405,6 +734,46 @@ describe("subagent model qualification", () => {
       assert.equal(qualified, "openai-codex/gpt-5.4");
     } finally {
       rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("subagent launch environment", () => {
+  it("resolves relative child cwd against the parent before session creation", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.equal(
+      testApi.resolveEffectiveChildCwd("agents/worker", "/workspace/project"),
+      "/workspace/project/agents/worker",
+    );
+    assert.equal(
+      testApi.resolveEffectiveChildCwd(undefined, "/workspace/project"),
+      "/workspace/project",
+    );
+  });
+
+  it("reasserts inherited profile selectors for child and resume commands", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const originalProfile = process.env.PI_PROFILE;
+    const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+    try {
+      process.env.PI_PROFILE = "radius";
+      process.env.PI_CODING_AGENT_DIR = "/tmp/profile root/radius";
+      assert.deepEqual(testApi.inheritedProfileEnvParts(), [
+        "PI_PROFILE='radius'",
+        "PI_CODING_AGENT_DIR='/tmp/profile root/radius'",
+      ]);
+      assert.deepEqual(testApi.inheritedProfileEnvUnsets(), []);
+
+      delete process.env.PI_PROFILE;
+      delete process.env.PI_CODING_AGENT_DIR;
+      assert.deepEqual(testApi.inheritedProfileEnvUnsets(), [
+        "-u", "PI_PROFILE", "-u", "PI_CODING_AGENT_DIR",
+      ]);
+    } finally {
+      if (originalProfile == null) delete process.env.PI_PROFILE;
+      else process.env.PI_PROFILE = originalProfile;
+      if (originalAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
     }
   });
 });
