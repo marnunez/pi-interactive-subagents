@@ -22,7 +22,7 @@ import {
 import { ChildIpcClient, type IpcEnvelope } from "./ipc.ts";
 import {
   monitorExtensionUi,
-  type ExtensionUiRequest,
+  PendingExtensionUiRequests,
 } from "./ui-monitor.ts";
 
 const MAX_SUMMARY_CHARS = 2_000;
@@ -161,7 +161,7 @@ export default function (pi: ExtensionAPI) {
   let latestCtx: ExtensionContext | null = null;
   let runState: "idle" | "running" = "idle";
   let stopUiMonitor: (() => void) | null = null;
-  const pendingUiRequests = new Map<string, ExtensionUiRequest>();
+  const pendingUiRequests = new PendingExtensionUiRequests();
 
   // Read subagent identity and IPC configuration from env vars set by the parent.
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
@@ -192,8 +192,8 @@ export default function (pi: ExtensionAPI) {
             ? `${latestCtx.model.provider}/${latestCtx.model.id}`
             : undefined,
           autoExit,
-          state: pendingUiRequests.size > 0 ? "waiting_input" : runState,
-          uiRequests: [...pendingUiRequests.values()],
+          state: pendingUiRequests.snapshot().pendingUiRequestCount > 0 ? "waiting_input" : runState,
+          ...pendingUiRequests.snapshot(),
         }),
         onMessage: (message: IpcEnvelope) => {
           const payload = message.payload as { text?: string } | undefined;
@@ -279,18 +279,22 @@ export default function (pi: ExtensionAPI) {
     latestCtx = ctx;
     completionSent = false;
     runState = ctx.isIdle() ? "idle" : "running";
-    pendingUiRequests.clear();
+    pendingUiRequests.reset();
     stopUiMonitor?.();
     stopUiMonitor = monitorExtensionUi(ctx.ui, (event) => {
       if (event.phase === "started") {
-        pendingUiRequests.set(event.request.id, event.request);
-        ipc?.send("ui_request", event.request);
+        pendingUiRequests.start(event.request);
+        ipc?.send("ui_request", {
+          ...event.request,
+          pendingUiRequestCount: pendingUiRequests.snapshot().pendingUiRequestCount,
+        });
         return;
       }
-      pendingUiRequests.delete(event.request.id);
+      pendingUiRequests.resolve(event.request.id);
       ipc?.send("ui_request_resolved", {
         id: event.request.id,
         state: latestCtx?.isIdle() ? "idle" : runState,
+        pendingUiRequestCount: pendingUiRequests.snapshot().pendingUiRequestCount,
         resolvedAt: Date.now(),
       });
     });
@@ -300,6 +304,7 @@ export default function (pi: ExtensionAPI) {
       sessionId: ctx.sessionManager.getSessionId(),
       sessionFile: ctx.sessionManager.getSessionFile(),
       state: runState,
+      ...pendingUiRequests.snapshot(),
     });
 
     const tools = pi.getAllTools();
@@ -372,7 +377,7 @@ export default function (pi: ExtensionAPI) {
     });
     stopUiMonitor?.();
     stopUiMonitor = null;
-    pendingUiRequests.clear();
+    pendingUiRequests.reset();
     if (event.reason !== "reload") latestCtx = null;
   });
 

@@ -13,6 +13,47 @@ export type ExtensionUiRequestEvent =
   | { phase: "started"; request: ExtensionUiRequest }
   | { phase: "resolved"; request: ExtensionUiRequest };
 
+/** Track an exact pending count while retaining only bounded display metadata. */
+export class PendingExtensionUiRequests {
+  #count = 0;
+  readonly #maximumRecent: number;
+  readonly #recent = new Map<string, ExtensionUiRequest>();
+
+  constructor(maximumRecent = 20) {
+    if (!Number.isSafeInteger(maximumRecent) || maximumRecent < 1) {
+      throw new Error("maximumRecent must be a positive safe integer");
+    }
+    this.#maximumRecent = maximumRecent;
+  }
+
+  start(request: ExtensionUiRequest): void {
+    this.#count++;
+    this.#recent.set(request.id, request);
+    while (this.#recent.size > this.#maximumRecent) {
+      const oldest = this.#recent.keys().next().value;
+      if (oldest === undefined) break;
+      this.#recent.delete(oldest);
+    }
+  }
+
+  resolve(requestId: string): void {
+    this.#count = Math.max(0, this.#count - 1);
+    this.#recent.delete(requestId);
+  }
+
+  reset(): void {
+    this.#count = 0;
+    this.#recent.clear();
+  }
+
+  snapshot(): { pendingUiRequestCount: number; uiRequests: ExtensionUiRequest[] } {
+    return {
+      pendingUiRequestCount: this.#count,
+      uiRequests: [...this.#recent.values()],
+    };
+  }
+}
+
 function boundedTitle(title: unknown): string | undefined {
   if (typeof title !== "string") return undefined;
   const normalized = title.replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").replace(/\s+/g, " ").trim();

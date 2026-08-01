@@ -438,6 +438,8 @@ interface PendingUiRequest {
   startedAt?: number;
 }
 
+const MAX_DISPLAY_UI_REQUESTS = 20;
+
 function parsePendingUiRequest(value: unknown): PendingUiRequest | null {
   if (!value || typeof value !== "object") return null;
   const request = value as Partial<PendingUiRequest>;
@@ -455,6 +457,12 @@ function parsePendingUiRequest(value: unknown): PendingUiRequest | null {
     title,
     startedAt: typeof request.startedAt === "number" ? request.startedAt : undefined,
   };
+}
+
+function parsePendingUiRequestCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
 }
 
 /**
@@ -483,6 +491,7 @@ interface RunningSubagent {
   autoExit: boolean;
   connected?: boolean;
   state?: SubagentRunState;
+  pendingUiRequestCount?: number;
   uiRequests?: PendingUiRequest[];
 }
 
@@ -574,7 +583,9 @@ function formatSubagentState(agent: RunningSubagent): string {
   if (!agent.connected) return "connecting…";
   if (agent.state === "waiting_input") {
     const request = agent.uiRequests?.[agent.uiRequests.length - 1];
-    return request?.title ? `waiting: ${request.title}` : "waiting for input";
+    if (request?.title) return `waiting: ${request.title}`;
+    const count = agent.pendingUiRequestCount ?? agent.uiRequests?.length ?? 0;
+    return count > 1 ? `waiting for ${count} inputs` : "waiting for input";
   }
   if (agent.state === "idle") return "idle";
   if (agent.state === "running") {
@@ -1045,29 +1056,30 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       ) {
         running.sessionFile = resolve(payload.sessionFile);
       }
-      if (
-        payload?.state === "idle" ||
-        payload?.state === "running" ||
-        payload?.state === "waiting_input"
-      ) {
-        running.state = payload.state;
-      }
+      const pendingCount = parsePendingUiRequestCount(payload?.pendingUiRequestCount);
+      if (pendingCount !== undefined) running.pendingUiRequestCount = pendingCount;
       if (Array.isArray(payload?.uiRequests)) {
         running.uiRequests = payload.uiRequests
           .map(parsePendingUiRequest)
           .filter((request: PendingUiRequest | null): request is PendingUiRequest => !!request)
-          .slice(-20);
+          .slice(-MAX_DISPLAY_UI_REQUESTS);
+        if (pendingCount === undefined) running.pendingUiRequestCount = (running.uiRequests ?? []).length;
+      }
+      if ((running.pendingUiRequestCount ?? 0) > 0) {
+        running.state = "waiting_input";
+      } else if (payload?.state === "idle" || payload?.state === "running") {
+        running.state = payload.state;
       }
       updateWidget();
       return;
     }
     if (message.type === "running") {
-      running.state = running.uiRequests?.length ? "waiting_input" : "running";
+      running.state = (running.pendingUiRequestCount ?? 0) > 0 ? "waiting_input" : "running";
       updateWidget();
       return;
     }
     if (message.type === "settled") {
-      running.state = running.uiRequests?.length ? "waiting_input" : "idle";
+      running.state = (running.pendingUiRequestCount ?? 0) > 0 ? "waiting_input" : "idle";
       updateWidget();
       return;
     }
@@ -1075,10 +1087,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const request = parsePendingUiRequest(payload);
       if (!request) return;
       const requests = running.uiRequests ?? [];
+      const wasDisplayed = requests.some((pending) => pending.id === request.id);
       running.uiRequests = [
         ...requests.filter((pending) => pending.id !== request.id),
         request,
-      ].slice(-20);
+      ].slice(-MAX_DISPLAY_UI_REQUESTS);
+      running.pendingUiRequestCount = parsePendingUiRequestCount(payload?.pendingUiRequestCount)
+        ?? (running.pendingUiRequestCount ?? requests.length) + (wasDisplayed ? 0 : 1);
       running.state = "waiting_input";
       updateWidget();
       return;
@@ -1089,7 +1104,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       running.uiRequests = (running.uiRequests ?? []).filter(
         (request) => request.id !== requestId,
       );
-      if (running.uiRequests.length > 0) {
+      running.pendingUiRequestCount = parsePendingUiRequestCount(payload?.pendingUiRequestCount)
+        ?? Math.max(0, (running.pendingUiRequestCount ?? 1) - 1);
+      if (running.pendingUiRequestCount > 0) {
         running.state = "waiting_input";
       } else if (payload?.state === "idle" || payload?.state === "running") {
         running.state = payload.state;
@@ -1796,6 +1813,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 name: a.name,
                 agent: a.agent,
                 status: formatSubagentState(a),
+                pendingUiRequestCount: a.pendingUiRequestCount,
                 uiRequests: a.uiRequests,
               })),
             },

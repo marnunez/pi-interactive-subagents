@@ -48,7 +48,10 @@ import {
   IpcFrameDecoder,
   ParentIpcServer,
 } from "../pi-extension/subagents/ipc.ts";
-import { monitorExtensionUi } from "../pi-extension/subagents/ui-monitor.ts";
+import {
+  monitorExtensionUi,
+  PendingExtensionUiRequests,
+} from "../pi-extension/subagents/ui-monitor.ts";
 
 // --- Helpers ---
 
@@ -890,6 +893,22 @@ describe("subagents widget rendering", () => {
     ], 80);
 
     assert.match(lines[1], /waiting: Requires High/);
+
+    const bounded = testApi.renderSubagentWidgetLines([
+      {
+        id: "a2",
+        name: "Many Requests",
+        task: "",
+        surface: "s2",
+        startTime: Date.now(),
+        sessionFile: "sess2",
+        connected: true,
+        state: "waiting_input",
+        pendingUiRequestCount: 25,
+        uiRequests: [],
+      },
+    ], 80);
+    assert.match(bounded[1], /waiting for 25 inputs/);
   });
 
   it("handles ultra-narrow widths without exceeding the width contract", () => {
@@ -923,6 +942,28 @@ describe("subagents widget rendering", () => {
 });
 
 describe("generic extension UI monitoring", () => {
+  it("keeps an exact pending count with bounded reconnect/display metadata", () => {
+    const pending = new PendingExtensionUiRequests(20);
+    for (let index = 0; index < 25; index++) {
+      pending.start({
+        id: `ui-${index}`,
+        method: "select",
+        title: `Request ${index}`,
+        startedAt: index,
+      });
+    }
+    assert.equal(pending.snapshot().pendingUiRequestCount, 25);
+    assert.equal(pending.snapshot().uiRequests.length, 20);
+    assert.equal(pending.snapshot().uiRequests[0].id, "ui-5");
+
+    // Resolve retained requests first: state must still reflect the five older requests
+    // whose display metadata was deliberately evicted.
+    for (let index = 5; index < 25; index++) pending.resolve(`ui-${index}`);
+    assert.deepEqual(pending.snapshot(), { pendingUiRequestCount: 5, uiRequests: [] });
+    for (let index = 0; index < 5; index++) pending.resolve(`ui-${index}`);
+    assert.deepEqual(pending.snapshot(), { pendingUiRequestCount: 0, uiRequests: [] });
+  });
+
   it("reports every focused UI method and restores the shared context", async () => {
     const events: Array<{ phase: string; method: string; title?: string }> = [];
     let resolveSelection!: (value: string | undefined) => void;
