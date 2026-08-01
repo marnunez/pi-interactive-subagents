@@ -428,6 +428,35 @@ interface SubagentResult {
   error?: string;
 }
 
+/** Generic child lifecycle and keyboard-focused extension UI state received over IPC. */
+type SubagentRunState = "idle" | "running" | "waiting_input";
+
+interface PendingUiRequest {
+  id: string;
+  method: string;
+  title?: string;
+  startedAt?: number;
+}
+
+function parsePendingUiRequest(value: unknown): PendingUiRequest | null {
+  if (!value || typeof value !== "object") return null;
+  const request = value as Partial<PendingUiRequest>;
+  if (typeof request.id !== "string" || typeof request.method !== "string") return null;
+  const title = typeof request.title === "string"
+    ? request.title
+        .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 200) || undefined
+    : undefined;
+  return {
+    id: request.id.slice(0, 100),
+    method: request.method.slice(0, 50),
+    title,
+    startedAt: typeof request.startedAt === "number" ? request.startedAt : undefined,
+  };
+}
+
 /**
  * State for a launched (but not yet completed) subagent.
  */
@@ -453,6 +482,8 @@ interface RunningSubagent {
   ipcToken: string;
   autoExit: boolean;
   connected?: boolean;
+  state?: SubagentRunState;
+  uiRequests?: PendingUiRequest[];
 }
 
 /** All currently running subagents, keyed by id. */
@@ -539,6 +570,22 @@ function borderBottom(width: number): string {
   return `${ACCENT}╰${"─".repeat(inner)}╯${RST}`;
 }
 
+function formatSubagentState(agent: RunningSubagent): string {
+  if (!agent.connected) return "connecting…";
+  if (agent.state === "waiting_input") {
+    const request = agent.uiRequests?.[agent.uiRequests.length - 1];
+    return request?.title ? `waiting: ${request.title}` : "waiting for input";
+  }
+  if (agent.state === "idle") return "idle";
+  if (agent.state === "running") {
+    return agent.entries != null ? `running · ${agent.entries} msgs` : "running";
+  }
+  if (agent.entries != null && agent.bytes != null) {
+    return `${agent.entries} msgs (${formatBytes(agent.bytes)})`;
+  }
+  return "connected";
+}
+
 function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): string[] {
   const count = agents.length;
   const title = "Subagents";
@@ -550,12 +597,7 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
     const elapsed = formatElapsedMMSS(agent.startTime);
     const agentTag = agent.agent ? ` (${agent.agent})` : "";
     const left = ` ${elapsed}  ${agent.name}${agentTag} `;
-    const right =
-      agent.entries != null && agent.bytes != null
-        ? ` ${agent.entries} msgs (${formatBytes(agent.bytes)}) `
-        : agent.connected
-          ? " connected "
-          : " connecting… ";
+    const right = ` ${formatSubagentState(agent)} `;
 
     lines.push(borderLine(left, right, width));
   }
@@ -1002,6 +1044,57 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         resolve(payload.sessionFile) === resolve(running.sessionFile)
       ) {
         running.sessionFile = resolve(payload.sessionFile);
+      }
+      if (
+        payload?.state === "idle" ||
+        payload?.state === "running" ||
+        payload?.state === "waiting_input"
+      ) {
+        running.state = payload.state;
+      }
+      if (Array.isArray(payload?.uiRequests)) {
+        running.uiRequests = payload.uiRequests
+          .map(parsePendingUiRequest)
+          .filter((request: PendingUiRequest | null): request is PendingUiRequest => !!request)
+          .slice(-20);
+      }
+      updateWidget();
+      return;
+    }
+    if (message.type === "running") {
+      running.state = running.uiRequests?.length ? "waiting_input" : "running";
+      updateWidget();
+      return;
+    }
+    if (message.type === "settled") {
+      running.state = running.uiRequests?.length ? "waiting_input" : "idle";
+      updateWidget();
+      return;
+    }
+    if (message.type === "ui_request") {
+      const request = parsePendingUiRequest(payload);
+      if (!request) return;
+      const requests = running.uiRequests ?? [];
+      running.uiRequests = [
+        ...requests.filter((pending) => pending.id !== request.id),
+        request,
+      ].slice(-20);
+      running.state = "waiting_input";
+      updateWidget();
+      return;
+    }
+    if (message.type === "ui_request_resolved") {
+      if (typeof payload?.id !== "string") return;
+      const requestId = payload.id.slice(0, 100);
+      running.uiRequests = (running.uiRequests ?? []).filter(
+        (request) => request.id !== requestId,
+      );
+      if (running.uiRequests.length > 0) {
+        running.state = "waiting_input";
+      } else if (payload?.state === "idle" || payload?.state === "running") {
+        running.state = payload.state;
+      } else {
+        running.state = "running";
       }
       updateWidget();
       return;
@@ -1688,7 +1781,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const lines = agents.map((a) => {
             const elapsed = formatElapsedMMSS(a.startTime);
             const agentTag = a.agent ? ` (${a.agent})` : "";
-            return `• ${a.name}${agentTag} [id: ${a.id}] — running for ${elapsed}`;
+            return `• ${a.name}${agentTag} [id: ${a.id}] — ${formatSubagentState(a)} · elapsed ${elapsed}`;
           });
           return {
             content: [
@@ -1698,7 +1791,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               },
             ],
             details: {
-              running: agents.map((a) => ({ id: a.id, name: a.name, agent: a.agent })),
+              running: agents.map((a) => ({
+                id: a.id,
+                name: a.name,
+                agent: a.agent,
+                status: formatSubagentState(a),
+                uiRequests: a.uiRequests,
+              })),
             },
           };
         }

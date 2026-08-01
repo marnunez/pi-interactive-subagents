@@ -10,8 +10,8 @@ Call `subagent()` and it **returns immediately**. The sub-agent runs as a fully 
 
 ```
 ╭─ Subagents ──────────────────────── 2 running ─╮
-│ 00:23  Scout: Auth (scout)    8 msgs (5.1KB)   │
-│ 00:45  Scout: DB (scout)     12 msgs (9.3KB)   │
+│ 00:23  Scout: Auth (scout)       running · 8 msgs │
+│ 00:45  Scout: DB (scout)                  idle   │
 ╰─────────────────────────────────────────────────╯
 ```
 
@@ -102,12 +102,15 @@ Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global**
 1. Agent calls subagent()          → returns immediately ("started")
 2. Child opens a real Pi TUI       → user can watch, type, and steer directly
 3. Child bridge authenticates      → parent/child lifecycle moves over Unix IPC
-4. User keeps chatting             → main session remains fully interactive
-5. Sub-agent finishes              → structured result steered back as interrupt
-6. Main agent processes result     → continues with new context
+4. Child state stays observable    → running, idle, or waiting for Pi UI input
+5. User keeps chatting             → main session remains fully interactive
+6. Sub-agent finishes              → structured result steered back as interrupt
+7. Main agent processes result     → continues with new context
 ```
 
-The multiplexer is used only to create, focus, rename, and close panes. Lifecycle, progress, completion, cancellation, and parent-issued prompts use framed IPC messages under `$XDG_RUNTIME_DIR/pi-subagents/`; no pane screen contents or shell sentinels are involved. Child connections automatically retry across parent `/reload`, and unresolved launches are reconstructed from non-context session entries.
+The multiplexer is used only to create, focus, rename, and close panes. Lifecycle, progress, completion, cancellation, generic Pi UI-wait state, and parent-issued prompts use framed IPC messages under `$XDG_RUNTIME_DIR/pi-subagents/`; no pane screen contents or shell sentinels are involved. Child connections automatically retry across parent `/reload`, and unresolved launches are reconstructed from non-context session entries.
+
+The child bridge observes the shared Pi extension UI methods generically. Any extension that opens a keyboard-focused `select`, `confirm`, `input`, `editor`, or custom UI is reported as waiting for input until its promise resolves. The bridge does not import the requesting extension, inspect the active tool, or maintain a catalogue of tool behaviours.
 
 Every new child session is pre-created with its own Pi v3 session ID, the effective
 child working directory, the official `parentSession` header field, and a
@@ -119,9 +122,9 @@ Multiple subagents run concurrently — each steers its result back independentl
 
 ```
 ╭─ Subagents ──────────────────────── 3 running ─╮
-│ 01:23  Scout: Auth (scout)      15 msgs (12KB) │
-│ 00:45  Researcher (researcher)   8 msgs (6KB)  │
-│ 00:12  Scout: DB (scout)             starting…  │
+│ 01:23  Scout: Auth (scout)      running · 15 msgs │
+│ 00:45  Researcher (researcher)                  idle │
+│ 00:12  Scout: DB (scout) waiting: Requires approval │
 ╰─────────────────────────────────────────────────╯
 ```
 

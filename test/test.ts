@@ -48,6 +48,7 @@ import {
   IpcFrameDecoder,
   ParentIpcServer,
 } from "../pi-extension/subagents/ipc.ts";
+import { monitorExtensionUi } from "../pi-extension/subagents/ui-monitor.ts";
 
 // --- Helpers ---
 
@@ -872,6 +873,25 @@ describe("subagents widget rendering", () => {
     assert.equal(visibleWidth(line), 16);
   });
 
+  it("shows generic pending UI state without knowing its source", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const lines = testApi.renderSubagentWidgetLines([
+      {
+        id: "a1",
+        name: "Waiting Child",
+        task: "",
+        surface: "s1",
+        startTime: Date.now(),
+        sessionFile: "sess1",
+        connected: true,
+        state: "waiting_input",
+        uiRequests: [{ id: "ui-1", method: "select", title: "Requires High" }],
+      },
+    ], 80);
+
+    assert.match(lines[1], /waiting: Requires High/);
+  });
+
   it("handles ultra-narrow widths without exceeding the width contract", () => {
     const testApi = (subagentsModule as any).__test__;
     assert.ok(testApi, "expected subagents test helpers to be exported");
@@ -899,6 +919,63 @@ describe("subagents widget rendering", () => {
         );
       }
     }
+  });
+});
+
+describe("generic extension UI monitoring", () => {
+  it("reports every focused UI method and restores the shared context", async () => {
+    const events: Array<{ phase: string; method: string; title?: string }> = [];
+    let resolveSelection!: (value: string | undefined) => void;
+    const originalSelect = async () =>
+      new Promise<string | undefined>((resolveSelectionPromise) => { resolveSelection = resolveSelectionPromise; });
+    const originalConfirm = async () => true;
+    const originalInput = async () => "input";
+    const originalEditor = async () => "editor";
+    const originalCustom = async () => "custom";
+    const ui = {
+      select: originalSelect,
+      confirm: originalConfirm,
+      input: originalInput,
+      editor: originalEditor,
+      custom: originalCustom,
+    } as any;
+
+    const dispose = monitorExtensionUi(ui, (event) => {
+      events.push({
+        phase: event.phase,
+        method: event.request.method,
+        title: event.request.title,
+      });
+    });
+    const selection = ui.select("  Requires\nHigh  ", ["Allow", "Cancel"]);
+    await Promise.resolve();
+
+    assert.deepEqual(events, [
+      { phase: "started", method: "select", title: "Requires High" },
+    ]);
+    resolveSelection("Allow");
+    assert.equal(await selection, "Allow");
+    assert.equal(await ui.confirm("Confirm", "Continue?"), true);
+    assert.equal(await ui.input("Input", "Value"), "input");
+    assert.equal(await ui.editor("Editor", "Text"), "editor");
+    assert.equal(await ui.custom(() => ({})), "custom");
+    assert.deepEqual(
+      events.map((event) => `${event.phase}:${event.method}`),
+      [
+        "started:select", "resolved:select",
+        "started:confirm", "resolved:confirm",
+        "started:input", "resolved:input",
+        "started:editor", "resolved:editor",
+        "started:custom", "resolved:custom",
+      ],
+    );
+
+    dispose();
+    assert.equal(ui.select, originalSelect);
+    assert.equal(ui.confirm, originalConfirm);
+    assert.equal(ui.input, originalInput);
+    assert.equal(ui.editor, originalEditor);
+    assert.equal(ui.custom, originalCustom);
   });
 });
 

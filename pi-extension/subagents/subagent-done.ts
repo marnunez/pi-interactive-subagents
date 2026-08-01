@@ -20,6 +20,10 @@ import {
   type SubagentDoneResult,
 } from "./session.ts";
 import { ChildIpcClient, type IpcEnvelope } from "./ipc.ts";
+import {
+  monitorExtensionUi,
+  type ExtensionUiRequest,
+} from "./ui-monitor.ts";
 
 const MAX_SUMMARY_CHARS = 2_000;
 const MAX_REPORT_CHARS = 50 * 1024;
@@ -155,6 +159,9 @@ export default function (pi: ExtensionAPI) {
   let expanded = false;
   let completionSent = false;
   let latestCtx: ExtensionContext | null = null;
+  let runState: "idle" | "running" = "idle";
+  let stopUiMonitor: (() => void) | null = null;
+  const pendingUiRequests = new Map<string, ExtensionUiRequest>();
 
   // Read subagent identity and IPC configuration from env vars set by the parent.
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
@@ -185,6 +192,8 @@ export default function (pi: ExtensionAPI) {
             ? `${latestCtx.model.provider}/${latestCtx.model.id}`
             : undefined,
           autoExit,
+          state: pendingUiRequests.size > 0 ? "waiting_input" : runState,
+          uiRequests: [...pendingUiRequests.values()],
         }),
         onMessage: (message: IpcEnvelope) => {
           const payload = message.payload as { text?: string } | undefined;
@@ -265,14 +274,32 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
-  // Show widget + status bar and establish the parent IPC connection.
+  // Show widget + status bar, observe generic Pi UI requests, and establish parent IPC.
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
     completionSent = false;
+    runState = ctx.isIdle() ? "idle" : "running";
+    pendingUiRequests.clear();
+    stopUiMonitor?.();
+    stopUiMonitor = monitorExtensionUi(ctx.ui, (event) => {
+      if (event.phase === "started") {
+        pendingUiRequests.set(event.request.id, event.request);
+        ipc?.send("ui_request", event.request);
+        return;
+      }
+      pendingUiRequests.delete(event.request.id);
+      ipc?.send("ui_request_resolved", {
+        id: event.request.id,
+        state: latestCtx?.isIdle() ? "idle" : runState,
+        resolvedAt: Date.now(),
+      });
+    });
+
     ipc?.start();
     ipc?.send("ready", {
       sessionId: ctx.sessionManager.getSessionId(),
       sessionFile: ctx.sessionManager.getSessionFile(),
+      state: runState,
     });
 
     const tools = pi.getAllTools();
@@ -301,6 +328,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_start", () => {
+    runState = "running";
     ipc?.send("running", { timestamp: Date.now() });
   });
 
@@ -312,6 +340,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", (_event, ctx) => {
+    runState = "idle";
     ipc?.send("settled", { timestamp: Date.now(), autoExit });
     if (!autoExit || completionSent) return;
 
@@ -341,6 +370,9 @@ export default function (pi: ExtensionAPI) {
       sessionId: ctx.sessionManager.getSessionId(),
       completionSent,
     });
+    stopUiMonitor?.();
+    stopUiMonitor = null;
+    pendingUiRequests.clear();
     if (event.reason !== "reload") latestCtx = null;
   });
 
