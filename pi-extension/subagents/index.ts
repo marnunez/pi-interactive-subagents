@@ -293,6 +293,10 @@ function resolveEffectiveChildCwd(rawCwd: string | undefined, parentCwd: string)
 }
 
 const PROFILE_ENV_NAMES = ["PI_PROFILE", "PI_CODING_AGENT_DIR"] as const;
+const NON_INHERITED_RUNTIME_ENV_NAMES = [
+  "PI_SESSION_LEASE_OWNER_PID",
+  "PI_SESSION_LEASE_OWNER_NONCE",
+] as const;
 
 function inheritedProfileEnvParts(): string[] {
   return PROFILE_ENV_NAMES.flatMap((name) => {
@@ -306,7 +310,23 @@ function inheritedProfileEnvParts(): string[] {
  * selectors absent from this parent before applying the selectors it does have.
  */
 function inheritedProfileEnvUnsets(): string[] {
-  return PROFILE_ENV_NAMES.flatMap((name) => (process.env[name] == null ? ["-u", name] : []));
+  return [
+    ...PROFILE_ENV_NAMES.flatMap((name) => (process.env[name] == null ? ["-u", name] : [])),
+    ...NON_INHERITED_RUNTIME_ENV_NAMES.flatMap((name) => ["-u", name]),
+  ];
+}
+
+function customAgentEnvParts(value: string | undefined): string[] {
+  if (!value) return [];
+  const parts: string[] = [];
+  for (const pair of value.split(/\s+/).filter(Boolean)) {
+    const assignment = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(pair);
+    if (!assignment) continue;
+    const [, name, rawValue] = assignment;
+    if (NON_INHERITED_RUNTIME_ENV_NAMES.some((reserved) => reserved === name)) continue;
+    parts.push(`${name}=${shellEscape(rawValue)}`);
+  }
+  return parts;
 }
 
 function formatElapsed(seconds: number): string {
@@ -653,6 +673,7 @@ export const __test__ = {
   resolveEffectiveChildCwd,
   inheritedProfileEnvParts,
   inheritedProfileEnvUnsets,
+  customAgentEnvParts,
 };
 
 function startWidgetRefresh() {
@@ -860,12 +881,9 @@ async function launchSubagent(
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
   }
-  // Custom env vars from agent frontmatter (e.g. "PI_PERMISSION_LEVEL=low PI_FOO=bar")
-  if (agentDefs?.env) {
-    for (const pair of agentDefs.env.split(/\s+/).filter(Boolean)) {
-      if (pair.includes("=")) envParts.push(pair);
-    }
-  }
+  // Custom env vars from agent frontmatter (e.g. "PI_PERMISSION_LEVEL=low PI_FOO=bar").
+  // Lease hand-off values are parent-only capabilities and cannot be restored here.
+  envParts.push(...customAgentEnvParts(agentDefs?.env));
   // Multiplexer server environments can lag behind the invoking Pi process.
   // Reassert profile selectors last so agent frontmatter cannot cross profiles.
   envParts.push(...inheritedProfileEnvParts());

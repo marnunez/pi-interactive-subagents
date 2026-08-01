@@ -82,6 +82,12 @@ Durable task, report, and artifact files live beside their owning session at
 `<session-file-without-.jsonl>/artifacts/`. They therefore move with the session
 corpus instead of depending on a separate history tree.
 
+Child and resumed-subagent commands explicitly reassert `PI_PROFILE` and
+`PI_CODING_AGENT_DIR`, even when a multiplexer retains stale environment state.
+Parent-only lease hand-off capabilities (`PI_SESSION_LEASE_OWNER_PID` and
+`PI_SESSION_LEASE_OWNER_NONCE`) are always removed; each child acquires its own
+session lease.
+
 ### Bundled Agents
 
 | Agent             | Model                  | Role                                                                                     |

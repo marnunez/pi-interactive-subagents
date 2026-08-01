@@ -755,29 +755,55 @@ describe("subagent launch environment", () => {
     );
   });
 
+  it("rejects parent lease capabilities from custom agent environment", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.deepEqual(
+      testApi.customAgentEnvParts(
+        "PI_FOO=kept PI_LITERAL=$(not-executed) PI_EQUALS=a=b " +
+        "PI_SESSION_LEASE_OWNER_PID=1234 " +
+        "PI_SESSION_LEASE_OWNER_NONCE=parent-only-nonce " +
+        "PI_SESSION_LEASE_OWNER_\\PID=escaped " +
+        "'PI_SESSION_LEASE_OWNER_PID=single-quoted' " +
+        "\"PI_SESSION_LEASE_OWNER_NONCE=double-quoted\" MALFORMED",
+      ),
+      ["PI_FOO='kept'", "PI_LITERAL='$(not-executed)'", "PI_EQUALS='a=b'"],
+    );
+  });
+
   it("reasserts inherited profile selectors for child and resume commands", () => {
     const testApi = (subagentsModule as any).__test__;
     const originalProfile = process.env.PI_PROFILE;
     const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const originalLeasePid = process.env.PI_SESSION_LEASE_OWNER_PID;
+    const originalLeaseNonce = process.env.PI_SESSION_LEASE_OWNER_NONCE;
     try {
       process.env.PI_PROFILE = "radius";
       process.env.PI_CODING_AGENT_DIR = "/tmp/profile root/radius";
+      process.env.PI_SESSION_LEASE_OWNER_PID = "1234";
+      process.env.PI_SESSION_LEASE_OWNER_NONCE = "parent-only-nonce";
       assert.deepEqual(testApi.inheritedProfileEnvParts(), [
         "PI_PROFILE='radius'",
         "PI_CODING_AGENT_DIR='/tmp/profile root/radius'",
       ]);
-      assert.deepEqual(testApi.inheritedProfileEnvUnsets(), []);
+      assert.deepEqual(testApi.inheritedProfileEnvUnsets(), [
+        "-u", "PI_SESSION_LEASE_OWNER_PID", "-u", "PI_SESSION_LEASE_OWNER_NONCE",
+      ]);
 
       delete process.env.PI_PROFILE;
       delete process.env.PI_CODING_AGENT_DIR;
       assert.deepEqual(testApi.inheritedProfileEnvUnsets(), [
         "-u", "PI_PROFILE", "-u", "PI_CODING_AGENT_DIR",
+        "-u", "PI_SESSION_LEASE_OWNER_PID", "-u", "PI_SESSION_LEASE_OWNER_NONCE",
       ]);
     } finally {
       if (originalProfile == null) delete process.env.PI_PROFILE;
       else process.env.PI_PROFILE = originalProfile;
       if (originalAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+      if (originalLeasePid == null) delete process.env.PI_SESSION_LEASE_OWNER_PID;
+      else process.env.PI_SESSION_LEASE_OWNER_PID = originalLeasePid;
+      if (originalLeaseNonce == null) delete process.env.PI_SESSION_LEASE_OWNER_NONCE;
+      else process.env.PI_SESSION_LEASE_OWNER_NONCE = originalLeaseNonce;
     }
   });
 });
