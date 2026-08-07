@@ -33,7 +33,10 @@ import {
 } from "../pi-extension/subagents/session.ts";
 
 import { shellEscape, isCmuxAvailable, isWezTermAvailable } from "../pi-extension/subagents/cmux.ts";
-import { validateSubagentDoneParams } from "../pi-extension/subagents/subagent-done.ts";
+import {
+  resolveChildActiveTools,
+  validateSubagentDoneParams,
+} from "../pi-extension/subagents/subagent-done.ts";
 import {
   ensureSessionArtifactDir,
   getSessionArtifactDir,
@@ -600,6 +603,39 @@ describe("subagent-done.ts", () => {
 
   after(() => {
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("preserves preset-selected tools and activates registered child lifecycle tools", () => {
+    assert.deepEqual(
+      resolveChildActiveTools(
+        ["read", "bash", "subagent"],
+        [],
+        ["read", "bash", "subagent", "subagent_done", "set_tab_title"],
+      ),
+      ["read", "bash", "subagent", "subagent_done", "set_tab_title"],
+    );
+  });
+
+  it("keeps an explicit child tool lock while restoring mandatory lifecycle tools", () => {
+    assert.deepEqual(
+      resolveChildActiveTools(
+        ["read", "bash", "edit", "web_search"],
+        ["read", "bash"],
+        ["read", "bash", "edit", "web_search", "subagent_done"],
+      ),
+      ["read", "bash", "subagent_done"],
+    );
+  });
+
+  it("does not activate child tools that were denied and therefore not registered", () => {
+    assert.deepEqual(
+      resolveChildActiveTools(
+        ["read", "bash"],
+        [],
+        ["read", "bash", "subagent_done"],
+      ),
+      ["read", "bash", "subagent_done"],
+    );
   });
 
   it("validates structured completion and resolves artifact paths", () => {

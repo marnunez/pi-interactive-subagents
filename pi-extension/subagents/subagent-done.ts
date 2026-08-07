@@ -33,6 +33,7 @@ const MAX_ARTIFACT_NAME_CHARS = 512;
 const MAX_ARTIFACT_DESCRIPTION_CHARS = 500;
 const MAX_NEXT_STEPS = 20;
 const MAX_NEXT_STEP_CHARS = 500;
+const CHILD_LIFECYCLE_TOOLS = ["subagent_done", "set_tab_title"];
 
 const DoneParams = Type.Object({
   status: Type.Union(
@@ -101,6 +102,17 @@ function assertBoundedString(value: unknown, label: string, maxChars: number, re
   if (value.length > maxChars) {
     throw new Error(`${label} is too long (${value.length}/${maxChars} characters).`);
   }
+}
+
+export function resolveChildActiveTools(
+  activeTools: readonly string[],
+  lockedTools: readonly string[],
+  registeredTools: readonly string[],
+): string[] {
+  const registered = new Set(registeredTools);
+  const selected = lockedTools.length > 0 ? lockedTools : activeTools;
+  const lifecycleTools = CHILD_LIFECYCLE_TOOLS.filter((tool) => registered.has(tool));
+  return [...new Set([...selected, ...lifecycleTools])];
 }
 
 export function validateSubagentDoneParams(
@@ -317,7 +329,8 @@ export default function (pi: ExtensionAPI) {
     renderWidget(ctx, null);
   });
 
-  // Reassert parent-selected model and tools after all startup extensions (including presets) ran.
+  // Reassert parent-selected settings after startup presets ran. Without an explicit
+  // tool lock, preserve the preset's selection while keeping child lifecycle tools active.
   pi.on("before_agent_start", async () => {
     if (lockedModel?.includes("/")) {
       const slash = lockedModel.indexOf("/");
@@ -329,7 +342,11 @@ export default function (pi: ExtensionAPI) {
       }
     }
     if (lockedThinking) pi.setThinkingLevel(lockedThinking as any);
-    if (lockedTools.length > 0) pi.setActiveTools(lockedTools);
+    pi.setActiveTools(resolveChildActiveTools(
+      pi.getActiveTools(),
+      lockedTools,
+      pi.getAllTools().map((tool) => tool.name),
+    ));
   });
 
   pi.on("agent_start", () => {
