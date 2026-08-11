@@ -55,6 +55,15 @@ const SUBAGENT_COMPLETION_INSTRUCTION =
   "and include recommended follow-up actions in nextSteps. Exiting without subagent_done is a protocol failure. " +
   "The user can interact with you at any time, but the same completion contract still applies.";
 
+const SUBAGENT_ASYNC_GUIDANCE =
+  "Results are delivered automatically via a steer message; never poll child status. " +
+  "Continue independent work if any remains. Otherwise end the current turn silently: emit no text and call no more tools. " +
+  "The first child completion will trigger the next turn.";
+
+const SUBAGENT_KILL_GUIDANCE =
+  "Kill one or all running sub-agents. Omit target to inspect running children only when the user explicitly asks. " +
+  "Never use this tool to poll while waiting; completion arrives automatically via a steer message.";
+
 const SubagentParams = Type.Object({
   name: Type.String({ description: "Display name for the subagent" }),
   task: Type.String({ description: "Task/prompt for the sub-agent" }),
@@ -674,6 +683,8 @@ export const __test__ = {
   inheritedProfileEnvParts,
   inheritedProfileEnvUnsets,
   customAgentEnvParts,
+  SUBAGENT_ASYNC_GUIDANCE,
+  SUBAGENT_KILL_GUIDANCE,
 };
 
 function startWidgetRefresh() {
@@ -1302,16 +1313,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       label: "Subagent",
       description:
         "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
-        "IMPORTANT: This tool returns IMMEDIATELY — the sub-agent runs asynchronously in the background. " +
-        "You will NOT have results when this tool returns. Results are delivered later via a steer message. " +
-        "Do NOT fabricate, assume, or summarize results after calling this tool. " +
-        "Either wait for the steer message or move on to other work.",
+        "IMPORTANT: This tool returns immediately and the child runs asynchronously. " +
+        "Do not fabricate or assume its result. " + SUBAGENT_ASYNC_GUIDANCE,
       promptSnippet:
-        "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
-        "IMPORTANT: This tool returns IMMEDIATELY — the sub-agent runs asynchronously in the background. " +
-        "You will NOT have results when this tool returns. Results are delivered later via a steer message. " +
-        "Do NOT fabricate, assume, or summarize results after calling this tool. " +
-        "Either wait for the steer message or move on to other work.",
+        "Spawn a sub-agent asynchronously. Do not fabricate its result. " + SUBAGENT_ASYNC_GUIDANCE,
+      promptGuidelines: [
+        "After using subagent, never poll child status. If no independent work remains, end the turn silently with no text and no further tool calls; child completion arrives as a steer message and triggers the next turn.",
+      ],
       parameters: SubagentParams,
 
       async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
@@ -1390,9 +1398,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               type: "text",
               text:
                 `Sub-agent "${params.name}" launched and is now running in the background. ` +
-                `Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
-                `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
-                `Until then, move on to other work or tell the user you're waiting.`,
+                `Do not generate or assume any result. ${SUBAGENT_ASYNC_GUIDANCE}`,
             },
           ],
           details: {
@@ -1761,17 +1767,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     pi.registerTool(defineTool({
       name: "subagent_kill",
       label: "Kill Subagent",
-      description:
-        "Kill one or all running sub-agents. Use without parameters to list running sub-agents. " +
-        "Pass an id or name to kill a specific one, or 'all' to kill them all.",
-      promptSnippet:
-        "Kill one or all running sub-agents. Use without parameters to list running sub-agents. " +
-        "Pass an id or name to kill a specific one, or 'all' to kill them all.",
+      description: SUBAGENT_KILL_GUIDANCE,
+      promptSnippet: SUBAGENT_KILL_GUIDANCE,
+      promptGuidelines: [
+        "Never call subagent_kill to poll child status. Omit its target only when the user explicitly asks to inspect running sub-agents.",
+      ],
       parameters: Type.Object({
         target: Type.Optional(
           Type.String({
             description:
-              "Subagent to kill: an id, a name (case-insensitive partial match), or 'all'. Omit to list running subagents.",
+              "Subagent to kill: an id, a name (case-insensitive partial match), or 'all'. Omit only when the user explicitly asks to inspect running subagents.",
           }),
         ),
       }),
@@ -1822,7 +1827,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             content: [
               {
                 type: "text",
-                text: `Running sub-agents (${agents.length}):\n${lines.join("\n")}\n\nPass a name, id, or 'all' to kill.`,
+                text: `Running sub-agents (${agents.length}):\n${lines.join("\n")}\n\nPass a name, id, or 'all' to kill. Do not poll again; completion will arrive automatically via a steer message.`,
               },
             ],
             details: {

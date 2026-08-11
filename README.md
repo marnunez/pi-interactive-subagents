@@ -109,10 +109,12 @@ Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global**
 2. Child opens a real Pi TUI       → user can watch, type, and steer directly
 3. Child bridge authenticates      → parent/child lifecycle moves over Unix IPC
 4. Child state stays observable    → running, idle, or waiting for Pi UI input
-5. User keeps chatting             → main session remains fully interactive
+5. Parent does independent work    → or ends its turn silently without polling
 6. Sub-agent finishes              → structured result steered back as interrupt
 7. Main agent processes result     → continues with new context
 ```
+
+When the parent has no independent work left, it must end its current turn without text or further tool calls. It does not poll `subagent_kill` or announce that it is waiting: the first child completion steer message automatically triggers the next turn. No-argument `subagent_kill` status inspection remains available only for an explicit user request.
 
 The multiplexer is used only to create, focus, rename, and close panes. Lifecycle, progress, completion, cancellation, generic Pi UI-wait state, and parent-issued prompts use framed IPC messages under `$XDG_RUNTIME_DIR/pi-subagents/`; no pane screen contents or shell sentinels are involved. Child connections automatically retry across parent `/reload`, and unresolved launches are reconstructed from non-context session entries.
 

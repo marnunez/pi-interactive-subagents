@@ -878,6 +878,18 @@ describe("subagent tool allow-list", () => {
   });
 });
 
+describe("parent waiting guidance", () => {
+  it("requires silent event-driven waiting and forbids status polling", () => {
+    const testApi = (subagentsModule as any).__test__;
+
+    assert.match(testApi.SUBAGENT_ASYNC_GUIDANCE, /never poll child status/i);
+    assert.match(testApi.SUBAGENT_ASYNC_GUIDANCE, /end the current turn silently/i);
+    assert.match(testApi.SUBAGENT_ASYNC_GUIDANCE, /first child completion will trigger the next turn/i);
+    assert.match(testApi.SUBAGENT_KILL_GUIDANCE, /only when the user explicitly asks/i);
+    assert.match(testApi.SUBAGENT_KILL_GUIDANCE, /never use this tool to poll/i);
+  });
+});
+
 describe("subagents widget rendering", () => {
   it("keeps every rendered line within a very narrow width", () => {
     const testApi = (subagentsModule as any).__test__;
