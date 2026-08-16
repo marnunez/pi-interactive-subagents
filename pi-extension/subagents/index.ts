@@ -38,11 +38,18 @@ import {
 } from "./ipc.ts";
 
 const SUBAGENT_COMPLETION_INSTRUCTION =
-  "Complete your task. When finished, call the subagent_done tool exactly once with a structured result. " +
-  "Set status to success, failed, or blocked; put the concise orchestration result in summary; " +
-  "put the expanded human-readable result in report when useful; list any write_artifact outputs in artifacts; " +
-  "and include recommended follow-up actions in nextSteps. Exiting without subagent_done is a protocol failure. " +
-  "The user can interact with you at any time, but the same completion contract still applies.";
+  "Complete this subagent run. When finished, make one successful call to the subagent_done tool with a structured result. " +
+  "Every run requires its own successful subagent_done call. Set status to success, failed, or blocked; " +
+  "put the concise orchestration result in summary; put the expanded human-readable result in report when useful; " +
+  "list any write_artifact outputs in artifacts; and include recommended follow-up actions in nextSteps. " +
+  "Exiting without a successful subagent_done call for the current run is a protocol failure. " +
+  "The user can interact with you at any time, but the same per-run completion contract still applies.";
+
+const SUBAGENT_RESUME_COMPLETION_INSTRUCTION =
+  "This is a new resumed run of an existing subagent session. Historical subagent_done calls in the conversation " +
+  "completed earlier runs; they neither complete nor prohibit completion of this run. You must make a new " +
+  "successful subagent_done call for the current resumed run.\n\n" +
+  SUBAGENT_COMPLETION_INSTRUCTION;
 
 const SubagentParams = Type.Object({
   name: Type.String({ description: "Display name for the subagent" }),
@@ -560,6 +567,8 @@ export const __test__ = {
   buildSubagentToolAllowList,
   resolveDenyTools,
   withChildOnlyTools,
+  freshCompletionInstruction: SUBAGENT_COMPLETION_INSTRUCTION,
+  resumeCompletionInstruction: SUBAGENT_RESUME_COMPLETION_INSTRUCTION,
 };
 
 function startWidgetRefresh() {
@@ -1488,7 +1497,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         let cleanupMsgFile: string | undefined;
         if (params.message) {
           const msgFile = join(tmpdir(), `subagent-resume-${Date.now()}.md`);
-          writeFileSync(msgFile, `${params.message}\n\n${SUBAGENT_COMPLETION_INSTRUCTION}`, "utf8");
+          writeFileSync(
+            msgFile,
+            `${params.message}\n\n${SUBAGENT_RESUME_COMPLETION_INSTRUCTION}`,
+            "utf8",
+          );
           cleanupMsgFile = msgFile;
           parts.push(`@${msgFile}`);
         }

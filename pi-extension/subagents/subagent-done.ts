@@ -372,9 +372,11 @@ export default function (pi: ExtensionAPI) {
     name: "subagent_done",
     label: "Subagent Done",
     description:
-      "Mandatory lifecycle tool for sub-agents. Call exactly once when the task is complete, failed, or blocked. " +
-      "Persists a structured result for the parent orchestrator and then shuts this sub-agent session down. " +
-      "Exiting without calling this tool is a protocol failure.",
+      "Mandatory lifecycle tool for sub-agents. Complete every sub-agent run with one successful call when its task " +
+      "is complete, failed, or blocked. A resumed session is a new run: historical calls completed earlier runs and " +
+      "do not prevent or satisfy a new call for the current run. Persists a structured result for the parent " +
+      "orchestrator and then shuts this sub-agent session down. Exiting without a successful call for the current " +
+      "run is a protocol failure.",
     parameters: DoneParams,
     async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
       const params = rawParams as DoneParamsValue;

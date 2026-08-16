@@ -280,6 +280,24 @@ describe("session.ts", () => {
   });
 });
 
+describe("subagent completion instructions", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("defines successful completion per run rather than once per conversation", () => {
+    assert.match(testApi.freshCompletionInstruction, /Every run requires its own successful subagent_done call/);
+    assert.doesNotMatch(testApi.freshCompletionInstruction, /exactly once/i);
+  });
+
+  it("requires a new completion after resume despite historical calls", () => {
+    assert.match(testApi.resumeCompletionInstruction, /new resumed run/);
+    assert.match(
+      testApi.resumeCompletionInstruction,
+      /Historical subagent_done calls.*completed earlier runs/,
+    );
+    assert.match(testApi.resumeCompletionInstruction, /must make a new successful subagent_done call/);
+  });
+});
+
 describe("subagent-done.ts", () => {
   let dir: string;
 

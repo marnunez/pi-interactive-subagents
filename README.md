@@ -119,7 +119,7 @@ Completion messages render with a colored background and are expandable with `Ct
 
 ### Structured Completion Contract
 
-By default, every sub-agent must finish by calling `subagent_done` exactly once. Exiting without a persisted `subagent_done_result` is a protocol failure, even if the process exits cleanly. Agents configured with `auto-exit: true` instead persist a bounded fallback result from their final assistant message and shut down on the first fully settled run when they did not explicitly call `subagent_done`.
+By default, every sub-agent run must finish with one successful `subagent_done` call. A resumed session starts a new run, so historical calls completed earlier runs and a fresh call is required for the resumed work. Exiting without a persisted `subagent_done_result` for the current run is a protocol failure, even if the process exits cleanly. Agents configured with `auto-exit: true` instead persist a bounded fallback result from their final assistant message and shut down on the first fully settled run when they did not explicitly call `subagent_done`.
 
 ```typescript
 subagent_done({
