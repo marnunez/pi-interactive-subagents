@@ -97,15 +97,11 @@ Work through requirements **one topic at a time**:
 
 **How to ask:**
 
-- Group related questions — then **always run `/answer`** for a clean Q&A interface:
-  ```
-  [list your questions]
-  execute_command(command="/answer", reason="Opening Q&A for requirements")
-  ```
+- Group related questions clearly in your message. The user can answer directly or open `/answer` when that extension is installed. Do not call a nonexistent `execute_command` tool.
 - Prefer multiple choice when possible
 - Share what you already know from context — don't re-ask obvious things
 
-**Don't move to Phase 3 until requirements are clear. Ask, run `/answer`, then STOP and wait.**
+**Don't move to Phase 3 until requirements are clear. Ask, then STOP and wait.**
 
 ---
 
@@ -219,7 +215,7 @@ Your **FINAL message** must include:
 - Key decisions made
 - Any open questions remaining
 
-"Plan and todos are ready. Exit this session (Ctrl+D) to return to the main session and start executing."
+When the plan and todos are ready and validated, call `subagent_done` with their artifact names and todo IDs. This finishes the current run; the session remains resumable for revisions. Do not close the terminal as a substitute for the result.
 
 ---
 

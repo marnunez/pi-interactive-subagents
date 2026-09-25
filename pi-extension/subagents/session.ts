@@ -1,6 +1,7 @@
 import { readFileSync, appendFileSync, copyFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 export const SUBAGENT_DONE_RESULT_TYPE = "subagent_done_result";
 export const SUBAGENT_METADATA_TYPE = "subagent_metadata";
@@ -16,6 +17,8 @@ export interface SubagentArtifactRef {
 
 export interface SubagentDoneResult {
   schemaVersion: 1;
+  /** Run that produced this result. Optional only for legacy persisted results. */
+  runId?: string;
   status: SubagentTaskStatus;
   summary: string;
   report?: string;
@@ -65,6 +68,7 @@ export interface CreatedSubagentSession {
 }
 
 export interface SubagentSessionCorrelation {
+  agent?: string;
   childSessionId: string;
   cwd: string;
   originatingRunId?: string;
@@ -249,6 +253,7 @@ export function readSubagentSessionCorrelation(sessionFile: string): SubagentSes
     childSessionId: header.id,
     cwd: resolve((header as SessionHeader).cwd),
     originatingRunId: metadata?.runId,
+    ...(metadata?.agent ? { agent: metadata.agent } : {}),
   };
 }
 
@@ -293,7 +298,9 @@ export function isSubagentDoneResult(data: unknown): data is SubagentDoneResult 
       candidate.status === "failed" ||
       candidate.status === "blocked") &&
     typeof candidate.summary === "string" &&
-    typeof candidate.completedAt === "string"
+    typeof candidate.completedAt === "string" &&
+    (candidate.runId === undefined ||
+      (typeof candidate.runId === "string" && candidate.runId.length > 0))
   );
 }
 
@@ -304,6 +311,36 @@ export function findSubagentDoneResults(entries: SessionEntry[]): SubagentDoneRe
   return findSubagentDoneResultEntries(entries)
     .map((entry) => entry.data)
     .filter(isSubagentDoneResult);
+}
+
+/**
+ * Find the durable completion for one child run.
+ *
+ * Legacy results without a run id and results from other runs are deliberately
+ * ignored. Identical duplicate entries are tolerated, but conflicting results
+ * for one run are rejected rather than silently choosing one.
+ */
+export function findRunCompletion(
+  entries: SessionEntry[],
+  runId: string,
+): SubagentDoneResult | undefined {
+  if (!runId) throw new Error("runId is required to find a subagent completion.");
+
+  const matches = findSubagentDoneResults(entries).filter((result) => result.runId === runId);
+  const first = matches[0];
+  if (!first) return undefined;
+  if (matches.some((result) => !isDeepStrictEqual(result, first))) {
+    throw new Error(`Conflicting subagent completion results for run ${runId}.`);
+  }
+  return first;
+}
+
+/** Read the durable completion for one run from a persisted session file. */
+export function readRunCompletion(
+  sessionFile: string,
+  runId: string,
+): SubagentDoneResult | undefined {
+  return findRunCompletion(readEntries(sessionFile), runId);
 }
 
 /**

@@ -206,6 +206,9 @@ interface ChildIpcClientOptions {
   token: string;
   helloPayload: () => unknown;
   onMessage?: (message: IpcEnvelope) => void;
+  /** Called after the parent authenticates the child and sends its welcome frame. */
+  onConnect?: () => void;
+  onDisconnect?: () => void;
   reconnectDelayMs?: number;
 }
 
@@ -224,12 +227,16 @@ export class ChildIpcClient {
 
   start(): void {
     this.stopped = false;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
     this.connect();
   }
 
   private connect(): void {
     if (this.stopped || this.socket) return;
+    this.reconnectTimer = null;
     const socket = createConnection(this.options.socketPath);
+    let welcomed = false;
     this.socket = socket;
     this.decoder = new IpcFrameDecoder();
 
@@ -249,15 +256,24 @@ export class ChildIpcClient {
 
     socket.on("data", (chunk) => {
       try {
-        for (const message of this.decoder.push(chunk)) this.options.onMessage?.(message);
+        for (const message of this.decoder.push(chunk)) {
+          if (!welcomed && message.type === "welcome" && message.childId === this.options.childId) {
+            welcomed = true;
+            this.options.onConnect?.();
+          }
+          this.options.onMessage?.(message);
+        }
       } catch {
         socket.destroy();
       }
     });
 
     socket.on("close", () => {
-      if (this.socket === socket) this.socket = null;
+      if (this.socket !== socket) return;
+      this.socket = null;
+      if (welcomed) this.options.onDisconnect?.();
       if (!this.stopped) {
+        if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
         this.reconnectTimer = setTimeout(
           () => this.connect(),
           this.options.reconnectDelayMs ?? 500,
@@ -288,5 +304,7 @@ export class ChildIpcClient {
     this.reconnectTimer = null;
     this.socket?.destroy();
     this.socket = null;
+    this.decoder = new IpcFrameDecoder();
+    this.queue = [];
   }
 }

@@ -7,7 +7,6 @@ import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import {
-  readdirSync,
   statSync,
   readFileSync,
   existsSync,
@@ -15,7 +14,11 @@ import {
   unlinkSync,
   rmSync,
 } from "node:fs";
-import { ChildProcess, spawn as nodeSpawn, execSync as nodeExecSync } from "node:child_process";
+import { ChildProcess, spawn as nodeSpawn, execSync as nodeExecSync, execFileSync as nodeExecFileSync } from "node:child_process";
+import { loadAgentDefaults, listAgentDefinitions, resolveChildTools } from "./config.ts";
+import { restoreRunLedger, CLOSED_ENTRY, IDENTITY_ENTRY } from "./run-ledger.ts";
+import { collectOpenDescendants, terminateWorkspaceChild } from "./termination.ts";
+import { readChildRunConfig, legacyChildDefaults, type ChildRunConfig } from "./launch-config.ts";
 import { homedir } from "node:os";
 import {
   isMuxAvailable,
@@ -31,6 +34,7 @@ import {
   createSubagentSession,
   isSubagentDoneResult,
   readSubagentSessionCorrelation,
+  readRunCompletion,
   selectForkHistory,
   type SessionEntry,
   type SubagentDoneResult,
@@ -49,7 +53,8 @@ import {
 } from "./ipc.ts";
 
 const SUBAGENT_COMPLETION_INSTRUCTION =
-  "Complete your task. When finished, call the subagent_done tool exactly once with a structured result. " +
+  "Complete your task. When this run is finished, call subagent_done with a structured result. " +
+  "This ends the current run, not the session: the session remains resumable as a new run. " +
   "Set status to success, failed, or blocked; put the concise orchestration result in summary; " +
   "put the expanded human-readable result in report when useful; list any write_artifact outputs in artifacts; " +
   "and include recommended follow-up actions in nextSteps. Exiting without subagent_done is a protocol failure. " +
@@ -70,7 +75,7 @@ const SubagentParams = Type.Object({
   agent: Type.Optional(
     Type.String({
       description:
-        "Agent name to load defaults from (e.g. 'worker', 'scout', 'reviewer'). Reads ~/.pi/agent/agents/<name>.md for model, tools, skills.",
+        "Agent definition name (e.g. worker, scout, reviewer). Uses trusted project agents, the active profile's agents, then bundled defaults.",
     }),
   ),
   systemPrompt: Type.Optional(
@@ -106,148 +111,12 @@ const SubagentParams = Type.Object({
 });
 type SubagentParamsValue = Static<typeof SubagentParams>;
 
-interface AgentDefaults {
-  model?: string;
-  tools?: string;
-  skills?: string;
-  thinking?: string;
-  denyTools?: string;
-  allowTools?: string;
-  spawning?: boolean;
-  maxInstances?: number;
-  cwd?: string;
-  workspace?: string;
-  env?: string;
-  autoExit?: boolean;
-  body?: string;
-}
-
-const BUILTIN_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
-
-/** Tools that are gated by `spawning: false` */
-const SPAWNING_TOOLS = new Set(["subagent", "subagents_list", "subagent_resume", "subagent_kill"]);
-
 /** Child-only tools that may not exist in the parent process' tool registry. */
-const CHILD_ONLY_TOOLS = new Set(["subagent_done", "set_tab_title"]);
-
-/** Lifecycle tools that must remain available even under allow/deny filtering. */
-const MANDATORY_CHILD_TOOLS = new Set(["subagent_done"]);
-
-function parseToolCsv(value: string | undefined): string[] {
-  return (value ?? "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
+const CHILD_ONLY_TOOLS = new Set(["subagent_done", "set_tab_title", "write_artifact"]);
 
 function withChildOnlyTools(allToolNames?: string[]): string[] | undefined {
   if (!allToolNames) return undefined;
   return [...new Set([...allToolNames, ...CHILD_ONLY_TOOLS])];
-}
-
-function buildSubagentToolAllowList(
-  effectiveTools: string | undefined,
-  denySet: Set<string>,
-  allToolNames?: string[],
-): string[] | undefined {
-  if (!effectiveTools) return undefined;
-
-  const requestedBuiltins = parseToolCsv(effectiveTools).filter((tool) => BUILTIN_TOOLS.has(tool));
-  const extensionTools = (allToolNames ?? [])
-    .filter((tool) => !BUILTIN_TOOLS.has(tool))
-    .filter((tool) => !denySet.has(tool));
-
-  for (const tool of MANDATORY_CHILD_TOOLS) {
-    if (!denySet.has(tool)) extensionTools.push(tool);
-  }
-
-  return [...new Set([...requestedBuiltins, ...extensionTools])];
-}
-
-/**
- * Resolve the effective set of denied tool names from agent defaults.
- *
- * If `allow-tools` is present, it acts as a whitelist: all tools NOT in the
- * list are denied. This takes priority over `deny-tools`.
- *
- * Otherwise, `deny-tools` is used as a blacklist, and `spawning: false`
- * expands to all SPAWNING_TOOLS.
- *
- * @param allToolNames - all currently registered tool names (from pi.getAllTools())
- */
-function resolveDenyTools(agentDefs: AgentDefaults | null, allToolNames?: string[]): Set<string> {
-  const denied = new Set<string>();
-  if (!agentDefs) return denied;
-
-  // allow-tools (whitelist) takes priority when present
-  if (agentDefs.allowTools && allToolNames) {
-    const allowed = new Set(
-      agentDefs.allowTools
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean),
-    );
-    for (const tool of allToolNames) {
-      if (!allowed.has(tool)) denied.add(tool);
-    }
-    return denied;
-  }
-
-  // spawning: false → deny all spawning tools
-  if (agentDefs.spawning === false) {
-    for (const t of SPAWNING_TOOLS) denied.add(t);
-  }
-
-  // deny-tools: explicit blacklist
-  if (agentDefs.denyTools) {
-    for (const t of agentDefs.denyTools
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean)) {
-      denied.add(t);
-    }
-  }
-
-  return denied;
-}
-
-function loadAgentDefaults(agentName: string): AgentDefaults | null {
-  const paths = [
-    join(process.cwd(), ".pi", "agents", `${agentName}.md`),
-    join(homedir(), ".pi", "agent", "agents", `${agentName}.md`),
-    join(dirname(new URL(import.meta.url).pathname), "../../agents", `${agentName}.md`),
-  ];
-  for (const p of paths) {
-    if (!existsSync(p)) continue;
-    const content = readFileSync(p, "utf8");
-    const match = content.match(/^---\n([\s\S]*?)\n---/);
-    if (!match) continue;
-    const frontmatter = match[1];
-    const get = (key: string) => {
-      const m = frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
-      return m ? m[1].trim() : undefined;
-    };
-    // Extract body (everything after frontmatter)
-    const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
-    const spawningRaw = get("spawning");
-    const autoExitRaw = get("auto-exit");
-    return {
-      model: get("model"),
-      tools: get("tools"),
-      skills: get("skill") ?? get("skills"),
-      thinking: get("thinking"),
-      denyTools: get("deny-tools"),
-      allowTools: get("allow-tools"),
-      maxInstances: get("max-instances") ? parseInt(get("max-instances")!, 10) : undefined,
-      spawning: spawningRaw != null ? spawningRaw === "true" : undefined,
-      cwd: get("cwd"),
-      workspace: get("workspace"),
-      env: get("env"),
-      autoExit: autoExitRaw != null ? autoExitRaw === "true" : undefined,
-      body: body || undefined,
-    };
-  }
-  return null;
 }
 
 function readJsonFile<T>(path: string): T | null {
@@ -261,7 +130,7 @@ function readJsonFile<T>(path: string): T | null {
 
 function getPreferredDefaultModel(cwd: string): { defaultProvider?: string; defaultModel?: string } {
   const globalSettings = readJsonFile<{ defaultProvider?: string; defaultModel?: string }>(
-    join(homedir(), ".pi", "agent", "settings.json"),
+    join(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "settings.json"),
   );
   const projectSettings = readJsonFile<{ defaultProvider?: string; defaultModel?: string }>(
     join(cwd, ".pi", "settings.json"),
@@ -303,8 +172,10 @@ function resolveEffectiveChildCwd(rawCwd: string | undefined, parentCwd: string)
 
 const PROFILE_ENV_NAMES = ["PI_PROFILE", "PI_CODING_AGENT_DIR"] as const;
 const NON_INHERITED_RUNTIME_ENV_NAMES = [
-  "PI_SESSION_LEASE_OWNER_PID",
-  "PI_SESSION_LEASE_OWNER_NONCE",
+  "PI_SESSION_LEASE_OWNER_PID", "PI_SESSION_LEASE_OWNER_NONCE",
+  "PI_DENY_TOOLS", "PI_SUBAGENT_NAME", "PI_SUBAGENT_ID", "PI_SUBAGENT_SOCKET",
+  "PI_SUBAGENT_TOKEN", "PI_SUBAGENT_AUTO_EXIT", "PI_SUBAGENT_MODEL",
+  "PI_SUBAGENT_THINKING", "PI_SUBAGENT_TOOLS", "PI_SUBAGENT_AGENT", "PI_SUBAGENT_DEPTH",
 ] as const;
 
 function inheritedProfileEnvParts(): string[] {
@@ -516,8 +387,10 @@ interface RunningSubagent {
   workspace?: string;
   previousWorkspace?: string;
   workspaceProcess?: ChildProcess;
+  childPid?: number;
   ipcToken: string;
   autoExit: boolean;
+  config?: ChildRunConfig;
   connected?: boolean;
   state?: SubagentRunState;
   pendingUiRequestCount?: number;
@@ -672,12 +545,18 @@ function updateWidget() {
   );
 }
 
+function forkConversation(branch: SessionEntry[]): SessionEntry[] {
+  const history = selectForkHistory(branch).filter((entry) =>
+    !(entry.type === "custom" && typeof entry.customType === "string" && entry.customType.startsWith("subagent_")),
+  );
+  return history.map((entry, index) => ({ ...entry, parentId: history[index - 1]?.id ?? null }));
+}
+
 export const __test__ = {
+  forkConversation,
   borderLine,
   renderSubagentWidgetLines,
   qualifyModelWithProvider,
-  buildSubagentToolAllowList,
-  resolveDenyTools,
   withChildOnlyTools,
   resolveEffectiveChildCwd,
   inheritedProfileEnvParts,
@@ -709,7 +588,7 @@ function getCurrentSwayWorkspace(): string | null {
 }
 
 function switchSwayWorkspace(name: string): void {
-  try { nodeExecSync(`swaymsg workspace "${name}"`, { stdio: "ignore" }); } catch {}
+  try { nodeExecFileSync("swaymsg", ["workspace", JSON.stringify(name)], { stdio: "ignore" }); } catch {}
 }
 
 /**
@@ -757,7 +636,14 @@ async function launchSubagent(
     };
     cwd: string;
   },
-  options?: { surface?: string; allToolNames?: string[] },
+  options: {
+    surface?: string;
+    allToolNames: string[];
+    activeToolNames: string[];
+    projectTrusted: boolean;
+    onPrepared: (running: RunningSubagent) => void;
+    onFailed: (running: RunningSubagent, error: unknown) => void;
+  },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const runId = randomUUID();
@@ -767,7 +653,10 @@ async function launchSubagent(
     throw new Error("Subagent IPC server is not ready");
   }
 
-  const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+  const agentDefs = params.agent ? loadAgentDefaults(params.agent, ctx.cwd, options.projectTrusted) : null;
+  if (params.agent && !agentDefs) throw new Error(`Unknown agent: ${params.agent}`);
+  const depth = Number(process.env.PI_SUBAGENT_DEPTH ?? "0");
+  if (!Number.isSafeInteger(depth) || depth >= 4) throw new Error("Subagent nesting limit (4) reached.");
   const effectiveModel = params.model ?? agentDefs?.model;
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
@@ -784,7 +673,7 @@ async function launchSubagent(
 
   const mode: SubagentSessionMode = params.fork ? "fork" : "fresh";
   const historyEntries = params.fork
-    ? selectForkHistory(ctx.sessionManager.getBranch() as SessionEntry[])
+    ? forkConversation(ctx.sessionManager.getBranch() as SessionEntry[])
     : [];
   const createdSession = createSubagentSession({
     sessionDir: dirname(parentSessionFile),
@@ -803,6 +692,7 @@ async function launchSubagent(
   let surface = "";
   let workspaceProcess: ChildProcess | undefined;
   let registeredWithIpc = false;
+  let prepared: RunningSubagent | undefined;
 
   try {
   // Determine workspace mode early — if set, skip mux surface creation entirely.
@@ -824,8 +714,10 @@ async function launchSubagent(
   // Only send the user's task as a clean message — no wrapper instructions
   // that would confuse the agent into thinking it needs to restart.
   const modeHint = SUBAGENT_COMPLETION_INSTRUCTION;
-  const denySet = resolveDenyTools(agentDefs, withChildOnlyTools(options?.allToolNames));
-  for (const tool of MANDATORY_CHILD_TOOLS) denySet.delete(tool);
+  const allowedTools = resolveChildTools(
+    { ...agentDefs, tools: effectiveTools }, options.activeToolNames, options.allToolNames,
+  );
+  const denySet = new Set(withChildOnlyTools(options.allToolNames)!.filter((name) => !allowedTools.includes(name)));
   const agentType = params.agent ?? params.name;
   const tabTitleInstruction = denySet.has("set_tab_title")
     ? ""
@@ -837,14 +729,12 @@ async function launchSubagent(
   // additional instructions from the caller.
   const identityParts = [agentDefs?.body, params.systemPrompt].filter(Boolean);
   const identity = identityParts.length > 0 ? identityParts.join("\n\n") : null;
-  const roleBlock = identity ? `\n\n${identity}` : "";
-  const fullTask = params.fork
-    ? `${params.task}\n\n${modeHint}`
-    : `${roleBlock}\n\n${modeHint}\n\n${tabTitleInstruction}\n\n${params.task}`;
+  const fullTask = `${modeHint}\n\n${tabTitleInstruction}\n\n${params.task}`;
 
   // Build pi command
   const parts: string[] = ["pi"];
   parts.push("--session", shellEscape(subagentSessionFile));
+  if (identity) parts.push("--append-system-prompt", shellEscape(identity));
 
   const subagentDonePath = join(dirname(new URL(import.meta.url).pathname), "subagent-done.ts");
   parts.push("-e", shellEscape(subagentDonePath));
@@ -856,7 +746,6 @@ async function launchSubagent(
     parts.push("--model", shellEscape(model));
   }
 
-  const allowedTools = buildSubagentToolAllowList(effectiveTools, denySet, withChildOnlyTools(options?.allToolNames));
   if (allowedTools && allowedTools.length > 0) {
     parts.push("--tools", shellEscape(allowedTools.join(",")));
   }
@@ -880,6 +769,7 @@ async function launchSubagent(
   envParts.push(`PI_SUBAGENT_SOCKET=${shellEscape(parentIpcSocketPath)}`);
   envParts.push(`PI_SUBAGENT_TOKEN=${shellEscape(ipcToken)}`);
   envParts.push(`PI_SUBAGENT_AUTO_EXIT=${effectiveAutoExit ? "1" : "0"}`);
+  envParts.push(`PI_SUBAGENT_DEPTH=${depth + 1}`);
   if (qualifiedModelForLock) {
     envParts.push(`PI_SUBAGENT_MODEL=${shellEscape(qualifiedModelForLock)}`);
   }
@@ -902,6 +792,13 @@ async function launchSubagent(
 
   // Keep the launch task with the child session so it moves atomically with the transcript.
   const artifactDir = ensureSessionArtifactDir(subagentSessionFile);
+  const config: ChildRunConfig = {
+    schemaVersion: 1, skills: effectiveSkills, env: agentDefs?.env,
+    systemPrompt: identity ?? undefined,
+    agent: params.agent, model: qualifiedModelForLock, thinking: effectiveThinking,
+    tools: allowedTools, autoExit: effectiveAutoExit,
+  };
+  writeArtifactFile(artifactDir, "context/subagent-config.json", JSON.stringify(config));
   const taskPath = writeArtifactFile(artifactDir, "context/subagent-task.md", fullTask);
   parts.push(`@${shellEscape(taskPath)}`);
 
@@ -912,15 +809,7 @@ async function launchSubagent(
 
   if (effectiveWorkspace && !options?.surface) {
     // ── Workspace mode: launch in a WezTerm window on a dedicated Sway workspace ──
-    const command = piCommand;
-    const { process: wezProc, previousWorkspace: prevWs } = launchWorkspaceSurface(
-      effectiveWorkspace,
-      params.name,
-      command,
-      effectiveCwd,
-    );
-    workspaceProcess = wezProc;
-
+    const prevWs = getCurrentSwayWorkspace();
     const running: RunningSubagent = {
       id: runId,
       runId,
@@ -934,18 +823,20 @@ async function launchSubagent(
       sessionFile: subagentSessionFile,
       workspace: effectiveWorkspace,
       previousWorkspace: prevWs ?? undefined,
-      workspaceProcess: wezProc,
       ipcToken,
       autoExit: effectiveAutoExit,
+      config,
     };
 
-    runningSubagents.set(runId, running);
+    options.onPrepared(running);
+    prepared = running;
+    const launched = launchWorkspaceSurface(effectiveWorkspace, params.name, piCommand, effectiveCwd);
+    workspaceProcess = launched.process;
+    running.workspaceProcess = workspaceProcess;
     return running;
   }
 
-  // ── Normal mode: multiplexer pane ──
-  sendCommand(surface, piCommand);
-
+  // Journal the launch before the pane can execute any child code.
   const running: RunningSubagent = {
     id: runId,
     runId,
@@ -959,11 +850,18 @@ async function launchSubagent(
     sessionFile: subagentSessionFile,
     ipcToken,
     autoExit: effectiveAutoExit,
+    config,
   };
 
-  runningSubagents.set(runId, running);
+  options.onPrepared(running);
+  prepared = running;
+  sendCommand(surface, piCommand);
   return running;
   } catch (error) {
+    if (prepared) {
+      options.onFailed(prepared, error);
+      throw error;
+    }
     if (registeredWithIpc) parentIpcServer?.unregisterChild(runId);
     if (workspaceProcess) {
       try { process.kill(workspaceProcess.pid!, "SIGTERM"); } catch {}
@@ -979,7 +877,8 @@ async function launchSubagent(
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
-  const isChildProcess = !!process.env.PI_SUBAGENT_ID;
+  const reportChildren = () => pi.events?.emit("subagent:children", runningSubagents.size);
+  let unsubscribeChildren: (() => void) | undefined;
   const connectionFailureTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   const serializeRunning = (running: RunningSubagent) => ({
@@ -999,9 +898,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     previousWorkspace: running.previousWorkspace,
     ipcToken: running.ipcToken,
     autoExit: running.autoExit,
+    config: running.config,
+    childPid: running.childPid,
   });
 
-  const finishSubagent = (result: SubagentResult) => {
+  const completedRuns = new Map<string, SubagentResult>();
+  const cleanupTimers = new Map<string, { timer: ReturnType<typeof setTimeout>; cleanup: (force?: boolean) => void; done: Promise<void> }>();
+  let drainPromise: Promise<void> | undefined;
+  const deliverResult = (result: SubagentResult) => pi.sendMessage({
+    customType: "subagent_result", content: buildSubagentResultContent(result),
+    display: true, details: result,
+  }, { triggerTurn: true, deliverAs: "steer" });
+
+  const finishSubagent = (result: SubagentResult, notify = true) => {
     if (!acceptIpcResults) return;
     const running = runningSubagents.get(result.id ?? "");
     const childId = result.id;
@@ -1016,36 +925,99 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       sessionFile: running.sessionFile,
     };
 
+    // Commit the outcome BEFORE acknowledgement or process cleanup. If message
+    // delivery is interrupted, startup replays this durable outbox entry.
+    pi.appendEntry(IPC_FINISH_ENTRY, {
+      id: childId, runId: running.runId, childSessionId: running.childSessionId,
+      sessionFile: running.sessionFile, finishedAt: Date.now(), notify, pendingCleanup: true,
+      result: correlatedResult,
+    });
+    completedRuns.set(childId, correlatedResult);
+    runningSubagents.delete(childId);
+    reportChildren();
     const failureTimer = connectionFailureTimers.get(childId);
     if (failureTimer) clearTimeout(failureTimer);
     connectionFailureTimers.delete(childId);
-    parentIpcServer?.unregisterChild(childId);
-    runningSubagents.delete(childId);
-    if (running.workspace) {
-      if (running.previousWorkspace) switchSwayWorkspace(running.previousWorkspace);
-    } else {
-      try { closeSurface(running.surface); } catch {}
-    }
-    if (running.forkCleanupFile) {
-      try { unlinkSync(running.forkCleanupFile); } catch {}
-    }
-    pi.appendEntry(IPC_FINISH_ENTRY, {
-      id: childId,
-      runId: running.runId,
-      childSessionId: running.childSessionId,
-      sessionFile: running.sessionFile,
-      finishedAt: Date.now(),
-    });
+    const server = parentIpcServer;
+    if (result.protocolStatus === "completed") server?.send(childId, "completion_ack", { runId: childId });
+    else server?.send(childId, "shutdown", { reason: result.protocolStatus });
+    // Wait for an explicit subtree-drained acknowledgement. Deeper levels have
+    // shorter force-close deadlines, so an ancestor cannot pre-empt their cleanup.
+    let resolveCleanup!: () => void;
+    const done = new Promise<void>((resolve) => { resolveCleanup = resolve; });
+    const cleanup = (force = false) => {
+      if (force) {
+        try {
+          for (const descendant of collectOpenDescendants(running.sessionFile)) {
+            if (descendant.workspace) terminateWorkspaceChild(descendant);
+            else if (descendant.surface) { try { closeSurface(descendant.surface); } catch {} }
+          }
+        } catch (error) {
+          latestCtx?.ui.notify(`Forced cleanup could not inspect descendants of ${running.name}: ${String(error)}`, "warning");
+        }
+      }
+      server?.unregisterChild(childId);
+      if (running.workspace) {
+        terminateWorkspaceChild(running);
+        if (running.workspaceProcess?.pid) {
+          try { process.kill(running.workspaceProcess.pid, "SIGTERM"); } catch {}
+        }
+        if (running.previousWorkspace) switchSwayWorkspace(running.previousWorkspace);
+      } else if (running.surface) {
+        try { closeSurface(running.surface); } catch {}
+      }
+      if (running.forkCleanupFile) {
+        try { unlinkSync(running.forkCleanupFile); } catch {}
+      }
+      const pending = cleanupTimers.get(childId);
+      if (pending) clearTimeout(pending.timer);
+      cleanupTimers.delete(childId);
+      pi.appendEntry(CLOSED_ENTRY, { id: childId, runId: childId, closedAt: Date.now() });
+      resolveCleanup();
+    };
+    const graceMs = Math.max(2_000, (5 - Number(process.env.PI_SUBAGENT_DEPTH ?? "0")) * 2_000);
+    cleanupTimers.set(childId, { cleanup, done, timer: setTimeout(() => cleanup(true), graceMs) });
     updateWidget();
-    pi.sendMessage(
-      {
-        customType: "subagent_result",
-        content: buildSubagentResultContent(correlatedResult),
-        display: true,
-        details: correlatedResult,
-      },
-      { triggerTurn: true, deliverAs: "steer" },
-    );
+    if (notify) deliverResult(correlatedResult);
+    return done;
+  };
+
+  const drainChildren = (): Promise<void> => {
+    if (drainPromise) return drainPromise;
+    for (const running of [...runningSubagents.values()]) {
+      finishSubagent({
+        id: running.id, name: running.name, task: running.task, agent: running.agent,
+        protocolStatus: "cancelled", protocolError: "Parent run ended.",
+        elapsed: Math.floor((Date.now() - running.startTime) / 1000),
+      }, false);
+    }
+    drainPromise = Promise.all([...cleanupTimers.values()].map(({ done }) => done)).then(() => {});
+    return drainPromise;
+  };
+  let unsubscribeDrain: (() => void) | undefined;
+  const registerLifecycleListeners = () => {
+    unsubscribeChildren?.();
+    unsubscribeDrain?.();
+    unsubscribeChildren = pi.events?.on("subagent:children-query", reportChildren);
+    unsubscribeDrain = pi.events?.on("subagent:drain", (request: unknown) => {
+      (request as { pending: Promise<void>[] }).pending.push(drainChildren());
+    });
+  };
+
+  const recoverCompletion = (running: RunningSubagent): boolean => {
+    try {
+      const result = readRunCompletion(running.sessionFile, running.runId);
+      if (!result) return false;
+      finishSubagent({
+        id: running.id, name: running.name, task: running.task, agent: running.agent,
+        protocolStatus: "completed", result,
+        elapsed: Math.floor((Date.now() - running.startTime) / 1000),
+      });
+      return true;
+    } catch (error) {
+      latestCtx?.ui.notify(`Cannot recover ${running.name}: ${String(error)}`, "warning");
+      return false;
+    }
   };
 
   const scheduleConnectionFailure = (childId: string, delayMs: number, reason: string) => {
@@ -1055,6 +1027,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       connectionFailureTimers.delete(childId);
       const running = runningSubagents.get(childId);
       if (!running || running.connected || !acceptIpcResults) return;
+      if (recoverCompletion(running)) return;
       finishSubagent({
         id: running.id,
         runId: running.runId,
@@ -1073,12 +1046,28 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   };
 
   const handleIpcMessage = (message: IpcEnvelope) => {
+    if (!acceptIpcResults) return;
+    if (message.type === "shutdown_ready") {
+      cleanupTimers.get(message.childId)?.cleanup();
+      return;
+    }
     const running = runningSubagents.get(message.childId);
-    if (!running) return;
+    if (!running) {
+      const completed = completedRuns.get(message.childId);
+      if (completed && ["hello", "ready", "completion"].includes(message.type)) {
+        if (completed.protocolStatus === "completed") parentIpcServer?.send(message.childId, "completion_ack", { runId: message.childId });
+        else parentIpcServer?.send(message.childId, "shutdown", { reason: completed.protocolStatus });
+      }
+      return;
+    }
     const payload = message.payload as any;
 
     if (message.type === "hello" || message.type === "ready") {
       running.connected = true;
+      if (Number.isSafeInteger(payload?.pid) && payload.pid > 0 && running.childPid !== payload.pid) {
+        running.childPid = payload.pid;
+        pi.appendEntry(IDENTITY_ENTRY, { id: running.id, runId: running.runId, childPid: payload.pid });
+      }
       if (
         typeof payload?.sessionFile === "string" &&
         resolve(payload.sessionFile) === resolve(running.sessionFile)
@@ -1154,7 +1143,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       return;
     }
     if (message.type === "completion") {
-      if (!isSubagentDoneResult(payload)) {
+      if (!isSubagentDoneResult(payload) || payload.runId !== running.runId) {
         finishSubagent({
           ...running,
           id: running.id,
@@ -1179,7 +1168,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (message.type === "shutdown" && payload?.reason !== "reload") {
       // Explicit completion is sent before shutdown. Give that frame a moment to arrive first.
       setTimeout(() => {
-        if (!runningSubagents.has(running.id)) return;
+        if (!acceptIpcResults || !runningSubagents.has(running.id)) return;
+        if (recoverCompletion(running)) return;
         finishSubagent({
           id: running.id,
           name: running.name,
@@ -1197,28 +1187,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // Capture UI context, restore unresolved launches, and start the IPC server.
   pi.on("session_start", async (_event, ctx) => {
     latestCtx = ctx;
-    if (isChildProcess) return;
+    drainPromise = undefined;
+    registerLifecycleListeners();
 
     acceptIpcResults = false;
     await parentIpcServer?.close().catch(() => {});
     parentIpcSocketPath = getIpcSocketPath(ctx.sessionManager.getSessionId());
 
-    const entries = ctx.sessionManager.getBranch() as Array<{
-      type: string;
-      customType?: string;
-      data?: any;
-    }>;
-    const finished = new Set(
-      entries
-        .filter((entry) => entry.type === "custom" && entry.customType === IPC_FINISH_ENTRY)
-        .map((entry) => entry.data?.id)
-        .filter(Boolean),
-    );
+    const ledger = restoreRunLedger(ctx.sessionManager.getEntries());
+    completedRuns.clear();
+    for (const [id, finish] of ledger.finishes) {
+      if (finish.result) completedRuns.set(id, finish.result);
+    }
     runningSubagents.clear();
-    for (const entry of entries) {
-      if (entry.type !== "custom" || entry.customType !== IPC_LAUNCH_ENTRY) continue;
-      const data = entry.data as Partial<RunningSubagent> | undefined;
-      if (!data?.id || !data.ipcToken || !data.sessionFile || finished.has(data.id)) continue;
+    for (const data of ledger.unresolved as Partial<RunningSubagent>[]) {
+      if (!data?.id || !data.ipcToken || !data.sessionFile) continue;
       let sessionCorrelation: ReturnType<typeof readSubagentSessionCorrelation> | undefined;
       try {
         sessionCorrelation = readSubagentSessionCorrelation(data.sessionFile);
@@ -1261,39 +1244,51 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     }
     await parentIpcServer.start();
     acceptIpcResults = true;
+    for (const result of ledger.pendingResults) deliverResult(result);
+    // A crash can occur after committing a terminal outcome but before closing
+    // its pane. Reap only journalled, still-open surfaces, deepest descendants first.
+    for (const run of ledger.openSurfaces as RunningSubagent[]) {
+      if (!ledger.finishes.has(run.runId ?? run.id)) continue;
+      try {
+        for (const surface of [...collectOpenDescendants(run.sessionFile), run]) {
+          if (surface.workspace) terminateWorkspaceChild(surface);
+          else if (surface.surface) { try { closeSurface(surface.surface); } catch {} }
+        }
+        pi.appendEntry(CLOSED_ENTRY, { id: run.id, runId: run.runId, closedAt: Date.now() });
+      } catch (error) {
+        ctx.ui.notify(`Could not reap completed subagent ${run.name}: ${String(error)}`, "warning");
+      }
+    }
     for (const running of runningSubagents.values()) {
+      if (recoverCompletion(running)) continue;
       scheduleConnectionFailure(
         running.id,
         15_000,
         "Subagent did not reconnect to IPC after the parent session reloaded.",
       );
     }
+    reportChildren();
     if (runningSubagents.size > 0) startWidgetRefresh();
   });
 
   // Preserve child processes across /reload; terminate them for real parent-session shutdowns.
   pi.on("session_shutdown", async (event, _ctx) => {
+    if (event.reason !== "reload") await drainChildren();
     acceptIpcResults = false;
-    if (widgetInterval) {
-      clearInterval(widgetInterval);
-      widgetInterval = null;
+    if (widgetInterval) clearInterval(widgetInterval);
+    widgetInterval = null;
+    for (const { timer, cleanup } of cleanupTimers.values()) {
+      clearTimeout(timer);
+      cleanup(true);
     }
-    if (!isChildProcess && event.reason !== "reload") {
-      for (const running of runningSubagents.values()) {
-        parentIpcServer?.send(running.id, "shutdown", { reason: event.reason });
-      }
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      for (const running of runningSubagents.values()) {
-        if (!running.workspace) {
-          try { closeSurface(running.surface); } catch {}
-        }
-      }
-      runningSubagents.clear();
-    }
+    cleanupTimers.clear();
     for (const timer of connectionFailureTimers.values()) clearTimeout(timer);
     connectionFailureTimers.clear();
-    if (!isChildProcess) await parentIpcServer?.close().catch(() => {});
+    await parentIpcServer?.close().catch(() => {});
     parentIpcServer = null;
+    latestCtx = null;
+    unsubscribeChildren?.();
+    unsubscribeDrain?.();
   });
 
   // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
@@ -1340,7 +1335,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Enforce max-instances limit
         if (params.agent) {
-          const agentDefs = loadAgentDefaults(params.agent);
+          const agentDefs = loadAgentDefaults(params.agent, ctx.cwd, ctx.isProjectTrusted());
           if (agentDefs?.maxInstances != null) {
             const running = Array.from(runningSubagents.values()).filter(
               (a) => a.agent === params.agent,
@@ -1379,14 +1374,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Launch the subagent (creates pane, sends command)
         const allToolNames = pi.getAllTools().map((t: any) => t.name);
-        const running = await launchSubagent(params, ctx, { allToolNames });
-
-        pi.appendEntry(IPC_LAUNCH_ENTRY, serializeRunning(running));
-        scheduleConnectionFailure(
-          running.id,
-          30_000,
-          "Subagent did not establish its IPC connection during startup.",
-        );
+        const running = await launchSubagent(params, ctx, {
+          allToolNames, activeToolNames: pi.getActiveTools(), projectTrusted: ctx.isProjectTrusted(),
+          onPrepared: (running) => {
+            pi.appendEntry(IPC_LAUNCH_ENTRY, serializeRunning(running));
+            runningSubagents.set(running.id, running);
+            reportChildren();
+            scheduleConnectionFailure(running.id, 120_000, "Subagent did not establish its IPC connection during startup (check project trust or authentication).");
+          },
+          onFailed: (running, error) => finishSubagent({
+            id: running.id, name: running.name, task: running.task, agent: running.agent,
+            protocolStatus: "failed", protocolError: `Launch failed: ${String(error)}`, elapsed: 0,
+          }),
+        });
 
         // Start widget refresh when first agent launches. Lifecycle now arrives over IPC.
         startWidgetRefresh();
@@ -1470,59 +1470,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagents_list",
       label: "List Subagents",
       description:
-        "List all available subagent definitions. " +
-        "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-        "Project-local agents override global ones with the same name.",
+        "List effective subagent definitions: trusted project .pi/agents, active profile agents, then bundled defaults. Chain files are not supported.",
       promptSnippet:
-        "List all available subagent definitions. " +
-        "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-        "Project-local agents override global ones with the same name.",
+        "List effective subagent definitions from the trusted project, active profile and bundled defaults.",
       parameters: Type.Object({}),
 
-      async execute() {
-        const agents = new Map<
-          string,
-          { name: string; description?: string; model?: string; source: string }
-        >();
-
-        const dirs = [
-          {
-            path: join(dirname(new URL(import.meta.url).pathname), "../../agents"),
-            source: "package",
-          },
-          { path: join(homedir(), ".pi", "agent", "agents"), source: "global" },
-          { path: join(process.cwd(), ".pi", "agents"), source: "project" },
-        ];
-
-        for (const { path: dir, source } of dirs) {
-          if (!existsSync(dir)) continue;
-          for (const file of readdirSync(dir).filter((f) => f.endsWith(".md"))) {
-            const content = readFileSync(join(dir, file), "utf8");
-            const match = content.match(/^---\n([\s\S]*?)\n---/);
-            if (!match) continue;
-            const frontmatter = match[1];
-            const get = (key: string) => {
-              const m = frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
-              return m ? m[1].trim() : undefined;
-            };
-            const name = get("name") ?? file.replace(/\.md$/, "");
-            agents.set(name, {
-              name,
-              description: get("description"),
-              model: get("model"),
-              source,
-            });
-          }
-        }
-
-        if (agents.size === 0) {
+      async execute(_id, _params, _signal, _update, ctx) {
+        const list = listAgentDefinitions(ctx.cwd, ctx.isProjectTrusted());
+        if (list.length === 0) {
           return {
             content: [{ type: "text", text: "No subagent definitions found." }],
             details: { agents: [] },
           };
         }
 
-        const list = [...agents.values()];
         const lines = list.map((a) => {
           const badge = a.source === "project" ? " (project)" : "";
           const desc = a.description ? ` — ${a.description}` : "";
@@ -1647,7 +1608,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return new Text(theme.fg("dim", text), 0, 0);
       },
 
-      async execute(_toolCallId, rawParams, _signal, _onUpdate) {
+      async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
         const params = rawParams as { sessionPath: string; name?: string; message?: string };
         const name = params.name ?? "Resume";
         const startTime = Date.now();
@@ -1656,7 +1617,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return muxUnavailableResult("subagents");
         }
 
-        if (!existsSync(params.sessionPath)) {
+        if (!existsSync(resolve(ctx.cwd, params.sessionPath))) {
           return {
             content: [
               { type: "text", text: `Error: session file not found: ${params.sessionPath}` },
@@ -1672,14 +1633,33 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        const sessionFile = resolve(params.sessionPath);
+        const sessionFile = resolve(ctx.cwd, params.sessionPath);
+        if ([...runningSubagents.values()].some((run) => run.sessionFile === sessionFile)) {
+          throw new Error("This session already has an active subagent run. Finish or cancel it before resuming.");
+        }
+        const depth = Number(process.env.PI_SUBAGENT_DEPTH ?? "0");
+        if (!Number.isSafeInteger(depth) || depth >= 4) throw new Error("Subagent nesting limit (4) reached.");
         const correlation = readSubagentSessionCorrelation(sessionFile);
+        const savedConfig = readChildRunConfig(join(getSessionArtifactDir(sessionFile), "context/subagent-config.json"));
+        const legacyDefs = !savedConfig && correlation.agent
+          ? loadAgentDefaults(correlation.agent, correlation.cwd, correlation.cwd === ctx.cwd && ctx.isProjectTrusted()) : null;
+        const restoredConfig = savedConfig ?? legacyChildDefaults(correlation.agent, legacyDefs);
+        const config: ChildRunConfig = {
+          ...restoredConfig, schemaVersion: 1,
+          tools: resolveChildTools({ ...legacyDefs, tools: restoredConfig.tools?.join(",") }, pi.getActiveTools(), pi.getAllTools().map((tool) => tool.name)),
+          autoExit: false,
+        };
         const runId = randomUUID();
         const ipcToken = createIpcToken();
         let surface: string | undefined;
         let resumeMessagePath: string | undefined;
 
-        const parts = ["pi", "--session", shellEscape(sessionFile)];
+        const parts = ["pi", "--session", shellEscape(sessionFile), "--tools", shellEscape(config.tools.join(","))];
+        if (config.model) parts.push("--model", shellEscape(config.thinking ? `${config.model}:${config.thinking}` : config.model));
+        if (config.systemPrompt) parts.push("--append-system-prompt", shellEscape(config.systemPrompt));
+        for (const skill of config.skills?.split(",").map((skill) => skill.trim()).filter(Boolean) ?? []) {
+          parts.push(shellEscape(`/skill:${skill}`));
+        }
         const subagentDonePath = join(
           dirname(new URL(import.meta.url).pathname),
           "subagent-done.ts",
@@ -1702,47 +1682,43 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           `PI_SUBAGENT_SOCKET=${shellEscape(parentIpcSocketPath)}`,
           `PI_SUBAGENT_TOKEN=${shellEscape(ipcToken)}`,
           "PI_SUBAGENT_AUTO_EXIT=0",
+          `PI_SUBAGENT_DEPTH=${depth + 1}`,
+          `PI_SUBAGENT_TOOLS=${shellEscape(config.tools.join(","))}`,
+          `PI_DENY_TOOLS=${shellEscape(withChildOnlyTools(pi.getAllTools().map((tool) => tool.name))!.filter((tool) => !config.tools.includes(tool)).join(","))}`,
+          ...(config.agent ? [`PI_SUBAGENT_AGENT=${shellEscape(config.agent)}`] : []),
+          ...(config.model ? [`PI_SUBAGENT_MODEL=${shellEscape(config.model)}`] : []),
+          ...(config.thinking ? [`PI_SUBAGENT_THINKING=${shellEscape(config.thinking)}`] : []),
+          ...customAgentEnvParts(config.env),
           ...inheritedProfileEnvParts(),
         ];
         const envPrefix = ["env", ...inheritedProfileEnvUnsets(), ...envParts].join(" ") + " ";
         const command = `cd ${shellEscape(correlation.cwd)} && ${envPrefix}${parts.join(" ")}`;
+        let running: RunningSubagent | undefined;
         try {
           surface = createSurface(name);
           await new Promise<void>((resolve) => setTimeout(resolve, 500));
+          running = {
+            id: runId, runId, childSessionId: correlation.childSessionId,
+            resumeOfRunId: correlation.originatingRunId, mode: "resume", name,
+            agent: config.agent, task: params.message ?? "resumed session", surface,
+            startTime, sessionFile, ipcToken, autoExit: false, config,
+          };
           parentIpcServer.registerChild(runId, ipcToken);
+          pi.appendEntry(IPC_LAUNCH_ENTRY, serializeRunning(running));
+          runningSubagents.set(runId, running);
+          reportChildren();
+          scheduleConnectionFailure(runId, 120_000, "Resumed subagent did not connect during startup (check project trust or authentication).");
           sendCommand(surface, command);
         } catch (error) {
-          parentIpcServer.unregisterChild(runId);
-          if (surface) {
-            try { closeSurface(surface); } catch {}
-          }
-          if (resumeMessagePath) {
-            try { unlinkSync(resumeMessagePath); } catch {}
+          if (runningSubagents.has(runId) && running) {
+            finishSubagent({ id: runId, name, task: running.task, protocolStatus: "failed", protocolError: String(error), elapsed: 0 });
+          } else {
+            parentIpcServer.unregisterChild(runId);
+            if (surface) { try { closeSurface(surface); } catch {} }
+            if (resumeMessagePath) { try { unlinkSync(resumeMessagePath); } catch {} }
           }
           throw error;
         }
-
-        const running: RunningSubagent = {
-          id: runId,
-          runId,
-          childSessionId: correlation.childSessionId,
-          resumeOfRunId: correlation.originatingRunId,
-          mode: "resume",
-          name,
-          task: params.message ?? "resumed session",
-          surface,
-          startTime,
-          sessionFile,
-          ipcToken,
-          autoExit: false,
-        };
-        runningSubagents.set(runId, running);
-        pi.appendEntry(IPC_LAUNCH_ENTRY, serializeRunning(running));
-        scheduleConnectionFailure(
-          running.id,
-          30_000,
-          "Resumed subagent did not establish its IPC connection during startup.",
-        );
         startWidgetRefresh();
 
         return {
@@ -1877,34 +1853,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const killed: { id: string; name: string; agent?: string; elapsed: number }[] = [];
         for (const agent of targets) {
           const elapsed = Math.floor((Date.now() - agent.startTime) / 1000);
-          // Ask the child bridge to abort and shut down gracefully before closing its pane.
-          parentIpcServer?.send(agent.id, "shutdown", { reason: "cancelled" });
-          parentIpcServer?.unregisterChild(agent.id);
-          // Workspace mode: kill WezTerm process, switch back
-          if (agent.workspace) {
-            if (agent.workspaceProcess) {
-              try { process.kill(agent.workspaceProcess.pid!, "SIGTERM"); } catch {}
-            }
-            if (agent.previousWorkspace) switchSwayWorkspace(agent.previousWorkspace);
-          } else {
-            // Close the mux pane
-            try { closeSurface(agent.surface); } catch {}
-          }
-          // Clean up fork temp file
-          if (agent.forkCleanupFile) {
-            try {
-              unlinkSync(agent.forkCleanupFile);
-            } catch {}
-          }
-          runningSubagents.delete(agent.id);
-          pi.appendEntry(IPC_FINISH_ENTRY, {
-            id: agent.id,
-            runId: agent.runId,
-            childSessionId: agent.childSessionId,
-            sessionFile: agent.sessionFile,
-            finishedAt: Date.now(),
-            cancelled: true,
-          });
+          finishSubagent({
+            id: agent.id, name: agent.name, task: agent.task, agent: agent.agent,
+            protocolStatus: "cancelled", protocolError: "Cancelled by the parent.", elapsed,
+          }, false);
           killed.push({ id: agent.id, name: agent.name, agent: agent.agent, elapsed });
         }
 
@@ -1955,10 +1907,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const agentName = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
       const task = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
 
-      const defs = loadAgentDefaults(agentName);
+      const defs = loadAgentDefaults(agentName, ctx.cwd, ctx.isProjectTrusted());
       if (!defs) {
         ctx.ui.notify(
-          `Agent "${agentName}" not found in ~/.pi/agent/agents/ or .pi/agents/`,
+          `Agent "${agentName}" not found in the trusted project, active profile or bundled definitions`,
           "error",
         );
         return;

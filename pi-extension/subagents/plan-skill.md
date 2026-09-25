@@ -1,182 +1,23 @@
 ---
 name: plan
-description: >
-  Planning workflow. Spawns an interactive planner sub-agent
-  in a multiplexer pane with shared session context. Use when asked to "plan",
-  "brainstorm", "I want to build X", or "let's design". Requires the
-  subagents extension and a supported multiplexer (cmux/tmux/zellij).
+description: Interactive planning and implementation through asynchronous Pi subagents.
 ---
 
-# Plan
+# Planning workflow
 
-A planning workflow that offloads brainstorming and plan creation to a dedicated interactive subagent, keeping the main session clean for orchestration.
-
-**Announce at start:** "Let me investigate first, then I'll open a dedicated planning session where we can work through this together."
-
----
-
-## Tab Titles
-
-Use `set_tab_title` to keep the user informed of progress in the multiplexer UI. Update the title at every phase transition.
-
-| Phase         | Title example                                                  |
-| ------------- | -------------------------------------------------------------- |
-| Investigation | `🔍 Investigating: <short task>`                               |
-| Planning      | `💬 Planning: <short task>`                                    |
-| Review plan   | `📋 Review: <short task>`                                      |
-| Executing     | `🔨 Executing: 1/3 — <short task>` (update counter per worker) |
-| Reviewing     | `🔎 Reviewing: <short task>`                                   |
-| Done          | `✅ Done: <short task>`                                        |
-
-Name subagents with context too:
-
-- Scout: `"🔍 Scout"` (default is fine)
-- Workers: `"🔨 Worker 1/3"`, `"🔨 Worker 2/3"`, etc.
-- Reviewer: `"🔎 Reviewer"`
-- Planner: `"💬 Planner"`
-
----
-
-## The Flow
-
-```
-Phase 1: Quick Investigation (main session)
-    ↓
-Phase 2: Spawn Planner Subagent (interactive — user collaborates here)
-    ↓
-Phase 3: Review Plan & Todos (main session)
-    ↓
-Phase 4: Execute Todos (workers)
-    ↓
-Phase 5: Review
-```
-
----
-
-## Phase 1: Quick Investigation
-
-Before spawning the planner, orient yourself:
-
-```bash
-ls -la
-find . -type f -name "*.ts" | head -20  # or relevant extension
-cat package.json 2>/dev/null | head -30
-```
-
-Spend 30–60 seconds. The goal is to give the planner useful context — not to do a full scout.
-
-**If deeper context is needed** (large codebase, unfamiliar architecture), spawn an autonomous scout subagent first:
+1. Briefly inspect the project with read/bash. Delegate deeper reconnaissance to a scout if useful.
+2. Spawn a planner with the user's task, constraints and your findings. The user can work directly in its terminal.
+3. Do independent work or end the current turn silently. Never poll children. A planner asking the user a question remains open; its answer is not completion.
+4. After the planner calls `subagent_done`, read its plan using `read_artifact` and inspect the todos. Confirm implementation scope with the user.
+5. Delegate implementation to workers. Use sequential workers in a shared worktree, or clearly partition files/use separate worktrees for concurrent tasks. Require checks and explicit completion results.
+6. Delegate review. State whether the reviewer may edit or must report findings only. Address substantive findings and verify again.
 
 ```typescript
-subagent({
-  name: "Scout",
-  agent: "scout",
-  interactive: false,
-  task: "Analyze the codebase. Map file structure, key modules, patterns, and conventions. Summarize findings concisely for a planning session.",
-});
+subagent({ name: "Planner", agent: "planner", task: "Plan the requested change. Context: ..." });
+// Later, after the completion event and user approval:
+subagent({ name: "Worker", agent: "worker", task: "Implement TODO-xxxx. Plan artifact: plans/feature.md. Run the relevant tests." });
 ```
 
-Read the scout's summary from the subagent result before proceeding.
+All subagents are interactive; there is no `interactive` parameter. Use descriptive names and child `set_tab_title` for progress. Do not instruct users to close the planner with Ctrl+D as a substitute for completion: the planner should finish its current run with `subagent_done` and reference the plan and todo IDs. The same session can be resumed later for revisions.
 
----
-
-## Phase 2: Spawn Planner Subagent
-
-Spawn the interactive planner. The `planner` agent definition has the full brainstorming workflow built in — clarify, explore, validate design, write plan, create todos.
-
-```typescript
-subagent({
-  name: "Planner",
-  agent: "planner",
-  interactive: true,
-  task: `Plan: [what the user wants to build]
-
-Context from investigation:
-[paste relevant findings from Phase 1 here]`,
-});
-```
-
-**The user works with the planner in the subagent.** The main session waits. When the user is done, they press Ctrl+D and the subagent.s summary is returned to the main session.
-
----
-
-## Phase 3: Review Plan & Todos
-
-Once the subagent closes, read the plan and todos:
-
-```typescript
-todo({ action: "list" });
-```
-
-Review with the user:
-
-> "Here's what the planner produced: [brief summary]. Ready to execute, or anything to adjust?"
-
----
-
-## Phase 4: Execute Todos
-
-Spawn a scout first for context, then workers sequentially:
-
-```typescript
-// 1. Scout gathers context
-subagent({
-  name: "Scout",
-  agent: "scout",
-  interactive: false,
-  task: "Gather context for implementing [feature]. Read the plan at [plan path]. Identify all files that will be created/modified, map existing patterns and conventions.",
-});
-
-// 2. Workers execute todos sequentially — one at a time
-subagent({
-  name: "Worker",
-  agent: "worker",
-  interactive: false,
-  task: "Implement TODO-xxxx. Mark the todo as done. Plan: [plan path]\n\nScout context: [paste scout summary]",
-});
-
-// Check result, then next todo
-subagent({
-  name: "Worker",
-  agent: "worker",
-  interactive: false,
-  task: "Implement TODO-yyyy. Mark the todo as done. Plan: [plan path]\n\nScout context: [paste scout summary]",
-});
-```
-
-**Always run workers sequentially in the same git repo** — parallel workers will conflict on commits.
-
----
-
-## Phase 5: Review
-
-After all todos are complete:
-
-```typescript
-subagent({
-  name: "Reviewer",
-  agent: "reviewer",
-  interactive: false,
-  task: "Review the recent changes. Plan: [plan path]",
-});
-```
-
-Triage findings:
-
-- **P0** — Real bugs, security issues → fix now
-- **P1** — Genuine traps, maintenance dangers → fix before merging
-- **P2** — Minor issues → fix if quick, note otherwise
-- **P3** — Nits → skip
-
-Create todos for P0/P1, run workers to fix, re-review only if fixes were substantial.
-
----
-
-## ⚠️ Completion Checklist
-
-Before reporting done:
-
-1. ✅ All worker todos closed?
-2. ✅ Every todo has a polished commit (using the `commit` skill)?
-3. ✅ Reviewer has run?
-4. ✅ Reviewer findings triaged and addressed?
+Before declaring the overall work complete, verify requested changes, checks, todo status, review findings and publication requirements. Never infer success merely because a child stopped speaking.

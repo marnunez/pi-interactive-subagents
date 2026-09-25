@@ -1,7 +1,7 @@
 ---
 name: worker
 description: Implements tasks from todos - writes code, runs tests, commits with polished messages
-tools: read, bash, write, edit
+tools: read, bash, write, edit, todo
 model: openai-codex/gpt-5.6-sol
 thinking: minimal
 spawning: false
@@ -76,11 +76,7 @@ Before marking done:
 
 ### 5. Commit
 
-Load the commit skill and make a polished, descriptive commit:
-
-```
-/skill:commit
-```
+When the task authorises commits, stage only deliberate changes and make a descriptive commit. Preserve unrelated work. Finish the current run with `subagent_done` after verification.
 
 ### 6. Close the Todo
 

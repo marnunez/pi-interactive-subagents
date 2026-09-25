@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
+import { resolveChildTools } from "../pi-extension/subagents/config.ts";
 
 import {
   getLeafId,
@@ -711,6 +712,12 @@ describe("subagent-done.ts", () => {
   });
 });
 describe("subagent model qualification", () => {
+  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  before(() => { delete process.env.PI_CODING_AGENT_DIR; });
+  after(() => {
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+  });
   it("qualifies the configured default model with its default provider", () => {
     const testApi = (subagentsModule as any).__test__;
     assert.equal(typeof testApi.qualifyModelWithProvider, "function");
@@ -821,13 +828,16 @@ describe("subagent launch environment", () => {
         "PI_PROFILE='radius'",
         "PI_CODING_AGENT_DIR='/tmp/profile root/radius'",
       ]);
-      assert.deepEqual(testApi.inheritedProfileEnvUnsets(), [
+      assert.deepEqual(testApi.inheritedProfileEnvUnsets().slice(0, 4), [
         "-u", "PI_SESSION_LEASE_OWNER_PID", "-u", "PI_SESSION_LEASE_OWNER_NONCE",
       ]);
+      for (const name of ["PI_DENY_TOOLS", "PI_SUBAGENT_ID", "PI_SUBAGENT_SOCKET", "PI_SUBAGENT_TOKEN", "PI_SUBAGENT_TOOLS", "PI_SUBAGENT_DEPTH"]) {
+        assert.ok(testApi.inheritedProfileEnvUnsets().includes(name));
+      }
 
       delete process.env.PI_PROFILE;
       delete process.env.PI_CODING_AGENT_DIR;
-      assert.deepEqual(testApi.inheritedProfileEnvUnsets(), [
+      assert.deepEqual(testApi.inheritedProfileEnvUnsets().slice(0, 8), [
         "-u", "PI_PROFILE", "-u", "PI_CODING_AGENT_DIR",
         "-u", "PI_SESSION_LEASE_OWNER_PID", "-u", "PI_SESSION_LEASE_OWNER_NONCE",
       ]);
@@ -847,9 +857,8 @@ describe("subagent launch environment", () => {
 describe("subagent tool allow-list", () => {
   it("keeps child lifecycle tools available when an agent restricts native tools", () => {
     const testApi = (subagentsModule as any).__test__;
-    const tools = testApi.buildSubagentToolAllowList(
-      "read,bash,edit,write",
-      new Set(),
+    const tools = resolveChildTools(
+      { tools: "read,bash,edit,write" }, [],
       testApi.withChildOnlyTools(["read", "bash", "edit", "write", "write_artifact"]),
     );
 
@@ -860,15 +869,8 @@ describe("subagent tool allow-list", () => {
 
   it("never denies the mandatory subagent_done lifecycle tool", () => {
     const testApi = (subagentsModule as any).__test__;
-    const denySet = testApi.resolveDenyTools(
-      { allowTools: "read,bash" },
-      testApi.withChildOnlyTools(["read", "bash", "write_artifact"]),
-    );
-    denySet.delete("subagent_done");
-
-    const tools = testApi.buildSubagentToolAllowList(
-      "read,bash",
-      denySet,
+    const tools = resolveChildTools(
+      { tools: "read,bash", allowTools: "read,bash" }, [],
       testApi.withChildOnlyTools(["read", "bash", "write_artifact"]),
     );
 

@@ -14,6 +14,7 @@ import {
 } from "../session-artifacts/paths.ts";
 import {
   findLastAssistantMessage,
+  readRunCompletion,
   SUBAGENT_DONE_RESULT_TYPE,
   type SessionEntry,
   type SubagentArtifactRef,
@@ -33,6 +34,8 @@ const MAX_ARTIFACT_NAME_CHARS = 512;
 const MAX_ARTIFACT_DESCRIPTION_CHARS = 500;
 const MAX_NEXT_STEPS = 20;
 const MAX_NEXT_STEP_CHARS = 500;
+const COMPLETION_RETRY_MS = 250;
+const COMPLETION_ACK_TIMEOUT_MS = 10_000;
 const CHILD_LIFECYCLE_TOOLS = ["subagent_done", "set_tab_title"];
 
 const DoneParams = Type.Object({
@@ -170,6 +173,19 @@ export default function (pi: ExtensionAPI) {
   let denied: string[] = [];
   let expanded = false;
   let completionSent = false;
+  let pendingChildren = 0;
+  let unsubscribeChildren: (() => void) | undefined;
+  const registerChildListener = () => {
+    unsubscribeChildren?.();
+    unsubscribeChildren = pi.events?.on("subagent:children", (count: unknown) => {
+      if (typeof count === "number") pendingChildren = count;
+    });
+  };
+  const refreshChildren = () => pi.events?.emit("subagent:children-query", undefined);
+  let pendingCompletion: SubagentDoneResult | null = null;
+  let completionRetryTimer: ReturnType<typeof setInterval> | null = null;
+  let completionTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
+  let completionShutdownRequested = false;
   let latestCtx: ExtensionContext | null = null;
   let runState: "idle" | "running" = "idle";
   let stopUiMonitor: (() => void) | null = null;
@@ -178,7 +194,7 @@ export default function (pi: ExtensionAPI) {
   // Read subagent identity and IPC configuration from env vars set by the parent.
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
-  const childId = process.env.PI_SUBAGENT_ID ?? "";
+  const runId = process.env.PI_SUBAGENT_ID ?? "";
   const socketPath = process.env.PI_SUBAGENT_SOCKET ?? "";
   const token = process.env.PI_SUBAGENT_TOKEN ?? "";
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
@@ -189,10 +205,10 @@ export default function (pi: ExtensionAPI) {
     .map((value) => value.trim())
     .filter(Boolean);
 
-  const ipc = childId && socketPath && token
+  const ipc = runId && socketPath && token
     ? new ChildIpcClient({
         socketPath,
-        childId,
+        childId: runId,
         token,
         helloPayload: () => ({
           pid: process.pid,
@@ -207,9 +223,20 @@ export default function (pi: ExtensionAPI) {
           state: pendingUiRequests.snapshot().pendingUiRequestCount > 0 ? "waiting_input" : runState,
           ...pendingUiRequests.snapshot(),
         }),
+        onConnect: () => {
+          if (pendingCompletion) ipc?.send("completion", pendingCompletion);
+        },
         onMessage: (message: IpcEnvelope) => {
-          const payload = message.payload as { text?: string } | undefined;
-          if (message.type === "prompt" && payload?.text) {
+          const payload = message.payload as { text?: string; runId?: string } | undefined;
+          if (
+            message.type === "completion_ack" &&
+            payload?.runId === runId &&
+            pendingCompletion?.runId === runId
+          ) {
+            pendingCompletion = null;
+            clearCompletionDeliveryTimers();
+            requestCompletionShutdown();
+          } else if (message.type === "prompt" && payload?.text) {
             if (latestCtx?.isIdle()) pi.sendUserMessage(payload.text);
             else pi.sendUserMessage(payload.text, { deliverAs: "followUp" });
           } else if (message.type === "steer" && payload?.text) {
@@ -219,8 +246,10 @@ export default function (pi: ExtensionAPI) {
           } else if (message.type === "abort") {
             void latestCtx?.abort();
           } else if (message.type === "shutdown") {
-            void latestCtx?.abort();
-            latestCtx?.shutdown();
+            void (async () => {
+              await latestCtx?.abort();
+              requestCompletionShutdown();
+            })();
           } else if (message.type === "ping") {
             ipc?.send("pong", { timestamp: Date.now() });
           }
@@ -228,11 +257,58 @@ export default function (pi: ExtensionAPI) {
       })
     : null;
 
-  function persistAndSendCompletion(result: SubagentDoneResult): void {
-    if (completionSent) throw new Error("subagent_done has already been called for this run.");
-    completionSent = true;
-    pi.appendEntry(SUBAGENT_DONE_RESULT_TYPE, result);
+  function clearCompletionDeliveryTimers(): void {
+    if (completionRetryTimer) clearInterval(completionRetryTimer);
+    if (completionTimeoutTimer) clearTimeout(completionTimeoutTimer);
+    completionRetryTimer = null;
+    completionTimeoutTimer = null;
+  }
+
+  async function drainDescendants(): Promise<void> {
+    const request = { pending: [] as Promise<void>[] };
+    pi.events?.emit("subagent:drain", request);
+    await Promise.all(request.pending);
+  }
+
+  function requestCompletionShutdown(): void {
+    if (completionShutdownRequested) return;
+    completionShutdownRequested = true;
+    void drainDescendants().then(() => {
+      ipc?.send("shutdown_ready", { runId });
+      latestCtx?.shutdown();
+    });
+  }
+
+  function beginCompletionDelivery(result: SubagentDoneResult): void {
+    clearCompletionDeliveryTimers();
+    pendingCompletion = result;
     ipc?.send("completion", result);
+    completionRetryTimer = setInterval(() => {
+      if (pendingCompletion) ipc?.send("completion", pendingCompletion);
+    }, COMPLETION_RETRY_MS);
+    completionTimeoutTimer = setTimeout(() => {
+      pendingCompletion = null;
+      clearCompletionDeliveryTimers();
+      requestCompletionShutdown();
+    }, COMPLETION_ACK_TIMEOUT_MS);
+  }
+
+  function persistAndDeliverCompletion(result: SubagentDoneResult): void {
+    if (completionSent) throw new Error("subagent_done has already been called for this run.");
+    if (!runId) throw new Error("subagent_done requires PI_SUBAGENT_ID for run correlation.");
+    pi.appendEntry(SUBAGENT_DONE_RESULT_TYPE, result);
+    completionSent = true;
+    beginCompletionDelivery(result);
+  }
+
+  function cleanupSessionResources(): void {
+    clearCompletionDeliveryTimers();
+    pendingCompletion = null;
+    stopUiMonitor?.();
+    stopUiMonitor = null;
+    pendingUiRequests.reset();
+    ipc?.stop();
+    latestCtx = null;
   }
 
   function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
@@ -288,11 +364,18 @@ export default function (pi: ExtensionAPI) {
 
   // Show widget + status bar, observe generic Pi UI requests, and establish parent IPC.
   pi.on("session_start", (_event, ctx) => {
+    cleanupSessionResources();
+    registerChildListener();
     latestCtx = ctx;
-    completionSent = false;
+    completionShutdownRequested = false;
     runState = ctx.isIdle() ? "idle" : "running";
-    pendingUiRequests.reset();
-    stopUiMonitor?.();
+
+    const sessionFile = ctx.sessionManager.getSessionFile();
+    const persistedCompletion = sessionFile && runId
+      ? readRunCompletion(sessionFile, runId)
+      : undefined;
+    completionSent = !!persistedCompletion;
+
     stopUiMonitor = monitorExtensionUi(ctx.ui, (event) => {
       if (event.phase === "started") {
         pendingUiRequests.start(event.request);
@@ -314,13 +397,13 @@ export default function (pi: ExtensionAPI) {
     ipc?.start();
     ipc?.send("ready", {
       sessionId: ctx.sessionManager.getSessionId(),
-      sessionFile: ctx.sessionManager.getSessionFile(),
+      sessionFile,
       state: runState,
       ...pendingUiRequests.snapshot(),
     });
+    if (persistedCompletion) beginCompletionDelivery(persistedCompletion);
 
-    const tools = pi.getAllTools();
-    toolNames = tools.map((t) => t.name).sort();
+    toolNames = resolveChildActiveTools(pi.getActiveTools(), lockedTools, pi.getAllTools().map((t) => t.name)).sort();
     denied = (process.env.PI_DENY_TOOLS ?? "")
       .split(",")
       .map((s) => s.trim())
@@ -364,7 +447,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_settled", (_event, ctx) => {
     runState = "idle";
     ipc?.send("settled", { timestamp: Date.now(), autoExit });
-    if (!autoExit || completionSent) return;
+    refreshChildren();
+    if (!autoExit || completionSent || pendingChildren > 0) return;
 
     const entries = ctx.sessionManager.getEntries() as unknown as SessionEntry[];
     const report = findLastAssistantMessage(entries) ?? "Subagent settled without a textual final response.";
@@ -374,28 +458,37 @@ export default function (pi: ExtensionAPI) {
       .join("\n")
       .slice(0, MAX_REPORT_CHARS)
       .trim();
-    const summary = boundedReport.slice(0, MAX_SUMMARY_CHARS).trim() || "Subagent task settled.";
     const result: SubagentDoneResult = {
       schemaVersion: 1,
-      status: "success",
-      summary,
-      report: boundedReport === summary ? undefined : boundedReport,
+      runId,
+      status: "blocked",
+      summary: "Subagent settled without calling subagent_done; no explicit outcome was reported.",
+      report: boundedReport,
       completedAt: new Date().toISOString(),
     };
-    persistAndSendCompletion(result);
-    setTimeout(() => ctx.shutdown(), 0);
+    persistAndDeliverCompletion(result);
   });
 
-  pi.on("session_shutdown", (event, ctx) => {
+  pi.on("session_shutdown", async (event, ctx) => {
+    if (event.reason !== "reload") {
+      await drainDescendants();
+      ipc?.send("shutdown_ready", { runId });
+    }
     ipc?.send("shutdown", {
       reason: event.reason,
       sessionId: ctx.sessionManager.getSessionId(),
       completionSent,
     });
-    stopUiMonitor?.();
-    stopUiMonitor = null;
-    pendingUiRequests.reset();
-    if (event.reason !== "reload") latestCtx = null;
+    cleanupSessionResources();
+    unsubscribeChildren?.();
+  });
+
+  // Enforce the run's selected tools even if another extension changes active tools.
+  pi.on("tool_call", (event) => {
+    if (lockedTools.length && !lockedTools.includes(event.toolName) && event.toolName !== "subagent_done") {
+      return { block: true, reason: `Tool ${event.toolName} is not allowed for this subagent run.` };
+    }
+    if (completionSent) return { block: true, reason: "This run is already complete; resume the session as a new run.", terminate: true };
   });
 
   // Toggle expand/collapse with Ctrl+J
@@ -411,12 +504,14 @@ export default function (pi: ExtensionAPI) {
     name: "subagent_done",
     label: "Subagent Done",
     description:
-      "Mandatory lifecycle tool for sub-agents. Call exactly once when the task is complete, failed, or blocked. " +
-      "Persists a structured result for the parent orchestrator and then shuts this sub-agent session down. " +
+      "Finish the current subagent run with success, failed, or blocked. Each run accepts one terminal result. " +
+      "Persists a structured result, ends the current run after parent acknowledgement, and leaves the session resumable. " +
       "Exiting without calling this tool is a protocol failure.",
     parameters: DoneParams,
     async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
       const params = rawParams as DoneParamsValue;
+      refreshChildren();
+      if (pendingChildren > 0) throw new Error("Finish or cancel this run's children before calling subagent_done.");
       if (completionSent) {
         throw new Error("subagent_done has already been called for this run.");
       }
@@ -429,21 +524,21 @@ export default function (pi: ExtensionAPI) {
       const validated = validateSubagentDoneParams(params, artifactDir);
       const result: SubagentDoneResult = {
         ...validated,
+        runId,
         completedAt: new Date().toISOString(),
       };
 
-      persistAndSendCompletion(result);
-
-      setTimeout(() => ctx.shutdown(), 0);
+      persistAndDeliverCompletion(result);
 
       return {
         content: [
           {
             type: "text",
-            text: `Subagent result persisted with status "${result.status}". Shutting down.`,
+            text: `Subagent result persisted with status "${result.status}". Current run complete; session remains resumable.`,
           },
         ],
-        details: { persisted: true, status: result.status },
+        details: { persisted: true, runId, status: result.status },
+        terminate: true,
       };
     },
   }));
