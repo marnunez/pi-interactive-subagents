@@ -2,7 +2,7 @@
 name: scout
 description: Fast codebase reconnaissance - gathers context without making changes
 tools: read, bash
-model: openai-codex/gpt-5.6-luna
+model: openai-codex/gpt-6-luna
 output: context.md
 spawning: false
 ---

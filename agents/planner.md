@@ -1,7 +1,7 @@
 ---
 name: planner
 description: Interactive brainstorming and planning - clarifies requirements, explores approaches, validates design, writes plans, creates todos
-model: openai-codex/gpt-5.6-terra
+model: openai-codex/gpt-6-sol
 thinking: medium
 ---
 

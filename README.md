@@ -98,13 +98,15 @@ A configured profile never falls back to the legacy shared directory. The filena
 ---
 name: focused-worker
 description: Implements a small verified change
-model: openai-codex/gpt-5.6-sol
+model: openai-codex/gpt-6-sol
 thinking: high
 tools: read, bash, edit, write, todo
 spawning: false
 ---
 Implement only the delegated task. Verify it, then finish the current run with subagent_done.
 ```
+
+Bundled defaults use `openai-codex/gpt-6-luna` for the scout and `openai-codex/gpt-6-sol` for the other roles. Astra is not a bundled default; selecting it requires an explicit override. Saved model selections in existing sessions are not migrated by changes to these definitions.
 
 Supported frontmatter:
 
