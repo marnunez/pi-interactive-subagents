@@ -23,7 +23,7 @@ export function restoreRunLedger(entries: readonly LedgerEntry[]) {
       if (entry.customType === LAUNCH_ENTRY) launches.set(id, entry.data);
       if (entry.customType === FINISH_ENTRY) finishes.set(id, entry.data);
       if (entry.customType === CLOSED_ENTRY) closed.add(id);
-      if (entry.customType === IDENTITY_ENTRY) identities.set(id, entry.data);
+      if (entry.customType === IDENTITY_ENTRY) identities.set(id, { ...identities.get(id), ...entry.data });
     }
     if (entry.type === "custom_message" && entry.customType === "subagent_result") {
       const id = entry.details?.runId ?? entry.details?.id;

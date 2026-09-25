@@ -1,12 +1,20 @@
 # pi-interactive-subagents
 
-Interactive, asynchronous subagents for [Pi](https://pi.dev). Each child runs a real Pi TUI in a cmux, tmux, zellij or WezTerm pane; the user can watch and steer it directly. The terminal multiplexer manages presentation only. Authenticated, length-prefixed Unix-socket messages carry lifecycle and results—not terminal scraping.
+Interactive, asynchronous subagents for [Pi](https://pi.dev). Each child runs a real Pi TUI, launched directly in the background without typing into an interactive shell or stealing keyboard focus. Authenticated, length-prefixed Unix-socket messages carry lifecycle and results—not terminal scraping.
 
 ```sh
 pi install git:github.com/marnunez/pi-interactive-subagents
 ```
 
-Set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm` to override backend detection. A persistent parent session is required. `workspace` optionally launches a WezTerm window on a named Sway workspace.
+A persistent parent session and **local WezTerm or tmux** are required for new launches. Set `PI_SUBAGENT_MUX=wezterm|tmux` to override detection. Legacy cmux/zellij discovery and cleanup remain, but new launches fail explicitly rather than falling back to unsafe terminal input.
+
+## Focus-safe launching
+
+- **WezTerm:** each run starts in its own uniquely named, initially hidden WezTerm workspace. Your current tab, window and keyboard focus stay unchanged. Open the workspace yourself through WezTerm's workspace launcher when you want to watch, steer or answer a prompt; the tool result includes its name. This is a WezTerm workspace, **not a Sway workspace**. The optional `workspace` argument is a label, with a unique run suffix added.
+- **tmux:** creates a detached split (`split-window -d`) targeting the originating pane, without selecting it.
+- Pi arguments and environment overrides travel through a private, one-shot launch file (0700 directory, 0600 file), not terminal input or mux command-line text. A non-interactive launcher spawns Pi with an argument vector and inherited TTY, without a shell. It forwards termination signals and reports spawn failures; it never reads typed input itself.
+- There is no `send-text`, simulated Enter, arbitrary shell-readiness sleep, or switch-focus-and-restore sequence. Legacy tab packing (`PI_SUBAGENT_MAX_PANES_PER_TAB`) and automatic Sway switching are removed.
+- Spawn/resume first report **connecting**, then return **connected** only after the child authenticates. This confirms startup, not task completion. Cancellation and startup failure do not return a successful launch result.
 
 ## Session versus run
 
@@ -23,7 +31,8 @@ Each run accepts one terminal outcome. A completed session remains resumable; it
 
 ```typescript
 subagent({ name: "Map auth", agent: "scout", task: "Map authentication and write a context artifact." });
-// Returns immediately. Do independent work, or end the turn silently.
+// Returns after startup connects, not after the task finishes.
+// Do independent work, or end the turn silently.
 // Do not poll: completion arrives as a steering message and triggers a turn.
 
 subagent_resume({ sessionPath: "/absolute/session.jsonl", message: "Now check the logout path." });
@@ -103,7 +112,7 @@ Supported frontmatter:
 - `deny-tools`: remove tools, including built-ins. Denials and `spawning: false` always win over optional allowlists.
 - `spawning: false`: disable spawn/list/resume/kill tools.
 - `skills` (or `skill`): comma-separated skills to load.
-- `cwd`, `workspace`: default working directory and Sway workspace.
+- `cwd`, `workspace`: default working directory and background WezTerm workspace label.
 - `max-instances`: per-parent simultaneous instances for this agent.
 - `env`: whitespace-separated `KEY=value` assignments; reserved run identity, policy and lease variables cannot be overridden.
 - `auto-exit`: opt-in blocked fallback described above.
@@ -129,7 +138,7 @@ Task, launch configuration and artifact files live beside the owning session:
 
 Artifacts move with the session corpus. Names must be relative and cannot traverse symlinks. Use distinctive artifact names: lookup searches the current session first, then sibling sessions, and a flat profile session root can contain several projects. Generic names can collide. Large material belongs in artifacts rather than completion summaries.
 
-Startup allows two minutes for project trust/authentication before reporting a connection failure; reconnect after parent reload allows 15 seconds. These are startup/reconnect guards, not task execution deadlines.
+Startup allows at most two minutes for the authenticated connection; an observed launch failure or vanished pane fails sooner. An IPC timeout does not establish its cause—inspect the named child workspace or transcript rather than assuming an authentication problem. Reconnect after parent reload allows 15 seconds. These are startup/reconnect guards, not task execution deadlines.
 
 ## Development
 
@@ -138,6 +147,24 @@ npm install
 npm test
 ```
 
-Tests cover session lineage, run-scoped persistence, completion retry/acknowledgement, reload recovery, cancellation, nested orchestration sockets, tool policy, profile discovery, artifacts and UI-state monitoring. They use local fixtures and sockets, not paid model calls.
+Tests cover session lineage, run-scoped persistence, completion retry/acknowledgement, reload recovery, cancellation, nested orchestration sockets, tool policy, profile discovery, artifacts and UI-state monitoring. Launch/resume integration tests execute fake mux/Pi processes with real IPC: they assert journal-before-execution, direct argument handling, unique workspace selection, startup acknowledgement and cancellation. No paid model calls or live desktop operations are used.
+
+An explicit, optional real-GUI test creates a **separate Xvfb display and WezTerm instance**, types continuously while three children launch, and verifies every character remains in the original pane:
+
+```sh
+# Requires wezterm, xvfb-run and xdotool on PATH; never targets the desktop display.
+node test/isolated-focus.mjs
+```
+
+### Module boundaries
+
+`pi-extension/subagents/index.ts` only wires together a fresh per-parent runtime and registrations:
+
+- `launch.ts`, `launch-process.ts/.mjs`, `terminal-launch.ts`: session preparation, private direct process launch and focus-safe mux commands.
+- `controller.ts`, `runtime.ts`, `types.ts`: orchestration, recovery, cancellation, IPC events and instance-owned state.
+- `spawn-tool.ts`, `resume-tool.ts`, `management-tools.ts`, `commands.ts`: tool/command registration and input handling.
+- `presentation.ts`, `widget.ts`, `renderers.ts`: result text, status widgets and TUI rendering.
+- `config.ts`, `policy.ts`, `launch-config.ts`: agent discovery, capabilities, guidance and resume settings.
+- `ipc.ts`, `session.ts`, `run-ledger.ts`, `termination.ts`, `subagent-done.ts`: transport, persistence, subtree cleanup and child lifecycle.
 
 MIT. Originally based on HazAT/pi-interactive-subagents.

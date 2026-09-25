@@ -1,7 +1,7 @@
 {
   "name": "pi-interactive-subagents",
   "version": "2.0.0",
-  "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions in cmux/tmux/zellij terminals",
+  "description": "Interactive Pi subagents with focus-safe direct launches in WezTerm and tmux",
   "keywords": [
     "pi-package"
   ],
@@ -13,7 +13,8 @@
   },
   "type": "module",
   "scripts": {
-    "test": "node --test test/*.ts"
+    "test": "node --test test/*.ts",
+    "test:focus": "node test/isolated-focus.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
