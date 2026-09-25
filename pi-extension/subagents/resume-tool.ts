@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import { existsSync, unlinkSync } from "node:fs";
 import { prepareLaunch } from "./launch-process.ts";
-import { assertBackgroundLaunchAvailable, launchBackgroundSurface } from "./terminal-launch.ts";
+import { assertDirectLaunchAvailable, launchVisibleSurface } from "./terminal-launch.ts";
 import { loadAgentDefaults, resolveChildTools } from "./config.ts";
 import { readChildRunConfig, legacyChildDefaults, type ChildRunConfig } from "./launch-config.ts";
 import { isMuxAvailable, closeSurface } from "./cmux.ts";
@@ -26,11 +26,11 @@ export function registerResumeTool(pi: ExtensionAPI, runtime: RunRuntime, contro
       name: "subagent_resume",
       label: "Resume Subagent",
       description:
-        "Resume a previous sub-agent session with a direct, focus-safe background launch. " +
+        "Resume a previous sub-agent session directly in a visible terminal split, without typing shell commands. " +
         "Waits for authenticated startup, not task completion. Results arrive later via a steer message. " +
         "Use when a sub-agent was cancelled or needs follow-up work. " + SUBAGENT_ASYNC_GUIDANCE,
       promptSnippet:
-        "Resume a completed or cancelled session as a new background run, without stealing focus. " + SUBAGENT_ASYNC_GUIDANCE,
+        "Resume a completed or cancelled session as a new run in a visible terminal split. Terminal focus may change. " + SUBAGENT_ASYNC_GUIDANCE,
       parameters: Type.Object({
         sessionPath: Type.String({ description: "Path to the session .jsonl file to resume" }),
         name: Type.Optional(
@@ -60,7 +60,7 @@ export function registerResumeTool(pi: ExtensionAPI, runtime: RunRuntime, contro
             theme.fg("accent", "▸") +
             " " +
             theme.fg("toolTitle", theme.bold(name)) +
-            theme.fg("dim", " — resumed, connected") +
+            theme.fg("dim", ` — resumed, connected${details.surface ? `, pane ${details.surface}` : ""}`) +
             (details.backgroundWorkspace ? "\n" + theme.fg("dim", `Workspace: ${details.backgroundWorkspace}`) : ""),
             0,
             0,
@@ -120,7 +120,7 @@ export function registerResumeTool(pi: ExtensionAPI, runtime: RunRuntime, contro
         let surface: string | undefined;
         let resumeMessagePath: string | undefined;
 
-        assertBackgroundLaunchAvailable();
+        assertDirectLaunchAvailable();
 
         if (params.message) {
           const artifactDir = ensureSessionArtifactDir(sessionFile);
@@ -150,8 +150,11 @@ export function registerResumeTool(pi: ExtensionAPI, runtime: RunRuntime, contro
           runtime.runningSubagents.set(runId, running);
           published = true;
           reportChildren();
-          scheduleConnectionFailure(runId, 120_000, "Resumed subagent did not connect before the startup deadline. No task execution is confirmed; inspect its workspace/session for the cause.");
-          Object.assign(running, launchBackgroundSurface({ runId, name, cwd: correlation.cwd, argv: launch.argv }));
+          scheduleConnectionFailure(runId, 120_000, "Resumed subagent did not connect before the startup deadline. No task execution is confirmed; inspect its pane/session for the cause.");
+          Object.assign(running, launchVisibleSurface({
+            runId, name, cwd: correlation.cwd, argv: launch.argv,
+            siblingSurfaces: [...runtime.runningSubagents.values()].map(run => run.surface).filter(Boolean),
+          }));
           surface = running.surface;
           recordSurface(running);
           startWidgetRefresh();
@@ -170,14 +173,14 @@ export function registerResumeTool(pi: ExtensionAPI, runtime: RunRuntime, contro
         startWidgetRefresh();
 
         return {
-          content: [{ type: "text", text: `Session "${name}" resumed and connected without changing your focus. Task results arrive asynchronously. ${running?.backgroundWorkspace ? `WezTerm workspace: ${running.backgroundWorkspace}. ` : ""}${SUBAGENT_ASYNC_GUIDANCE}` }],
+          content: [{ type: "text", text: `Session "${name}" resumed and connected in visible pane ${running.surface}. Terminal focus may change. Task results arrive asynchronously. ${SUBAGENT_ASYNC_GUIDANCE}` }],
           details: {
             id: runId,
             runId,
             childSessionId: correlation.childSessionId,
             resumeOfRunId: correlation.originatingRunId,
             mode: "resume",
-            backgroundWorkspace: running?.backgroundWorkspace,
+            surface: running.surface,
             name,
             sessionPath: sessionFile,
             sessionFile,

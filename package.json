@@ -1,7 +1,7 @@
 {
   "name": "pi-interactive-subagents",
   "version": "2.0.0",
-  "description": "Interactive Pi subagents with focus-safe direct launches in WezTerm and tmux",
+  "description": "Interactive Pi subagents with direct launches in visible WezTerm and tmux splits",
   "keywords": [
     "pi-package"
   ],
@@ -14,7 +14,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test test/*.ts",
-    "test:focus": "node test/isolated-focus.mjs"
+    "test:visible": "node test/isolated-visible.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

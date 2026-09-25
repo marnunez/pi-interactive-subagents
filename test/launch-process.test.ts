@@ -5,7 +5,7 @@ import { mkdtempSync, statSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { prepareLaunch, waitForConnection } from '../pi-extension/subagents/launch-process.ts';
-import { backgroundLaunchCommand } from '../pi-extension/subagents/terminal-launch.ts';
+import { directLaunchCommand } from '../pi-extension/subagents/terminal-launch.ts';
 import { childLaunchSpec } from '../pi-extension/subagents/launch.ts';
 import { createRunRuntime } from '../pi-extension/subagents/runtime.ts';
 
@@ -37,23 +37,52 @@ test('direct exec failures are available to the parent without leaking the envir
   } finally { launch.dispose(); }
 });
 
-test('background launch plans use unique workspaces or detached targeted splits, and fail closed otherwise', () => {
+test('direct launch plans use visible targeted splits and never default to the active pane', () => {
   const spec = { name: 'same name', runId: 'one', cwd: tmpdir(), argv: ['/node', '/launcher', '/private-spec'] };
-  const one = backgroundLaunchCommand('wezterm', spec);
-  const two = backgroundLaunchCommand('wezterm', { ...spec, runId: 'two' });
-  assert.notEqual(one.workspace, two.workspace);
-  assert.ok(one.args.includes('--new-window'));
-  assert.ok(one.args.includes('--workspace'));
-  assert.deepEqual(one.args.slice(one.args.indexOf('--') + 1), spec.argv);
-  const old = process.env.TMUX_PANE;
+  const old = { WEZTERM_PANE: process.env.WEZTERM_PANE, TMUX_PANE: process.env.TMUX_PANE };
   try {
+    process.env.WEZTERM_PANE = '0';
+    const one = directLaunchCommand('wezterm', spec);
+    assert.deepEqual(one.args, ['cli', 'split-pane', '--pane-id', '0', '--right', '--percent', '50', '--cwd', spec.cwd, '--', ...spec.argv]);
+    assert.ok(!one.args.includes('--new-window') && !one.args.includes('--workspace'));
     process.env.TMUX_PANE = '%9';
-    const tmux = backgroundLaunchCommand('tmux', spec);
+    const tmux = directLaunchCommand('tmux', spec);
     assert.ok(tmux.args.includes('-d'));
     assert.equal(tmux.args[tmux.args.indexOf('-t') + 1], '%9');
     assert.deepEqual(tmux.args.slice(tmux.args.indexOf('--') + 1), spec.argv);
-  } finally { if (old === undefined) delete process.env.TMUX_PANE; else process.env.TMUX_PANE = old; }
-  for (const backend of ['cmux', 'zellij', null] as const) assert.throws(() => backgroundLaunchCommand(backend, spec), /No terminal input was sent/);
+    for (const backend of ['wezterm', 'tmux'] as const) {
+      const key = backend === 'wezterm' ? 'WEZTERM_PANE' : 'TMUX_PANE';
+      for (const value of [undefined, '', 'not-a-pane']) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+        assert.throws(() => directLaunchCommand(backend, spec), /explicit originating pane/);
+      }
+    }
+  } finally {
+    for (const [key, value] of Object.entries(old)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+  }
+  for (const backend of ['cmux', 'zellij', null] as const) assert.throws(() => directLaunchCommand(backend, spec), /No terminal input was sent/);
+});
+
+test('subsequent splits target only owned siblings in the originating tab and preserve parent space', () => {
+  const old = process.env.WEZTERM_PANE;
+  try {
+    process.env.WEZTERM_PANE = '0';
+    const spec = { name: 'next', runId: 'two', cwd: tmpdir(), argv: ['/node'], siblingSurfaces: ['0', '2', '3', '4', '5'] };
+    const panes = [
+      { pane_id: 0, tab_id: 1, window_id: 1, size: { rows: 100 } },
+      { pane_id: 1, tab_id: 1, window_id: 1, size: { rows: 200 } }, // Not owned.
+      { pane_id: 2, tab_id: 1, window_id: 1, size: { rows: 20 } },
+      { pane_id: 3, tab_id: 1, window_id: 1, size: { rows: 40 } },
+      { pane_id: 4, tab_id: 9, window_id: 1, size: { rows: 200 } }, // Other tab.
+      { pane_id: 5, tab_id: 1, window_id: 9, size: { rows: 200 } }, // Other window.
+    ];
+    const next = directLaunchCommand('wezterm', spec, panes);
+    assert.equal(next.args[next.args.indexOf('--pane-id') + 1], '3');
+    assert.ok(next.args.includes('--bottom'));
+    const fallback = directLaunchCommand('wezterm', { ...spec, siblingSurfaces: ['4', '5', '999'] }, panes);
+    assert.equal(fallback.args[fallback.args.indexOf('--pane-id') + 1], '0');
+    assert.ok(fallback.args.includes('--right'));
+  } finally { if (old === undefined) delete process.env.WEZTERM_PANE; else process.env.WEZTERM_PANE = old; }
 });
 
 test('startup observation waits for a connection, not simply a successful spawn', async () => {

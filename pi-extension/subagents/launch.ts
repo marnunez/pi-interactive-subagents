@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mkdirSync, rmSync } from "node:fs";
 import { prepareLaunch, type LaunchSpec } from "./launch-process.ts";
-import { assertBackgroundLaunchAvailable, launchBackgroundSurface } from "./terminal-launch.ts";
+import { assertDirectLaunchAvailable, launchVisibleSurface } from "./terminal-launch.ts";
 import { loadAgentDefaults, resolveChildTools } from "./config.ts";
 import { type ChildRunConfig } from "./launch-config.ts";
 import { closeSurface } from "./cmux.ts";
@@ -67,7 +67,7 @@ export async function launchSubagent(runtime: RunRuntime,
     onFailed: (running: RunningSubagent, error: unknown) => void;
   },
 ): Promise<RunningSubagent> {
-  assertBackgroundLaunchAvailable();
+  assertDirectLaunchAvailable();
   const startTime = Date.now();
   const runId = randomUUID();
   const ipcToken = createIpcToken();
@@ -180,9 +180,9 @@ export async function launchSubagent(runtime: RunRuntime,
 
     options.onPrepared(running);
     prepared = running;
-    Object.assign(running, launchBackgroundSurface({
+    Object.assign(running, launchVisibleSurface({
       runId, name: params.name, cwd: effectiveCwd, argv: launch.argv,
-      workspaceLabel: params.workspace ?? agentDefs?.workspace,
+      siblingSurfaces: [...runtime.runningSubagents.values()].map(run => run.surface).filter(Boolean),
     }));
     surface = running.surface;
     options.onLaunched(running);

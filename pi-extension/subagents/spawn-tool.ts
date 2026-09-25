@@ -15,7 +15,7 @@ export function registerSpawnTool(pi: ExtensionAPI, runtime: RunRuntime, control
       name: "subagent",
       label: "Subagent",
       description:
-        "Launch a sub-agent directly without terminal typing or stealing focus. " +
+        "Launch a sub-agent directly in a visible terminal split without typing shell commands. Terminal focus may change. " +
         "Waits for the child's authenticated startup connection, then returns while the task runs asynchronously. " +
         "Do not fabricate or assume its result. " + SUBAGENT_ASYNC_GUIDANCE,
       promptSnippet:
@@ -89,7 +89,7 @@ export function registerSpawnTool(pi: ExtensionAPI, runtime: RunRuntime, control
             pi.appendEntry(IPC_LAUNCH_ENTRY, serializeRunning(running));
             runtime.runningSubagents.set(running.id, running);
             reportChildren();
-            scheduleConnectionFailure(running.id, 120_000, "Subagent did not connect before the startup deadline. No task execution is confirmed; inspect its workspace/session for the cause.");
+            scheduleConnectionFailure(running.id, 120_000, "Subagent did not connect before the startup deadline. No task execution is confirmed; inspect its pane/session for the cause.");
           },
           onLaunched: recordSurface,
           onFailed: (running, error) => finishSubagent({
@@ -107,8 +107,7 @@ export function registerSpawnTool(pi: ExtensionAPI, runtime: RunRuntime, control
             {
               type: "text",
               text:
-                `Sub-agent "${params.name}" connected without changing your focus. Task results are delivered asynchronously. ` +
-                (running.backgroundWorkspace ? `WezTerm workspace: ${running.backgroundWorkspace}. ` : "") +
+                `Sub-agent "${params.name}" connected in visible pane ${running.surface}. Terminal focus may change. Task results are delivered asynchronously. ` +
                 `Do not generate or assume any result. ${SUBAGENT_ASYNC_GUIDANCE}`,
             },
           ],
@@ -121,7 +120,7 @@ export function registerSpawnTool(pi: ExtensionAPI, runtime: RunRuntime, control
             task: params.task,
             agent: params.agent,
             sessionFile: running.sessionFile,
-            backgroundWorkspace: running.backgroundWorkspace,
+            surface: running.surface,
             status: "started",
           },
         };
@@ -163,7 +162,7 @@ export function registerSpawnTool(pi: ExtensionAPI, runtime: RunRuntime, control
             theme.fg("accent", "▸") +
             " " +
             theme.fg("toolTitle", theme.bold(name)) +
-            theme.fg("dim", " — connected") +
+            theme.fg("dim", ` — connected${details.surface ? `, pane ${details.surface}` : ""}`) +
             (details.backgroundWorkspace ? "\n" + theme.fg("dim", `Workspace: ${details.backgroundWorkspace}`) : ""),
             0,
             0,

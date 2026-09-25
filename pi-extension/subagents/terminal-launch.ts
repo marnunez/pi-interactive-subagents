@@ -6,39 +6,57 @@ export interface TerminalLaunch {
   name: string;
   cwd: string;
   argv: string[];
-  workspaceLabel?: string;
+  siblingSurfaces?: string[];
 }
 
-export function assertBackgroundLaunchAvailable(backend = getMuxBackend()): void {
+interface WezTermPane {
+  pane_id: number;
+  tab_id: number;
+  window_id: number;
+  size?: { rows: number };
+}
+
+export function assertDirectLaunchAvailable(backend = getMuxBackend()): void {
   if (backend !== "wezterm" && backend !== "tmux") {
-    throw new Error("Focus-safe direct launches require WezTerm or tmux. No terminal input was sent; this backend has no verified background launch implementation.");
+    throw new Error("Direct launches require WezTerm or tmux. No terminal input was sent; this backend has no verified direct launch implementation.");
+  }
+  const parent = backend === "wezterm" ? process.env.WEZTERM_PANE : process.env.TMUX_PANE;
+  if (!parent || !(backend === "wezterm" ? /^\d+$/ : /^%\d+$/).test(parent)) {
+    throw new Error(`${backend} launch requires an explicit originating pane`);
   }
 }
 
-export function backgroundLaunchCommand(backend: MuxBackend | null, launch: TerminalLaunch) {
-  assertBackgroundLaunchAvailable(backend);
+export function directLaunchCommand(backend: MuxBackend | null, launch: TerminalLaunch, panes: WezTermPane[] = []) {
+  assertDirectLaunchAvailable(backend);
   if (!/^[a-zA-Z0-9_-]+$/.test(launch.runId)) throw new Error("Invalid launch run ID");
   if (!launch.argv.length) throw new Error("A direct launch programme is required");
   if (backend === "wezterm") {
-    // CLI spawn always activates its new tab. A unique, inactive workspace has
-    // no GUI window to focus: the GUI only materialises the active workspace.
-    // Never switch then restore focus; even that brief switch can steal typing.
-    const label = (launch.workspaceLabel ?? launch.name).replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 60);
-    const workspace = `pi-subagent · ${label} · ${launch.runId}`;
-    return { executable: "wezterm", args: ["cli", "spawn", "--new-window", "--domain-name", "local", "--workspace", workspace, "--cwd", launch.cwd, "--", ...launch.argv], workspace };
+    const parent = process.env.WEZTERM_PANE!;
+    const origin = panes.find(pane => String(pane.pane_id) === parent);
+    // Keep the parent half intact: subsequent agents subdivide the tallest
+    // owned sibling in the same tab. Never split an arbitrary active pane.
+    const siblings = new Set(launch.siblingSurfaces);
+    const sibling = origin && panes
+      .filter(pane => String(pane.pane_id) !== parent && siblings.has(String(pane.pane_id)) && pane.tab_id === origin.tab_id && pane.window_id === origin.window_id)
+      .sort((a, b) => (b.size?.rows ?? 0) - (a.size?.rows ?? 0))[0];
+    const target = sibling ? String(sibling.pane_id) : parent;
+    return { executable: "wezterm", args: ["cli", "split-pane", "--pane-id", target, sibling ? "--bottom" : "--right", "--percent", "50", "--cwd", launch.cwd, "--", ...launch.argv] };
   }
-  const parent = process.env.TMUX_PANE;
-  if (!parent || !/^%\d+$/.test(parent)) throw new Error("tmux launch requires an explicit originating pane");
-  return { executable: "tmux", args: ["split-window", "-d", "-h", "-t", parent, "-c", launch.cwd, "-P", "-F", "#{pane_id}", "--", ...launch.argv], workspace: undefined };
+  return { executable: "tmux", args: ["split-window", "-d", "-h", "-t", process.env.TMUX_PANE!, "-c", launch.cwd, "-P", "-F", "#{pane_id}", "--", ...launch.argv] };
 }
 
-export function launchBackgroundSurface(launch: TerminalLaunch) {
-  const command = backgroundLaunchCommand(getMuxBackend(), launch);
+export function launchVisibleSurface(launch: TerminalLaunch) {
+  const backend = getMuxBackend();
+  assertDirectLaunchAvailable(backend);
+  const panes: WezTermPane[] = backend === "wezterm" && launch.siblingSurfaces?.length
+    ? JSON.parse(execFileSync("wezterm", ["cli", "list", "--format", "json"], { encoding: "utf8", timeout: 3000 }))
+    : [];
+  const command = directLaunchCommand(backend, launch, panes);
   const surface = execFileSync(command.executable, command.args, { encoding: "utf8", timeout: 15_000 }).trim();
   if (!(command.executable === "wezterm" ? /^\d+$/ : /^%\d+$/).test(surface)) {
     throw new Error("Terminal launch did not return a valid pane identity; inspect the mux before retrying.");
   }
-  return { surface, backgroundWorkspace: command.workspace };
+  return { surface };
 }
 
 export function surfaceAlive(surface: string): boolean | undefined {

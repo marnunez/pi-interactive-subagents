@@ -16,7 +16,7 @@ async function fixture(action: (h: any) => Promise<void>) {
   for (const [name, file] of [['wezterm', 'fake-mux.mjs'], ['pi', 'fake-pi.mjs']]) {
     writeFileSync(join(directory, name), `#!${process.execPath}\nimport ${JSON.stringify(new URL(`./fixtures/${file}`, import.meta.url).href)};\n`, { mode: 0o700 });
   }
-  const overrides = { PATH: `${directory}:${process.env.PATH}`, PI_SUBAGENT_MUX: 'wezterm', WEZTERM_UNIX_SOCKET: 'test-only-no-real-gui', TEST_LAUNCH_DIR: directory, TEST_PARENT_SESSION: parentFile, TEST_CHILD_MODE: '', PI_DENY_TOOLS: '' };
+  const overrides = { PATH: `${directory}:${process.env.PATH}`, PI_SUBAGENT_MUX: 'wezterm', WEZTERM_UNIX_SOCKET: 'test-only-no-real-gui', WEZTERM_PANE: '0', TEST_LAUNCH_DIR: directory, TEST_PARENT_SESSION: parentFile, TEST_CHILD_MODE: '', PI_DENY_TOOLS: '' };
   const saved = Object.fromEntries(Object.keys(overrides).map(key => [key, process.env[key]]));
   Object.assign(process.env, overrides);
   const hooks = new Map<string, Function[]>(), tools = new Map<string, any>();
@@ -54,7 +54,7 @@ async function fixture(action: (h: any) => Promise<void>) {
   }
 }
 
-test('fresh launch and resume use direct argv in inactive workspaces, journal before execution, and wait for IPC', async () => {
+test('fresh launch and resume use direct argv in visible splits, journal before execution, and wait for IPC', async () => {
   await fixture(async h => {
     const updates: any[] = [];
     let resolved = false;
@@ -67,7 +67,9 @@ test('fresh launch and resume use direct argv in inactive workspaces, journal be
     assert.equal(updates[0].details.status, 'connecting');
     const restored = restoreRunLedger(h.entries.filter((entry: any) => entry.customType !== 'subagent_ipc_finish')).unresolved[0];
     assert.match(restored.surface, /^\d+$/);
-    assert.equal(restored.backgroundWorkspace, fresh.details.backgroundWorkspace);
+    assert.equal(restored.surface, fresh.details.surface);
+    assert.equal(restored.backgroundWorkspace, undefined);
+    assert.match(fresh.content[0].text, /visible pane/);
     assert.ok(Number.isInteger(restored.childPid), 'later PID metadata must not overwrite the recorded pane identity');
     await h.until(() => h.messages.length === 1);
     const resumed = await h.tools.get('subagent_resume').execute('resume', { sessionPath: fresh.details.sessionFile, message: 'follow-up' }, undefined, undefined, h.ctx);
@@ -79,14 +81,25 @@ test('fresh launch and resume use direct argv in inactive workspaces, journal be
     assert.ok(launches.every((launch: any) => launch.journalledBeforeStart));
     assert.ok(launches.every((launch: any) => launch.argv[0] === 'pi' && launch.cwd === h.directory));
     const calls = h.readLines('mux-calls.jsonl');
-    assert.ok(calls.every((args: string[]) => ['spawn', 'list', 'kill-pane'].includes(args[1])));
-    const spawns = calls.filter((args: string[]) => args[1] === 'spawn');
+    assert.ok(calls.every((args: string[]) => ['split-pane', 'list', 'kill-pane'].includes(args[1])));
+    const spawns = calls.filter((args: string[]) => args[1] === 'split-pane');
     assert.equal(spawns.length, 2);
-    assert.ok(spawns.every((args: string[]) => args.includes('--new-window') && args.includes('--workspace') && args.includes('--')));
-    assert.notEqual(fresh.details.backgroundWorkspace, resumed.details.backgroundWorkspace);
+    assert.ok(spawns.every((args: string[]) => args[args.indexOf('--pane-id') + 1] === '0' && args.includes('--right') && args.includes('--')));
+    assert.ok(spawns.every((args: string[]) => !args.includes('--new-window') && !args.includes('--workspace')));
+    assert.match(resumed.details.surface, /^\d+$/);
+    assert.match(resumed.content[0].text, /visible pane/);
     const ledger = restoreRunLedger(h.entries);
     assert.equal(ledger.unresolved.length, 0);
     assert.equal(ledger.finishes.size, 2);
+  });
+});
+
+test('missing originating pane fails before recording a run or calling the mux', async () => {
+  await fixture(async h => {
+    delete process.env.WEZTERM_PANE;
+    await assert.rejects(() => h.tools.get('subagent').execute('spawn', { name: 'missing pane', task: 'fixture' }, undefined, undefined, h.ctx), /explicit originating pane/);
+    assert.equal(h.entries.length, 0);
+    assert.equal(existsSync(join(h.directory, 'mux-calls.jsonl')), false);
   });
 });
 

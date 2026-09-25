@@ -54,12 +54,6 @@ export const SubagentParams = Type.Object({
         "Fork the current session — sub-agent gets full conversation context. Use for iterate/bugfix patterns.",
     }),
   ),
-  workspace: Type.Optional(
-    Type.String({
-      description:
-        "Optional label for the child's background WezTerm workspace. A unique run suffix is added. Never switches your active workspace or keyboard focus.",
-    }),
-  ),
 });
 
 export type SubagentParamsValue = Static<typeof SubagentParams>;
