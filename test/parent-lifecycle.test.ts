@@ -18,7 +18,7 @@ async function until(predicate: () => boolean) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
-function harness(entries: any[] = [], sessionId = crypto.randomUUID()) {
+function harness(entries: any[] = [], sessionId = crypto.randomUUID(), deniedTools = "") {
   const hooks = new Map<string, Function[]>();
   const tools = new Map<string, any>();
   const messages: any[] = [];
@@ -39,7 +39,17 @@ function harness(entries: any[] = [], sessionId = crypto.randomUUID()) {
     ui: { notify() {} },
     sessionManager: { getEntries: () => entries, getBranch: () => entries, getSessionId: () => sessionId },
   };
-  extension(pi as any);
+  // Model the synthetic parent's policy, not whichever worker launches the test
+  // process. Registration samples the policy synchronously; restore it before
+  // running any hooks so this fixture never relaxes its caller's restrictions.
+  const inheritedDenials = process.env.PI_DENY_TOOLS;
+  try {
+    process.env.PI_DENY_TOOLS = deniedTools;
+    extension(pi as any);
+  } finally {
+    if (inheritedDenials === undefined) delete process.env.PI_DENY_TOOLS;
+    else process.env.PI_DENY_TOOLS = inheritedDenials;
+  }
   const emit = async (event: string, payload: any = {}) => {
     for (const hook of hooks.get(event) ?? []) await hook(payload, ctx);
   };
@@ -60,6 +70,26 @@ function connect(h: ReturnType<typeof harness>, run: any, received: string[] = [
   cleanups.push(() => client.stop());
   return client;
 }
+
+test("parent fixture isolates and restores an ambient worker tool policy", () => {
+  const previous = process.env.PI_DENY_TOOLS;
+  const workerPolicy = "subagent,subagent_resume,subagents_list,subagent_kill";
+  try {
+    process.env.PI_DENY_TOOLS = workerPolicy;
+    const h = harness();
+    for (const name of workerPolicy.split(",")) assert.ok(h.tools.has(name), name);
+    assert.equal(process.env.PI_DENY_TOOLS, workerPolicy);
+  } finally {
+    if (previous === undefined) delete process.env.PI_DENY_TOOLS;
+    else process.env.PI_DENY_TOOLS = previous;
+  }
+});
+
+test("an explicitly restricted parent still does not register denied tools", () => {
+  const policy = "subagent,subagent_resume,subagents_list,subagent_kill";
+  const h = harness([], crypto.randomUUID(), policy);
+  for (const name of policy.split(",")) assert.equal(h.tools.has(name), false, name);
+});
 
 test("nested child processes start their own orchestration socket", async () => {
   const previous = process.env.PI_SUBAGENT_ID;
