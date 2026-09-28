@@ -1,23 +1,18 @@
 ---
 name: plan
-description: Interactive planning and implementation through asynchronous Pi subagents.
+description: Plan a change with optional focused delegation.
 ---
 
 # Planning workflow
 
-1. Briefly inspect the project with read/bash. Delegate deeper reconnaissance to a scout if useful.
-2. Spawn a planner with the user's task, constraints and your findings. The user can work directly in its terminal.
-3. Do independent work or end the current turn silently. Never poll children. A planner asking the user a question remains open; its answer is not completion.
-4. After the planner calls `subagent_done`, read its plan using `read_artifact` and inspect the todos. Confirm implementation scope with the user.
-5. Delegate implementation to workers. Use sequential workers in a shared worktree, or clearly partition files/use separate worktrees for concurrent tasks. Require checks and explicit completion results.
-6. Delegate review. State whether the reviewer may edit or must report findings only. Address substantive findings and verify again.
+1. Inspect the relevant project context and clarify requirements with the user where needed.
+2. Compare sensible approaches, recommend one and agree on the scope before implementation.
+3. Write a plan only when its complexity warrants one. Do not create todos or a fixed agent pipeline by default.
+4. Delegate an independent, bounded investigation if it would save context or time. Say whether it may edit and what result to return. Use the profile's general-purpose agent if present, or omit `agent` to use inherited capabilities. Do not poll: completion arrives as an event.
+5. When the user approves implementation, do the work directly or delegate clearly partitioned work. Verify changes and report remaining uncertainties.
 
 ```typescript
-subagent({ name: "Planner", agent: "planner", task: "Plan the requested change. Context: ..." });
-// Later, after the completion event and user approval:
-subagent({ name: "Worker", agent: "worker", task: "Implement TODO-xxxx. Plan artifact: plans/feature.md. Run the relevant tests." });
+subagent({ name: "Investigate auth", task: "Trace authentication and report relevant code paths with file references. Do not edit files." });
 ```
 
-All subagents are interactive; there is no `interactive` parameter. Use descriptive names and child `set_tab_title` for progress. Do not instruct users to close the planner with Ctrl+D as a substitute for completion: the planner should finish its current run with `subagent_done` and reference the plan and todo IDs. The same session can be resumed later for revisions.
-
-Before declaring the overall work complete, verify requested changes, checks, todo status, review findings and publication requirements. Never infer success merely because a child stopped speaking.
+Agents share the filesystem, not isolated worktrees; partition concurrent edits or use separate worktrees. Child completion requires `subagent_done`. Do not infer success merely because a child stops speaking.
