@@ -59,8 +59,12 @@ function agentDirectories(
 ): Array<{ path: string; source: string }> {
   const directories: Array<{ path: string; source: string }> = [];
   if (projectTrusted) directories.push({ path: join(cwd, ".pi", "agents"), source: "project" });
-  directories.push({ path: profileAgentsDir(), source: "profile" });
-  directories.push({ path: bundledAgentsDir, source: "bundled" });
+  const profileDir = profileAgentsDir();
+  directories.push({ path: profileDir, source: "profile" });
+  // An explicit profile catalogue can opt out of the bundled role defaults.
+  if (!existsSync(join(profileDir, ".no-bundled"))) {
+    directories.push({ path: bundledAgentsDir, source: "bundled" });
+  }
   return directories;
 }
 
