@@ -20,6 +20,7 @@ export interface SubagentResult {
   diagnosticSummary?: string;
   result?: SubagentDoneResult;
   sessionFile?: string;
+  worktreePath?: string;
   exitCode?: number;
   elapsed: number;
   error?: string;
@@ -47,6 +48,7 @@ export interface RunningSubagent {
   surface: string;
   startTime: number;
   sessionFile: string;
+  worktreePath?: string;
   entries?: number;
   bytes?: number;
   forkCleanupFile?: string;

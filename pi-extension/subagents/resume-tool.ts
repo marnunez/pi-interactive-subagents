@@ -17,6 +17,7 @@ import { type RunningSubagent } from "./types.ts";
 import { childLaunchSpec } from "./launch.ts";
 import { type RunRuntime, IPC_LAUNCH_ENTRY } from "./runtime.ts";
 import { type RunController } from "./controller.ts";
+import { assertManagedWorktree } from "./worktree.ts";
 
 export function registerResumeTool(pi: ExtensionAPI, runtime: RunRuntime, controller: RunController, shouldRegister: (name: string) => boolean) {
   const { serializeRunning, finishSubagent, reportChildren, scheduleConnectionFailure, recordSurface, awaitStartup, startWidgetRefresh } = controller;
@@ -106,6 +107,7 @@ export function registerResumeTool(pi: ExtensionAPI, runtime: RunRuntime, contro
         const depth = Number(process.env.PI_SUBAGENT_DEPTH ?? "0");
         if (!Number.isSafeInteger(depth) || depth >= 4) throw new Error("Subagent nesting limit (4) reached.");
         const correlation = readSubagentSessionCorrelation(sessionFile);
+        if (correlation.worktreePath) assertManagedWorktree(correlation.worktreePath, correlation.cwd);
         const savedConfig = readChildRunConfig(join(getSessionArtifactDir(sessionFile), "context/subagent-config.json"));
         const legacyDefs = !savedConfig && correlation.agent
           ? loadAgentDefaults(correlation.agent, correlation.cwd, correlation.cwd === ctx.cwd && ctx.isProjectTrusted()) : null;
@@ -143,7 +145,7 @@ export function registerResumeTool(pi: ExtensionAPI, runtime: RunRuntime, contro
             id: runId, runId, childSessionId: correlation.childSessionId,
             resumeOfRunId: correlation.originatingRunId, mode: "resume", name,
             agent: config.agent, task: params.message ?? "resumed session", surface: "",
-            startTime, sessionFile, ipcToken, autoExit: false, config, launch,
+            startTime, sessionFile, worktreePath: correlation.worktreePath, ipcToken, autoExit: false, config, launch,
           };
           runtime.parentIpcServer.registerChild(runId, ipcToken);
           pi.appendEntry(IPC_LAUNCH_ENTRY, serializeRunning(running));
@@ -173,7 +175,7 @@ export function registerResumeTool(pi: ExtensionAPI, runtime: RunRuntime, contro
         startWidgetRefresh();
 
         return {
-          content: [{ type: "text", text: `Session "${name}" resumed and connected in visible pane ${running.surface}. Terminal focus may change. Task results arrive asynchronously. ${SUBAGENT_ASYNC_GUIDANCE}` }],
+          content: [{ type: "text", text: `Session "${name}" resumed and connected in visible pane ${running.surface}.${running.worktreePath ? ` Worktree: ${running.worktreePath}. Review and integrate changes manually; it is retained.` : ""} Terminal focus may change. Task results arrive asynchronously. ${SUBAGENT_ASYNC_GUIDANCE}` }],
           details: {
             id: runId,
             runId,
@@ -184,6 +186,7 @@ export function registerResumeTool(pi: ExtensionAPI, runtime: RunRuntime, contro
             name,
             sessionPath: sessionFile,
             sessionFile,
+            worktreePath: correlation.worktreePath,
             status: "started",
           },
         };

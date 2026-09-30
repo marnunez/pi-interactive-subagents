@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { EventEmitter } from 'node:events';
 import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
 import extension from '../pi-extension/subagents/index.ts';
 import { restoreRunLedger } from '../pi-extension/subagents/run-ledger.ts';
 
@@ -91,6 +92,50 @@ test('fresh launch and resume use direct argv in visible splits, journal before 
     const ledger = restoreRunLedger(h.entries);
     assert.equal(ledger.unresolved.length, 0);
     assert.equal(ledger.finishes.size, 2);
+  });
+});
+
+test('opt-in child uses its own checkout, keeps lineage and resumes there without touching parent files', async () => {
+  await fixture(async h => {
+    const git = (...args: string[]) => execFileSync('git', ['-C', h.directory, ...args], { encoding: 'utf8' }).trim();
+    git('init', '-q');
+    writeFileSync(join(h.directory, 'tracked.txt'), 'base\n');
+    git('add', 'tracked.txt');
+    git('-c', 'user.email=test@example.org', '-c', 'user.name=Test', 'commit', '-qm', 'base');
+    writeFileSync(join(h.directory, 'tracked.txt'), 'dirty parent\n');
+    const child = await h.tools.get('subagent').execute('spawn', { name: 'isolated', task: 'fixture', worktree: true }, undefined, undefined, h.ctx);
+    const path = child.details.worktreePath;
+    assert.ok(path.startsWith(join(h.directory, '.git', 'pi-subagent-checkouts')));
+    assert.equal(readFileSync(join(path, 'tracked.txt'), 'utf8'), 'base\n');
+    assert.equal(h.readLines('launches.jsonl')[0].cwd, path);
+    const header = JSON.parse(readFileSync(child.details.sessionFile, 'utf8').split('\n')[0]);
+    assert.equal(header.cwd, path);
+    const metadata = JSON.parse(readFileSync(child.details.sessionFile, 'utf8').split('\n')[1]).data;
+    assert.equal(metadata.worktreePath, path);
+    await h.until(() => h.messages.length === 1);
+    assert.equal(h.messages[0].details.worktreePath, path);
+    assert.match(h.messages[0].content, /integrate into the target checkout explicitly/);
+    writeFileSync(join(path, 'child.txt'), 'child only');
+    const resumed = await h.tools.get('subagent_resume').execute('resume', { sessionPath: child.details.sessionFile, message: 'follow-up' }, undefined, undefined, h.ctx);
+    assert.equal(resumed.details.worktreePath, path);
+    assert.equal(h.readLines('launches.jsonl')[1].cwd, path);
+    assert.equal(readFileSync(join(h.directory, 'tracked.txt'), 'utf8'), 'dirty parent\n');
+    assert.equal(existsSync(join(h.directory, 'child.txt')), false);
+  });
+});
+
+test('resume refuses a removed managed checkout instead of falling back to the parent cwd', async () => {
+  await fixture(async h => {
+    const git = (...args: string[]) => execFileSync('git', ['-C', h.directory, ...args], { encoding: 'utf8' }).trim();
+    git('init', '-q');
+    writeFileSync(join(h.directory, 'tracked.txt'), 'base');
+    git('add', 'tracked.txt');
+    git('-c', 'user.email=test@example.org', '-c', 'user.name=Test', 'commit', '-qm', 'base');
+    const child = await h.tools.get('subagent').execute('spawn', { name: 'isolated', task: 'fixture', worktree: true }, undefined, undefined, h.ctx);
+    await h.until(() => h.messages.length === 1);
+    git('worktree', 'remove', child.details.worktreePath);
+    await assert.rejects(() => h.tools.get('subagent_resume').execute('resume', { sessionPath: child.details.sessionFile }, undefined, undefined, h.ctx), /Managed worktree unavailable/);
+    assert.equal(h.readLines('launches.jsonl').length, 1);
   });
 });
 
