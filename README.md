@@ -42,6 +42,16 @@ subagent_resume({ sessionPath: "/absolute/session.jsonl", message: "Now check th
 
 Multiple tool calls launch concurrent children. They share the filesystem, not isolated worktrees: partition edits or use separate worktrees. Nested delegation is supported to a maximum depth of four. Finish or cancel descendants before completing their parent run.
 
+### Mid-task messages
+
+Use the exact `runId` from `subagent` or `subagent_resume` to contact an **active, connected child of this parent**:
+
+```typescript
+subagent_message({ runId: "<active-run-id>", message: "Please also check the error path." });
+```
+
+The tool returns only when the child acknowledges accepting the message into Pi as a **custom advisory message**. It steers an active turn or triggers a new one when idle; it does **not** confirm that the child read, followed, or completed the request. Parent agent text is never treated as a user message or user approval. Names, past session IDs, completed runs and another parent's runs are not valid addresses. The parent retries unacknowledged messages for up to 10 seconds, including across brief IPC disconnects; a timeout or shutdown reports uncertain delivery, not success. Duplicate frames are suppressed while the child's extension stays loaded; a reload/crash between dispatch and acknowledgement can lead to a repeated advisory message. Do not use messaging as a status poll or for non-idempotent instructions.
+
 ## Completion protocol
 
 When finished, the child calls:
@@ -77,6 +87,7 @@ Results include run/session IDs, the session path and elapsed time. The model re
 - `subagents_list`: list effective definitions.
 - `subagent_resume`: reuse a session with optional `name` and `message`. Without a message it opens interactively. Saved role/model/tools are restored; automatic exit is disabled.
 - `subagent_kill`: cancel by ID, name match or `all`. Omit the target only for an explicit user request to inspect running children—not polling.
+- `subagent_message`: send an advisory note to one connected, active child by its exact run ID; wait for delivery acknowledgement, not task completion.
 - `subagent_done`: child-only terminal result.
 - `set_tab_title`: child-only progress title.
 - `write_artifact`: child-only session artifact storage.
@@ -171,6 +182,7 @@ Keep actual Pi smoke sessions outside the extension checkout: Pi auto-discovers 
 
 - `launch.ts`, `launch-process.ts/.mjs`, `terminal-launch.ts`: session preparation, private direct process launch and visible, explicitly targeted mux splits.
 - `controller.ts`, `runtime.ts`, `types.ts`: orchestration, recovery, cancellation, IPC events and instance-owned state.
+- `message-tool.ts`: addressed parent-to-child messaging and delivery acknowledgement.
 - `spawn-tool.ts`, `resume-tool.ts`, `management-tools.ts`, `commands.ts`: tool/command registration and input handling.
 - `presentation.ts`, `widget.ts`, `renderers.ts`: result text, status widgets and TUI rendering.
 - `config.ts`, `policy.ts`, `launch-config.ts`: agent discovery, capabilities, guidance and resume settings.

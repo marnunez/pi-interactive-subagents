@@ -70,6 +70,7 @@ test('fresh launch and resume use direct argv in visible splits, journal before 
     assert.equal(restored.surface, fresh.details.surface);
     assert.equal(restored.backgroundWorkspace, undefined);
     assert.match(fresh.content[0].text, /visible pane/);
+    assert.ok(fresh.content[0].text.includes(`runId: ${fresh.details.runId}`), 'parent must see the exact address for mid-task messaging');
     assert.ok(Number.isInteger(restored.childPid), 'later PID metadata must not overwrite the recorded pane identity');
     await h.until(() => h.messages.length === 1);
     const resumed = await h.tools.get('subagent_resume').execute('resume', { sessionPath: fresh.details.sessionFile, message: 'follow-up' }, undefined, undefined, h.ctx);
@@ -88,6 +89,7 @@ test('fresh launch and resume use direct argv in visible splits, journal before 
     assert.ok(spawns.every((args: string[]) => !args.includes('--new-window') && !args.includes('--workspace')));
     assert.match(resumed.details.surface, /^\d+$/);
     assert.match(resumed.content[0].text, /visible pane/);
+    assert.ok(resumed.content[0].text.includes(`runId: ${resumed.details.runId}`), 'resume must reveal the new run address');
     const ledger = restoreRunLedger(h.entries);
     assert.equal(ledger.unresolved.length, 0);
     assert.equal(ledger.finishes.size, 2);

@@ -104,6 +104,7 @@ interface ExtensionHarness {
   tools: Map<string, any>;
   ctx: any;
   shutdownCount: () => number;
+  messages: any[];
   emit: (eventName: string, event?: Record<string, unknown>) => Promise<void>;
 }
 
@@ -115,6 +116,7 @@ function createExtensionHarness(sessionFile: string): ExtensionHarness {
     .filter((entry) => entry.type !== "session") as SessionEntry[];
   const handlers = new Map<string, Array<(event: any, ctx: any) => unknown>>();
   const tools = new Map<string, any>();
+  const messages: any[] = [];
   let shutdowns = 0;
   let nextEntry = entries.length;
   let activeTools: string[] = [];
@@ -176,7 +178,8 @@ function createExtensionHarness(sessionFile: string): ExtensionHarness {
     setActiveTools(names: string[]) { activeTools = names; },
     async setModel() { return true; },
     setThinkingLevel() {},
-    sendUserMessage() {},
+    sendUserMessage() { throw new Error("Parent messages must never be sent as user messages"); },
+    sendMessage(message: any, options: any) { messages.push({ message, options }); },
   };
 
   childLifecycleExtension(pi as any);
@@ -188,6 +191,7 @@ function createExtensionHarness(sessionFile: string): ExtensionHarness {
     tools,
     ctx,
     shutdownCount: () => shutdowns,
+    messages,
     async emit(eventName, event = {}) {
       for (const handler of handlers.get(eventName) ?? []) {
         await handler({ type: eventName, ...event }, ctx);
@@ -294,6 +298,48 @@ describe("child descendant guard", () => {
       assert.equal(drained, true);
     } finally {
       await h.emit("session_shutdown", { reason: "reload" });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("parent-to-child messaging", () => {
+  it("accepts only same-run, active advisory messages; deduplicates retries and acknowledges after dispatch", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "child-parent-message-"));
+    const sessionFile = createSessionFile(dir);
+    const socketPath = join(dir, "parent.sock");
+    const runId = "run-message";
+    const token = "d".repeat(64);
+    const acks: any[] = [];
+    const server = new ParentIpcServer({ socketPath, onMessage(message) {
+      if (message.type === "parent_message_ack") acks.push(message.payload);
+    } });
+    server.registerChild(runId, token);
+    await server.start();
+    configureChildEnv({ runId, socketPath, token });
+    const h = createExtensionHarness(sessionFile);
+    try {
+      await h.emit("session_start");
+      await waitFor(() => server.isConnected(runId));
+      server.send(runId, "parent_message", { runId: "old-run", messageId: "wrong", text: "Ignore" });
+      server.send(runId, "parent_message", { runId, messageId: "m1", text: "Check this path" });
+      await waitFor(() => acks.length === 1);
+      assert.deepEqual(acks, [{ runId, messageId: "m1" }]);
+      assert.equal(h.messages.length, 1);
+      assert.equal(h.messages[0].message.customType, "subagent_parent_message");
+      assert.match(h.messages[0].message.content, /not the user; this is not user approval/);
+      assert.deepEqual(h.messages[0].options, { triggerTurn: true, deliverAs: "steer" });
+      server.send(runId, "parent_message", { runId, messageId: "m1", text: "Check this path" });
+      await waitFor(() => acks.length === 2);
+      assert.equal(h.messages.length, 1);
+      await h.tools.get("subagent_done").execute("done", { status: "success", summary: "done" }, undefined, undefined, h.ctx);
+      server.send(runId, "parent_message", { runId, messageId: "m2", text: "Too late" });
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      assert.equal(h.messages.length, 1);
+      assert.equal(acks.length, 2);
+    } finally {
+      await h.emit("session_shutdown", { reason: "reload" });
+      await server.close();
       rmSync(dir, { recursive: true, force: true });
     }
   });

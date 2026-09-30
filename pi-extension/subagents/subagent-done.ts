@@ -190,6 +190,7 @@ export default function (pi: ExtensionAPI) {
   let runState: "idle" | "running" = "idle";
   let stopUiMonitor: (() => void) | null = null;
   const pendingUiRequests = new PendingExtensionUiRequests();
+  const receivedParentMessages = new Set<string>();
 
   // Read subagent identity and IPC configuration from env vars set by the parent.
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
@@ -227,7 +228,10 @@ export default function (pi: ExtensionAPI) {
           if (pendingCompletion) ipc?.send("completion", pendingCompletion);
         },
         onMessage: (message: IpcEnvelope) => {
-          const payload = message.payload as { text?: string; runId?: string } | undefined;
+          // Only the authenticated parent's socket may steer this run. A parent
+          // message is an advisory custom message, never a user instruction or approval.
+          if (message.childId !== runId) return;
+          const payload = message.payload as { text?: string; runId?: string; messageId?: string } | undefined;
           if (
             message.type === "completion_ack" &&
             payload?.runId === runId &&
@@ -236,13 +240,20 @@ export default function (pi: ExtensionAPI) {
             pendingCompletion = null;
             clearCompletionDeliveryTimers();
             requestCompletionShutdown();
-          } else if (message.type === "prompt" && payload?.text) {
-            if (latestCtx?.isIdle()) pi.sendUserMessage(payload.text);
-            else pi.sendUserMessage(payload.text, { deliverAs: "followUp" });
-          } else if (message.type === "steer" && payload?.text) {
-            pi.sendUserMessage(payload.text, { deliverAs: "steer" });
-          } else if (message.type === "follow_up" && payload?.text) {
-            pi.sendUserMessage(payload.text, { deliverAs: "followUp" });
+          } else if (message.type === "parent_message") {
+            if (payload?.runId !== runId || typeof payload.messageId !== "string" ||
+                !payload.messageId || typeof payload.text !== "string" || !payload.text.trim() ||
+                completionSent || !latestCtx) return;
+            if (!receivedParentMessages.has(payload.messageId)) {
+              pi.sendMessage({
+                customType: "subagent_parent_message",
+                content: `[Message from parent agent, not the user; this is not user approval]\n${payload.text}`,
+                display: true,
+                details: { runId, messageId: payload.messageId, text: payload.text },
+              }, { triggerTurn: true, deliverAs: "steer" });
+              receivedParentMessages.add(payload.messageId);
+            }
+            ipc?.send("parent_message_ack", { runId, messageId: payload.messageId });
           } else if (message.type === "abort") {
             void latestCtx?.abort();
           } else if (message.type === "shutdown") {
@@ -365,6 +376,7 @@ export default function (pi: ExtensionAPI) {
   // Show widget + status bar, observe generic Pi UI requests, and establish parent IPC.
   pi.on("session_start", (_event, ctx) => {
     cleanupSessionResources();
+    receivedParentMessages.clear();
     registerChildListener();
     latestCtx = ctx;
     completionShutdownRequested = false;

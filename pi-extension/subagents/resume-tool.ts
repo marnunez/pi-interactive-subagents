@@ -173,7 +173,7 @@ export function registerResumeTool(pi: ExtensionAPI, runtime: RunRuntime, contro
         startWidgetRefresh();
 
         return {
-          content: [{ type: "text", text: `Session "${name}" resumed and connected in visible pane ${running.surface}. Terminal focus may change. Task results arrive asynchronously. ${SUBAGENT_ASYNC_GUIDANCE}` }],
+          content: [{ type: "text", text: `Session "${name}" resumed and connected in visible pane ${running.surface} (runId: ${runId}). Terminal focus may change. Task results arrive asynchronously. ${SUBAGENT_ASYNC_GUIDANCE}` }],
           details: {
             id: runId,
             runId,
