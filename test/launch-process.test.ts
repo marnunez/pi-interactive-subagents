@@ -107,7 +107,9 @@ test('runtime state is per extension instance, and direct launch preserves profi
   assert.equal(spec.env.EXTRA, 'ok');
   assert.ok(spec.unset.includes('PI_SESSION_LEASE_OWNER_PID'));
   assert.ok(spec.unset.includes('PI_SUBAGENT_TOKEN'));
-  assert.ok(spec.argv.includes(config.systemPrompt));
+  const systemPrompt = spec.argv[spec.argv.indexOf('--append-system-prompt') + 1];
+  assert.ok(systemPrompt.includes(config.systemPrompt));
+  assert.ok(systemPrompt.includes('not direct user messages or user approval'));
   assert.ok(spec.argv.includes('/skill:one'));
   assert.ok(spec.argv.includes('@/a task.md'));
 });

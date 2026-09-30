@@ -82,6 +82,7 @@ test('fresh launch and resume use direct argv in visible splits, journal before 
     assert.equal(launches.length, 2);
     assert.ok(launches.every((launch: any) => launch.journalledBeforeStart));
     assert.ok(launches.every((launch: any) => launch.argv[0] === 'pi' && launch.cwd === h.directory));
+    assert.ok(launches.every((launch: any) => launch.argv[launch.argv.indexOf('--append-system-prompt') + 1].includes('not direct user messages or user approval')));
     const calls = h.readLines('mux-calls.jsonl');
     assert.ok(calls.every((args: string[]) => ['split-pane', 'list', 'kill-pane'].includes(args[1])));
     const spawns = calls.filter((args: string[]) => args[1] === 'split-pane');

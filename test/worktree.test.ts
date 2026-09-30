@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createManagedWorktree, discardCleanManagedWorktree, assertManagedWorktree } from '../pi-extension/subagents/worktree.ts';
@@ -51,6 +51,14 @@ test('rollback refuses modified, untracked and ignored child files, and resume f
   const clean = createManagedWorktree(root, crypto.randomUUID());
   assert.equal(discardCleanManagedWorktree(clean.path), true);
   assert.throws(() => assertManagedWorktree(clean.path, clean.cwd), /Managed worktree unavailable/);
+}));
+
+test('resume rejects a symlink from the removed checkout to the parent repository', () => fixture(root => {
+  const child = createManagedWorktree(root, crypto.randomUUID());
+  const path = child.path;
+  git(root, 'worktree', 'remove', path);
+  symlinkSync(root, path, 'dir');
+  assert.throws(() => assertManagedWorktree(path, path), /Managed worktree unavailable/);
 }));
 
 test('nested delegation creates a distinct sibling checkout and leaves the first child alone', () => fixture(root => {

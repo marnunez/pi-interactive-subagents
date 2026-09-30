@@ -57,7 +57,9 @@ export function assertManagedWorktree(path: string, cwd: string): void {
   try {
     const root = realpathSync(git(cwd, "rev-parse", "--show-toplevel"));
     const common = realpathSync(git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"));
-    if (root !== realpathSync(path) || resolve(path) !== join(common, "pi-subagent-checkouts", path.split(sep).at(-1)!) ||
+    const canonicalPath = realpathSync(path);
+    if (canonicalPath !== resolve(path) || root !== canonicalPath ||
+        resolve(path) !== join(common, "pi-subagent-checkouts", path.split(sep).at(-1)!) ||
         !git(cwd, "worktree", "list", "--porcelain").split("\n").includes(`worktree ${root}`)) {
       throw new Error("not a registered checkout");
     }

@@ -10,7 +10,7 @@ import { closeSurface } from "./cmux.ts";
 import { createSubagentSession, selectForkHistory, type SessionEntry, type SubagentSessionMode } from "./session.ts";
 import { ensureSessionArtifactDir, getSessionArtifactDir, writeArtifactFile } from "../session-artifacts/paths.ts";
 import { createIpcToken } from "./ipc.ts";
-import { SUBAGENT_COMPLETION_INSTRUCTION, type SubagentParamsValue, withChildOnlyTools, qualifyModelWithProvider, resolveEffectiveChildCwd, PROFILE_ENV_NAMES, NON_INHERITED_RUNTIME_ENV_NAMES, customAgentEnvironment } from "./policy.ts";
+import { PARENT_MESSAGE_AUTHORITY_GUIDANCE, SUBAGENT_COMPLETION_INSTRUCTION, type SubagentParamsValue, withChildOnlyTools, qualifyModelWithProvider, resolveEffectiveChildCwd, PROFILE_ENV_NAMES, NON_INHERITED_RUNTIME_ENV_NAMES, customAgentEnvironment } from "./policy.ts";
 import { type RunningSubagent } from "./types.ts";
 import { type RunRuntime } from "./runtime.ts";
 import { createManagedWorktree, discardCleanManagedWorktree } from "./worktree.ts";
@@ -25,7 +25,7 @@ export function forkConversation(branch: SessionEntry[]): SessionEntry[] {
 export function childLaunchSpec(runtime: RunRuntime, config: ChildRunConfig, runId: string, name: string, sessionFile: string, cwd: string, promptPath?: string): LaunchSpec {
   const argv = ["pi", "--session", sessionFile, "--tools", config.tools.join(",")];
   if (config.model) argv.push("--model", config.thinking ? `${config.model}:${config.thinking}` : config.model);
-  if (config.systemPrompt) argv.push("--append-system-prompt", config.systemPrompt);
+  argv.push("--append-system-prompt", [config.systemPrompt, PARENT_MESSAGE_AUTHORITY_GUIDANCE].filter(Boolean).join("\n\n"));
   for (const skill of config.skills?.split(",").map((skill) => skill.trim()).filter(Boolean) ?? []) argv.push(`/skill:${skill}`);
   argv.push("-e", join(dirname(fileURLToPath(import.meta.url)), "subagent-done.ts"));
   if (promptPath) argv.push(`@${promptPath}`);
