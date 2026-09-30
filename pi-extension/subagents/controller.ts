@@ -1,5 +1,6 @@
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { resolve } from "node:path";
+import { randomUUID } from "node:crypto";
 import { statSync, existsSync, unlinkSync } from "node:fs";
 import { waitForConnection } from "./launch-process.ts";
 import { surfaceAlive } from "./terminal-launch.ts";
@@ -19,6 +20,47 @@ export function createController(pi: ExtensionAPI, runtime: RunRuntime) {
   const reportChildren = () => pi.events?.emit("subagent:children", runtime.runningSubagents.size);
   let unsubscribeChildren: (() => void) | undefined;
   const connectionFailureTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const pendingMessages = new Map<string, { run: RunningSubagent; stop: (error?: Error) => void }>();
+
+  const sendToChild = (runId: string, text: string): Promise<void> => {
+    const running = runtime.runningSubagents.get(runId);
+    if (!runtime.acceptIpcResults || !running || running.runId !== runId ||
+        !running.connected || !runtime.parentIpcServer?.isConnected(runId)) {
+      throw new Error("No connected, active child with that exact run ID.");
+    }
+    const epoch = runtime.epoch;
+    const messageId = randomUUID();
+    return new Promise<void>((resolveAck, rejectAck) => {
+      let stopped = false;
+      const stop = (error?: Error) => {
+        if (stopped) return;
+        stopped = true;
+        clearInterval(retry);
+        clearTimeout(deadline);
+        pendingMessages.delete(messageId);
+        if (error) rejectAck(error);
+        else resolveAck();
+      };
+      const retrySend = () => {
+        if (runtime.epoch !== epoch || runtime.runningSubagents.get(runId) !== running || !runtime.acceptIpcResults) {
+          stop(new Error("Child run or parent session changed before delivery acknowledgement."));
+          return;
+        }
+        if (runtime.parentIpcServer?.isConnected(runId)) {
+          runtime.parentIpcServer.send(runId, "parent_message", { runId, messageId, text });
+        }
+      };
+      const retry = setInterval(retrySend, 250);
+      const deadline = setTimeout(() => stop(new Error("No child delivery acknowledgement within 10 seconds; delivery is uncertain.")), 10_000);
+      pendingMessages.set(messageId, { run: running, stop });
+      retrySend();
+    });
+  };
+  const failPendingMessages = (run?: RunningSubagent) => {
+    for (const pending of [...pendingMessages.values()]) {
+      if (!run || pending.run === run) pending.stop(new Error("Child run ended before delivery acknowledgement; delivery is uncertain."));
+    }
+  };
 
   const serializeRunning = (running: RunningSubagent) => ({
     id: running.id,
@@ -74,6 +116,7 @@ export function createController(pi: ExtensionAPI, runtime: RunRuntime) {
     });
     completedRuns.set(childId, correlatedResult);
     runtime.runningSubagents.delete(childId);
+    failPendingMessages(running);
     reportChildren();
     const failureTimer = connectionFailureTimers.get(childId);
     if (failureTimer) clearTimeout(failureTimer);
@@ -228,6 +271,13 @@ export function createController(pi: ExtensionAPI, runtime: RunRuntime) {
 
   const handleIpcMessage = (message: IpcEnvelope) => {
     if (!runtime.acceptIpcResults) return;
+    if (message.type === "parent_message_ack") {
+      const payload = message.payload as { runId?: unknown; messageId?: unknown } | undefined;
+      const pending = typeof payload?.messageId === "string" ? pendingMessages.get(payload.messageId) : undefined;
+      if (pending && pending.run.id === message.childId && pending.run.runId === payload?.runId &&
+          runtime.runningSubagents.get(message.childId) === pending.run) pending.stop();
+      return;
+    }
     if (message.type === "shutdown_ready") {
       cleanupTimers.get(message.childId)?.cleanup();
       return;
@@ -368,6 +418,7 @@ export function createController(pi: ExtensionAPI, runtime: RunRuntime) {
   // Capture UI context, restore unresolved launches, and start the IPC server.
   pi.on("session_start", async (_event, ctx) => {
     runtime.epoch++;
+    failPendingMessages();
     runtime.latestCtx = ctx;
     drainPromise = undefined;
     registerLifecycleListeners();
@@ -456,6 +507,7 @@ export function createController(pi: ExtensionAPI, runtime: RunRuntime) {
   // Preserve child processes across /reload; terminate them for real parent-session shutdowns.
   pi.on("session_shutdown", async (event, _ctx) => {
     runtime.epoch++;
+    failPendingMessages();
     if (event.reason !== "reload") await drainChildren();
     runtime.acceptIpcResults = false;
     if (runtime.widgetInterval) clearInterval(runtime.widgetInterval);
@@ -475,6 +527,6 @@ export function createController(pi: ExtensionAPI, runtime: RunRuntime) {
   });
 
 
-  return { serializeRunning, finishSubagent, reportChildren, scheduleConnectionFailure, recordSurface, awaitStartup, updateWidget, startWidgetRefresh };
+  return { serializeRunning, finishSubagent, reportChildren, scheduleConnectionFailure, recordSurface, awaitStartup, updateWidget, startWidgetRefresh, sendToChild };
 }
 export type RunController = ReturnType<typeof createController>;

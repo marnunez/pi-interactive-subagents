@@ -35,6 +35,7 @@ const SPAWNING_TOOLS = new Set([
   "subagents_list",
   "subagent_resume",
   "subagent_kill",
+  "subagent_message",
 ]);
 
 const CHILD_TOOLS = [

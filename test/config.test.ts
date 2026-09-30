@@ -178,6 +178,7 @@ describe("child tool policy", () => {
     "subagents_list",
     "subagent_resume",
     "subagent_kill",
+    "subagent_message",
     "web_search",
     "database_query",
   ];
@@ -241,10 +242,10 @@ describe("child tool policy", () => {
     assert.deepEqual(
       resolveChildTools(
         {
-          allowTools: "read,subagent,subagents_list,subagent_resume,subagent_kill,set_tab_title",
+          allowTools: "read,subagent,subagents_list,subagent_resume,subagent_kill,subagent_message,set_tab_title",
           spawning: false,
         },
-        ["read", "subagent", "subagents_list", "subagent_resume", "subagent_kill"],
+        ["read", "subagent", "subagents_list", "subagent_resume", "subagent_kill", "subagent_message"],
         registered,
       ),
       ["read", "subagent_done", "set_tab_title"],

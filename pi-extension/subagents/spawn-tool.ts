@@ -107,7 +107,7 @@ export function registerSpawnTool(pi: ExtensionAPI, runtime: RunRuntime, control
             {
               type: "text",
               text:
-                `Sub-agent "${params.name}" connected in visible pane ${running.surface}. Terminal focus may change. Task results are delivered asynchronously. ` +
+                `Sub-agent "${params.name}" connected in visible pane ${running.surface} (runId: ${running.runId}). Terminal focus may change. Task results are delivered asynchronously. ` +
                 `Do not generate or assume any result. ${SUBAGENT_ASYNC_GUIDANCE}`,
             },
           ],

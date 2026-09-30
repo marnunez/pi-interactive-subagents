@@ -110,6 +110,92 @@ test("nested child processes start their own orchestration socket", async () => 
   assert.equal(h.events.listenerCount("subagent:drain"), 1);
 });
 
+test("mid-task message requires an exact owned run and its matching acknowledgement", async () => {
+  const a = childRun();
+  const b = childRun();
+  const parent = harness(a.entries);
+  const otherParent = harness(b.entries);
+  await parent.emit("session_start");
+  await otherParent.emit("session_start");
+  const delivered: any[] = [];
+  let welcomed = false;
+  const child = new ChildIpcClient({
+    socketPath: getIpcSocketPath(parent.sessionId), childId: a.run.id, token: a.run.ipcToken,
+    helloPayload: () => ({}),
+    onMessage: (frame) => {
+      if (frame.type === "welcome") welcomed = true;
+      if (frame.type === "parent_message") delivered.push(frame.payload);
+    },
+  });
+  child.start();
+  cleanups.push(() => child.stop());
+  await until(() => welcomed);
+  await assert.rejects(() => otherParent.tools.get("subagent_message").execute("x", { runId: a.run.id, message: "wrong parent" }), /No connected, active child/);
+  await assert.rejects(() => parent.tools.get("subagent_message").execute("x", { runId: b.run.id, message: "wrong run" }), /No connected, active child/);
+  const call = parent.tools.get("subagent_message").execute("x", { runId: a.run.id, message: "Check edge case" });
+  await until(() => delivered.length > 0);
+  const first = delivered[0];
+  assert.equal(first.runId, a.run.id);
+  assert.equal(first.text, "Check edge case");
+  child.send("parent_message_ack", { runId: b.run.id, messageId: first.messageId });
+  child.send("parent_message_ack", { runId: a.run.id, messageId: "wrong-id" });
+  await until(() => delivered.length >= 2);
+  assert.equal(delivered[1].messageId, first.messageId);
+  child.send("parent_message_ack", { runId: a.run.id, messageId: first.messageId });
+  const result = await call;
+  assert.equal(result.details.acknowledged, true);
+  assert.equal(result.details.runId, a.run.id);
+});
+
+test("message retries across a brief disconnect, and fails when the addressed run ends", async () => {
+  const { run, entries } = childRun();
+  const h = harness(entries);
+  await h.emit("session_start");
+  let welcomed = false;
+  let firstMessage: any;
+  const child = new ChildIpcClient({
+    socketPath: getIpcSocketPath(h.sessionId), childId: run.id, token: run.ipcToken,
+    helloPayload: () => ({}),
+    onMessage: (frame) => {
+      if (frame.type === "welcome") welcomed = true;
+      if (frame.type === "parent_message") firstMessage = frame.payload;
+    },
+  });
+  child.start();
+  cleanups.push(() => child.stop());
+  await until(() => welcomed);
+  const pending = h.tools.get("subagent_message").execute("x", { runId: run.id, message: "retry me" });
+  await until(() => !!firstMessage);
+  child.stop();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  welcomed = false;
+  const replay: any[] = [];
+  let acknowledge = true;
+  const reconnected = new ChildIpcClient({
+    socketPath: getIpcSocketPath(h.sessionId), childId: run.id, token: run.ipcToken,
+    helloPayload: () => ({}),
+    onMessage: (frame) => {
+      if (frame.type === "welcome") welcomed = true;
+      if (frame.type === "parent_message") {
+        replay.push(frame.payload);
+        if (acknowledge) reconnected.send("parent_message_ack", { runId: run.id, messageId: frame.payload.messageId });
+      }
+    },
+  });
+  reconnected.start();
+  cleanups.push(() => reconnected.stop());
+  await pending;
+  assert.equal(replay[0].messageId, firstMessage.messageId);
+  acknowledge = false;
+  const next = h.tools.get("subagent_message").execute("y", { runId: run.id, message: "cancel me" });
+  // Attach a rejection handler before cancelling, so the rejected promise is observed.
+  const failed = assert.rejects(next, /run ended before delivery acknowledgement/);
+  await until(() => replay.length >= 2);
+  await h.tools.get("subagent_kill").execute("kill", { target: run.id });
+  await failed;
+  await assert.rejects(() => h.tools.get("subagent_message").execute("z", { runId: run.id, message: "too late" }), /No connected, active child/);
+});
+
 test("completion is journalled once before ack and duplicate frames do not duplicate delivery", async () => {
   const { run, entries, result } = childRun();
   const h = harness(entries);

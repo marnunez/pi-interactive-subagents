@@ -7,6 +7,7 @@ import { createController } from "./controller.ts";
 import { registerSpawnTool } from "./spawn-tool.ts";
 import { registerResumeTool } from "./resume-tool.ts";
 import { registerManagementTools } from "./management-tools.ts";
+import { registerMessageTool } from "./message-tool.ts";
 import { registerCommands } from "./commands.ts";
 import { registerRenderers } from "./renderers.ts";
 
@@ -32,6 +33,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   registerSpawnTool(pi, runtime, controller, shouldRegister);
   registerResumeTool(pi, runtime, controller, shouldRegister);
   registerManagementTools(pi, runtime, controller, shouldRegister);
+  registerMessageTool(pi, controller, shouldRegister);
   registerCommands(pi);
   registerRenderers(pi);
 }
