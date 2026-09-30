@@ -74,6 +74,7 @@ export function createController(pi: ExtensionAPI, runtime: RunRuntime) {
     surface: running.surface,
     startTime: running.startTime,
     sessionFile: running.sessionFile,
+    worktreePath: running.worktreePath,
     forkCleanupFile: running.forkCleanupFile,
     workspace: running.workspace,
     previousWorkspace: running.previousWorkspace,
@@ -105,6 +106,7 @@ export function createController(pi: ExtensionAPI, runtime: RunRuntime) {
       resumeOfRunId: running.resumeOfRunId,
       mode: running.mode,
       sessionFile: running.sessionFile,
+      worktreePath: running.worktreePath,
     };
 
     // Commit the outcome BEFORE acknowledgement or process cleanup. If message

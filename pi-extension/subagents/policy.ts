@@ -48,6 +48,9 @@ export const SubagentParams = Type.Object({
         "Working directory for the sub-agent. The agent starts in this folder and picks up its local .pi/ config, CLAUDE.md, skills, and extensions. Use for role-specific subfolders.",
     }),
   ),
+  worktree: Type.Optional(Type.Boolean({
+    description: "Opt in to a separate managed Git checkout for this child, including read-only agents. Child changes must be integrated manually; this is not a security sandbox.",
+  })),
   fork: Type.Optional(
     Type.Boolean({
       description:

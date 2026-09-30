@@ -13,6 +13,7 @@ import { createIpcToken } from "./ipc.ts";
 import { SUBAGENT_COMPLETION_INSTRUCTION, type SubagentParamsValue, withChildOnlyTools, qualifyModelWithProvider, resolveEffectiveChildCwd, PROFILE_ENV_NAMES, NON_INHERITED_RUNTIME_ENV_NAMES, customAgentEnvironment } from "./policy.ts";
 import { type RunningSubagent } from "./types.ts";
 import { type RunRuntime } from "./runtime.ts";
+import { createManagedWorktree, discardCleanManagedWorktree } from "./worktree.ts";
 
 export function forkConversation(branch: SessionEntry[]): SessionEntry[] {
   const history = selectForkHistory(branch).filter((entry) =>
@@ -91,26 +92,36 @@ export async function launchSubagent(runtime: RunRuntime,
 
   // Resolve and create the actual child cwd before the child session header is written.
   const rawCwd = params.cwd ?? agentDefs?.cwd;
-  const effectiveCwd = resolveEffectiveChildCwd(rawCwd, ctx.cwd);
-  mkdirSync(effectiveCwd, { recursive: true });
-
   const mode: SubagentSessionMode = params.fork ? "fork" : "fresh";
   const historyEntries = params.fork
     ? forkConversation(ctx.sessionManager.getBranch() as SessionEntry[])
     : [];
-  const createdSession = createSubagentSession({
-    sessionDir: dirname(parentSessionFile),
-    cwd: effectiveCwd,
-    parentSessionId: ctx.sessionManager.getSessionId(),
-    parentSessionFile,
-    parentLeafId: ctx.sessionManager.getLeafId(),
-    runId,
-    name: params.name,
-    agent: params.agent,
-    mode,
-    task: params.task,
-    historyEntries,
-  });
+  const requestedCwd = resolveEffectiveChildCwd(rawCwd, ctx.cwd);
+  if (!params.worktree) mkdirSync(requestedCwd, { recursive: true });
+  const managed = params.worktree ? createManagedWorktree(requestedCwd, runId) : undefined;
+  const effectiveCwd = managed?.cwd ?? requestedCwd;
+  let createdSession: ReturnType<typeof createSubagentSession>;
+  try {
+    createdSession = createSubagentSession({
+      sessionDir: dirname(parentSessionFile),
+      cwd: effectiveCwd,
+      parentSessionId: ctx.sessionManager.getSessionId(),
+      parentSessionFile,
+      parentLeafId: ctx.sessionManager.getLeafId(),
+      runId,
+      name: params.name,
+      agent: params.agent,
+      mode,
+      task: params.task,
+      worktreePath: managed?.path,
+      historyEntries,
+    });
+  } catch (error) {
+    if (managed && !discardCleanManagedWorktree(managed.path)) {
+      throw new Error(`Session preparation failed; worktree preserved at ${managed.path}: ${String(error)}`, { cause: error });
+    }
+    throw error;
+  }
   const { sessionFile: subagentSessionFile, childSessionId } = createdSession;
   let surface = "";
   let launch: ReturnType<typeof prepareLaunch> | undefined;
@@ -139,7 +150,8 @@ export async function launchSubagent(runtime: RunRuntime,
     // additional instructions from the caller.
     const identityParts = [agentDefs?.body, params.systemPrompt].filter(Boolean);
     const identity = identityParts.length > 0 ? identityParts.join("\n\n") : null;
-    const fullTask = `${modeHint}\n\n${tabTitleInstruction}\n\n${params.task}`;
+    const worktreeHint = managed ? `Your checkout is ${managed.path}. Work only there; do not edit the parent's checkout. Report the path and let the parent review and integrate changes manually.` : "";
+    const fullTask = `${modeHint}\n\n${tabTitleInstruction}\n\n${worktreeHint}\n\n${params.task}`;
 
     const qualifiedModelForLock = effectiveModel ? qualifyModelWithProvider(effectiveModel, ctx) : undefined;
 
@@ -172,6 +184,7 @@ export async function launchSubagent(runtime: RunRuntime,
       surface,
       startTime,
       sessionFile: subagentSessionFile,
+      worktreePath: managed?.path,
       ipcToken,
       autoExit: effectiveAutoExit,
       config,
@@ -199,6 +212,9 @@ export async function launchSubagent(runtime: RunRuntime,
     // than leaving an unresumable orphan after pane/artifact setup failed.
     try { rmSync(subagentSessionFile, { force: true }); } catch { }
     try { rmSync(dirname(getSessionArtifactDir(subagentSessionFile)), { recursive: true, force: true }); } catch { }
+    if (managed && !discardCleanManagedWorktree(managed.path)) {
+      throw new Error(`Launch setup failed; worktree preserved at ${managed.path}: ${String(error)}`, { cause: error });
+    }
     throw error;
   }
 }

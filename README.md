@@ -40,7 +40,19 @@ subagent({ name: "Map auth", agent: "scout", task: "Map authentication and write
 subagent_resume({ sessionPath: "/absolute/session.jsonl", message: "Now check the logout path." });
 ```
 
-Multiple tool calls launch concurrent children. They share the filesystem, not isolated worktrees: partition edits or use separate worktrees. Nested delegation is supported to a maximum depth of four. Finish or cancel descendants before completing their parent run.
+By default, multiple children share the parent's filesystem. Set `worktree: true` on `subagent` for an **opt-in separate Git checkout** (including a read-only child if explicitly requested). Nested delegation is supported to a maximum depth of four; a nested child needs its own `worktree: true` to get a further checkout. Finish or cancel descendants before completing their parent run.
+
+### Opt-in Git worktrees
+
+```typescript
+subagent({ name: "Implement", agent: "worker", task: "Change and test the parser", worktree: true });
+```
+
+This requires an existing non-bare Git checkout with a commit (`HEAD`). The checkout is detached at the selected repository's current `HEAD` under its common Git directory, in `.git/pi-subagent-checkouts/<run-id>/` (or the equivalent linked-worktree common directory). Parent staged, unstaged, untracked and ignored files are **not copied**. A `cwd` override must already exist in that repository; a tracked subdirectory is mapped into the new checkout. An untracked-only subdirectory fails rather than silently starting in the parent checkout. A fresh read-only child stays in the requested cwd unless you explicitly set `worktree: true`; this feature does not infer writability from the role or tool list.
+
+The child session header records the actual checkout cwd and its lineage metadata records the worktree root. Spawn, resume, and completion results expose `worktreePath`; the parent should review `git -C <worktreePath> status --short`, `git -C <worktreePath> diff` (and any commits), then integrate via a reviewed commit/cherry-pick or deliberate file transfer. **No automatic merge or deletion occurs after launch**, including on failure, cancellation, or completion. Resume reuses the same checkout and refuses to run if it is missing; it never falls back to the parent checkout. Early setup failures only remove a registered worktree when even ignored/untracked files and tracked changes are absent; otherwise it remains for manual recovery. After integrating, remove it explicitly using `git worktree remove <worktreePath>` only after checking for uncommitted and untracked content.
+
+This is checkout separation, **not a security sandbox**: the child has the same Unix permissions and can access other paths or run Git commands against the parent. Git hooks/config, symlinks, submodules, shared Git metadata, and tools with absolute paths can cross checkout boundaries. Pi's project trust is resolved independently for the new cwd; do not auto-approve unfamiliar project extensions. Dirty parent changes and uncommitted changes in a parent worktree are not inherited, so commit or deliberately copy prerequisites before delegating. A child working in a nested checkout should not assume its parent's uncommitted work is available.
 
 ### Mid-task messages
 
@@ -83,7 +95,7 @@ Results include run/session IDs, the session path and elapsed time. The model re
 
 ## Tools and commands
 
-- `subagent`: spawn with `name`, `task`, optional `agent`, `model`, `systemPrompt`, `tools`, `skills`, `cwd`, `fork`.
+- `subagent`: spawn with `name`, `task`, optional `agent`, `model`, `systemPrompt`, `tools`, `skills`, `cwd`, `fork`, `worktree` (opt-in).
 - `subagents_list`: list effective definitions.
 - `subagent_resume`: reuse a session with optional `name` and `message`. Without a message it opens interactively. Saved role/model/tools are restored; automatic exit is disabled.
 - `subagent_kill`: cancel by ID, name match or `all`. Omit the target only for an explicit user request to inspect running children—not polling.
@@ -180,7 +192,7 @@ Keep actual Pi smoke sessions outside the extension checkout: Pi auto-discovers 
 
 `pi-extension/subagents/index.ts` only wires together a fresh per-parent runtime and registrations:
 
-- `launch.ts`, `launch-process.ts/.mjs`, `terminal-launch.ts`: session preparation, private direct process launch and visible, explicitly targeted mux splits.
+- `launch.ts`, `worktree.ts`, `launch-process.ts/.mjs`, `terminal-launch.ts`: session preparation, opt-in Git checkout, private direct process launch and visible, explicitly targeted mux splits.
 - `controller.ts`, `runtime.ts`, `types.ts`: orchestration, recovery, cancellation, IPC events and instance-owned state.
 - `message-tool.ts`: addressed parent-to-child messaging and delivery acknowledgement.
 - `spawn-tool.ts`, `resume-tool.ts`, `management-tools.ts`, `commands.ts`: tool/command registration and input handling.

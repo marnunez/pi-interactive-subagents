@@ -54,6 +54,12 @@ export function buildSubagentResultContent(details: SubagentResult): string {
     }
   }
 
+  if (details.worktreePath) {
+    lines.push("", `Child worktree: ${details.worktreePath}`,
+      `Review there (git -C '${details.worktreePath.replaceAll("'", "'\\''")}' status --short and git diff); integrate into the target checkout explicitly.`,
+      "No automatic merge or deletion is performed; preserve uncommitted and untracked files.");
+  }
+
   if (details.sessionFile) {
     lines.push("", `Session: ${details.sessionFile}`, `Resume: pi --session ${details.sessionFile}`);
   }

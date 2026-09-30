@@ -1,6 +1,6 @@
 import { readFileSync, appendFileSync, copyFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
 export const SUBAGENT_DONE_RESULT_TYPE = "subagent_done_result";
@@ -58,6 +58,7 @@ export interface SubagentMetadata {
   agent?: string;
   mode: SubagentSessionMode;
   taskDigest: string;
+  worktreePath?: string;
   createdAt: string;
 }
 
@@ -72,6 +73,7 @@ export interface SubagentSessionCorrelation {
   childSessionId: string;
   cwd: string;
   originatingRunId?: string;
+  worktreePath?: string;
 }
 
 export interface MessageEntry extends SessionEntry {
@@ -167,6 +169,7 @@ export function createSubagentSession(options: {
   agent?: string;
   mode: SubagentSessionMode;
   task: string;
+  worktreePath?: string;
   historyEntries?: SessionEntry[];
   createdAt?: string;
   childSessionId?: string;
@@ -189,6 +192,7 @@ export function createSubagentSession(options: {
     agent: options.agent,
     mode: options.mode,
     taskDigest: digestSubagentTask(options.task),
+    ...(options.worktreePath ? { worktreePath: resolve(options.worktreePath) } : {}),
     createdAt,
   };
   const header: SessionHeader = {
@@ -244,7 +248,8 @@ export function readSubagentSessionCorrelation(sessionFile: string): SubagentSes
       typeof metadata.runId !== "string" ||
       metadata.runId.length === 0 ||
       typeof metadata.parentSessionFile !== "string" ||
-      typeof metadata.parentSessionId !== "string"
+      typeof metadata.parentSessionId !== "string" ||
+      (metadata.worktreePath !== undefined && (typeof metadata.worktreePath !== "string" || !isAbsolute(metadata.worktreePath)))
     ) {
       throw new Error(`Session file has invalid subagent metadata: ${sessionFile}`);
     }
@@ -253,6 +258,7 @@ export function readSubagentSessionCorrelation(sessionFile: string): SubagentSes
     childSessionId: header.id,
     cwd: resolve((header as SessionHeader).cwd),
     originatingRunId: metadata?.runId,
+    ...(metadata?.worktreePath ? { worktreePath: metadata.worktreePath } : {}),
     ...(metadata?.agent ? { agent: metadata.agent } : {}),
   };
 }
