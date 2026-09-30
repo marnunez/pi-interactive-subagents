@@ -113,7 +113,7 @@ Discovery precedence:
 
 1. Trusted current project's `.pi/agents/<name>.md`.
 2. `$PI_CODING_AGENT_DIR/agents/<name>.md` (defaults to `~/.pi/agent/agents`).
-3. Bundled `agents/<name>.md`.
+3. Bundled `agents/<name>.md`, unless the active profile's `agents/` directory contains a `.no-bundled` marker file. This lets a profile maintain an explicit catalogue without bundled roles reappearing after it removes an override. Trusted project agents still take precedence.
 
 A configured profile never falls back to the legacy shared directory. The filename is the agent identity; `.chain.md` files are not executable agent definitions. Unknown named agents fail explicitly. Project definitions are ignored when project trust is absent.
 

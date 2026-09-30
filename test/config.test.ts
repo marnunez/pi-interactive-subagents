@@ -78,6 +78,22 @@ describe("agent configuration", () => {
     assert.equal(untrusted?.source, "profile");
   });
 
+  it("allows a profile to opt out of bundled agent defaults", () => {
+    const cwd = temporaryDirectory("no-bundled-cwd");
+    const profile = temporaryDirectory("no-bundled-profile");
+    process.env.PI_CODING_AGENT_DIR = profile;
+
+    writeAgent(profile, "general", "description: General-purpose coding agent");
+    writeProjectAgent(cwd, "special", "description: Project-only agent");
+    assert.ok(loadAgentDefaults("scout", cwd));
+    assert.ok(listAgentDefinitions(cwd).some((agent) => agent.name === "scout"));
+
+    writeFileSync(join(profile, "agents", ".no-bundled"), "");
+    assert.equal(loadAgentDefaults("scout", cwd), null);
+    assert.deepEqual(listAgentDefinitions(cwd, false).map((agent) => agent.name), ["general"]);
+    assert.deepEqual(listAgentDefinitions(cwd).map((agent) => agent.name), ["general", "special"]);
+  });
+
   it("uses filename identity consistently and parses YAML scalar types and quotes", () => {
     const cwd = temporaryDirectory("identity-cwd");
     const profile = temporaryDirectory("identity-profile");
