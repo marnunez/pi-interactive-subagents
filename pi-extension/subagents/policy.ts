@@ -34,7 +34,7 @@ export const SubagentParams = Type.Object({
   agent: Type.Optional(
     Type.String({
       description:
-        "Agent definition name (e.g. worker, scout, reviewer). Uses trusted project agents, the active profile's agents, then bundled defaults.",
+        "Optional named agent definition. Call subagents_list to see which names are available in this project and profile before choosing one; do not guess names. Omit this field to use inherited defaults.",
     }),
   ),
   systemPrompt: Type.Optional(

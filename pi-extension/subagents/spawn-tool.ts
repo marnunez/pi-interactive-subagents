@@ -21,6 +21,7 @@ export function registerSpawnTool(pi: ExtensionAPI, runtime: RunRuntime, control
       promptSnippet:
         "Spawn a sub-agent asynchronously. Do not fabricate its result. " + SUBAGENT_ASYNC_GUIDANCE,
       promptGuidelines: [
+        "Before passing a named agent to subagent, use subagents_list to verify that it is available in the current project and profile; otherwise omit agent to inherit defaults. Do not infer names from examples or earlier sessions.",
         "After using subagent, never poll child status. If no independent work remains, end the turn silently with no text and no further tool calls; child completion arrives as a steer message and triggers the next turn.",
       ],
       parameters: SubagentParams,

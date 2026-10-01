@@ -85,6 +85,14 @@ test("parent fixture isolates and restores an ambient worker tool policy", () =>
   }
 });
 
+test("named-agent guidance uses the live catalogue rather than suggesting bundled roles", () => {
+  const { tools } = harness();
+  const subagent = tools.get("subagent");
+  assert.match(subagent.parameters.properties.agent.description, /subagents_list/);
+  assert.doesNotMatch(subagent.parameters.properties.agent.description, /worker, scout/);
+  assert.ok(subagent.promptGuidelines.some((guideline: string) => guideline.includes("subagents_list")));
+});
+
 test("an explicitly restricted parent still does not register denied tools", () => {
   const policy = "subagent,subagent_resume,subagents_list,subagent_kill";
   const h = harness([], crypto.randomUUID(), policy);
