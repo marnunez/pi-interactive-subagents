@@ -102,6 +102,8 @@ Results include run/session IDs, the session path and elapsed time. The model re
 - `subagent_message`: send an advisory note to one connected, active child by its exact run ID; wait for delivery acknowledgement, not task completion.
 - `subagent_done`: child-only terminal result.
 - `set_tab_title`: child-only progress title.
+- `subagent_search`: optional child-only literal file discovery/content search within the child's cwd.
+- `subagent_git_inspect`: optional child-only fixed-operation Git inspection within the child's cwd.
 - `write_artifact`: child-only session artifact storage.
 - `read_artifact`: retrieve an artifact by name.
 
@@ -146,9 +148,34 @@ Supported frontmatter:
 
 `subagent_done` is always available. `set_tab_title`, `write_artifact` and `read_artifact` are added unless narrowed/denied. Unknown explicit tool names fail with an error. Update old definitions that relied on implicit extension access: e.g. a worker using todos needs `todo` in `tools`, and browser agents must list `browser_*` tools explicitly.
 
-Agent bodies and `systemPrompt` are appended as system instructions for both fresh and forked runs. Forks copy validated active conversation history but not the parent's orchestration ledger. Resume restores saved launch settings without inheriting stale multiplexer or ancestor run variables.
+Agent bodies and `systemPrompt` are appended as system instructions for both fresh and forked runs. Forks copy validated active conversation history but not the parent's orchestration ledger. Resume restores the saved **effective tool selection exactly**, adding only mandatory `subagent_done`; it does not re-add optional conveniences, inherit newly active parent tools or reread changed role defaults. A saved extension selection that is no longer available fails closed. Legacy sessions without a saved configuration still resolve their role defaults. Stale multiplexer or ancestor run variables are not inherited.
 
 **These are capability-selection controls, not a sandbox.** Bash and extensions run with the same Unix-user authority as Pi. Neither profiles nor tool allowlists provide filesystem isolation.
+
+### Read-only reviewer inspection
+
+The bundled reviewer uses `read, subagent_search, subagent_git_inspect`, with `spawning: false` and `deny-tools: write_artifact`; it has **no Bash, test runner or artifact writer**. Reviews are returned through `subagent_done.report`. Profile/project reviewer definitions override this default and must be updated explicitly if they still grant Bash. Reviewer findings should distinguish inspected test evidence from checks actually executed by a worker.
+
+These inspection names are recognised in explicit `tools` lists even though they are not registered in the parent. They are not automatically added or inherited by general children, and `allow-tools` only narrows a selection—it does not grant them. Child registration requires a run identity, explicit selected tool name and no denial. Existing denials, mandatory completion and `spawning: false` remain in force. `worktree: true` still works independently of role selection.
+
+```typescript
+subagent_search({ operation: "files", path: "src", query: ".ts" });
+subagent_search({ operation: "content", path: "src", query: "resolveChildTools", limit: 100 });
+subagent_git_inspect({ operation: "status" });
+subagent_git_inspect({ operation: "diff_staged", path: "src" });
+subagent_git_inspect({ operation: "diff_unstaged", path: "src" });
+subagent_git_inspect({ operation: "log", limit: 10 });
+subagent_git_inspect({ operation: "diff_commit", commit: "HEAD" });
+subagent_git_inspect({ operation: "diff_between", base: "HEAD~2", commit: "HEAD" });
+```
+
+- Search matches literal substrings using filesystem APIs, not regex/glob processing or a shell. `query` is optional for `files`, required/non-empty for `content`; `caseSensitive` defaults to true. In Git checkouts, directory searches use `git ls-files --cached --others --exclude-standard -z`: tracked files and non-ignored untracked files, including hidden files, but not ignored dependency/cache trees or untracked nested checkouts. Explicit regular files can be searched even when ignored. Only a missing Git executable or a positively identified non-repository discovery diagnostic allows a bounded filesystem fallback, which prunes `node_modules`, `.venv`, `venv`, `.cache`, `.pi/git` and nested checkouts; it does not implement arbitrary Git ignore rules. Configuration/include/gitdir failures do not fall back, even when Git exits with code 128. `.git`, discovered symlinks, non-regular, binary (NUL-containing) and >1 MiB files are skipped. Results use JSON-quoted filenames/content with line numbers. Catalogue capture is capped at 1 MiB, enumeration at 20,000 entries, content reads at 16 MiB, and result `limit` at 1–1000 (default 200). Catalogue exhaustion returns incomplete output; fallback entry-cap exhaustion fails rather than claiming completeness.
+- Filenames are captured/enumerated as bytes, never lossy-decoded into paths. The complete captured Git catalogue is checked for valid UTF-8 **before any catalogue source path is opened**; invalid filename encodings refuse the directory search rather than aliasing another Unicode filename (including an ignored U+FFFD name). At the capture cap, an incomplete final filename is discarded and the result is marked incomplete. Valid UTF-8 names containing controls or literal backslashes, and other unsupported relative names, are skipped and counted during discovery without hiding unrelated matches; explicit user paths remain strict. The filesystem fallback also preserves entry bytes and skips/counts unsupported or non-UTF-8 entries.
+- Git operations are strictly `status`, `log`, `diff_unstaged`, `diff_staged`, `diff_commit`, `diff_between`. Commits must be `HEAD`, `HEAD~N` (0–9999), or full 40/64-character object IDs resolving to commits—not paths, blobs, option strings or arbitrary revision expressions. `base` is required only for `diff_between`; `limit` is log-only. No raw flags, alternate cwd, pathspec magic, write operation or test execution is exposed. Paths are literal and scope diffs/status to child cwd (including a nested cwd); porcelain status filenames remain repository-root-relative. Explicitly selected symlink paths and symlink ancestors are refused, but root operations do not recursively pre-scan dependency trees. Git records discovered symlinks as link text/type changes, not dereferenced target contents; tracked directories replaced by links appear as deletions/type changes. Deleted files can still be inspected.
+- Git uses `execFile` argument vectors with a minimal environment, ignoring inherited `GIT_DIR`, `GIT_WORK_TREE`, config injection, diff and pager settings. It disables system/global config, optional locks/index refresh, fsmonitor, hooks, external diff, textconv, signatures, pager, submodule inspection and rename detection. Before each Git invocation it enumerates effective `filter.*.clean`/`filter.*.process` configuration, including local includes and worktree config, then overrides every discovered driver's clean/process/smudge command and disables its `required` flag. Unsupported driver names, >512 drivers or incomplete configuration capture cause refusal, not unsafe execution. Filters are not applied, so raw worktree diffs/status may differ from normal Git results for repositories using content filters. Modern Git's `GIT_NO_LAZY_FETCH=1` disables partial-clone lazy fetching. Each subprocess has a 10-second timeout and a 1 MiB capture cap.
+- Both tools cap model output, including notices, at **50 KiB / 1000 lines**, escape terminal controls, and report truncation/skips. They never write spill files. A truncated result is not a complete review; narrow paths/queries or inspect another commit. Git diffs do not include untracked file contents.
+
+**Not a sandbox:** explicit path checks reject absolute/traversal/`.git` paths and symlinks, and search validates each discovered file and opens regular files with `O_NOFOLLOW`. They cannot protect against hostile concurrent ancestor replacement, filter/config changes between enumeration and execution, or hard links. Git intentionally reads repository metadata/local config (including linked-worktree metadata outside child cwd); Git-controlled config includes/object alternates can also read external metadata. Trust the Git executable and repository metadata. Other selected tools—including built-in `read`, artifact storage and project extensions—retain their normal authority. Checkout isolation is unchanged and is not a permission boundary.
 
 ## Profiles, artifacts and recovery
 
@@ -174,7 +201,7 @@ npm install
 npm test
 ```
 
-Tests cover session lineage, run-scoped persistence, completion retry/acknowledgement, reload recovery, cancellation, nested orchestration sockets, tool policy, profile discovery, artifacts and UI-state monitoring. Launch/resume integration tests execute fake mux/Pi processes with real IPC: they assert journal-before-execution, direct argument handling, visible targeted splits, startup acknowledgement and cancellation. No paid model calls or live desktop operations are used.
+Tests cover session lineage, run-scoped persistence, completion retry/acknowledgement, reload recovery, cancellation, nested orchestration sockets, tool policy, profile discovery, artifacts and UI-state monitoring. Inspection regressions cover explicit child role selection, saved deny-tools on resume, literal search, adversarial paths/args, bounded output, symlinks, nested cwd and linked worktrees, huge ignored dependency/nested trees, tracked links and directory-to-link replacements, hostile inherited Git environment, disabled execution hooks/diff/textconv/clean/process filters (including local, conditional and worktree config), unchanged index bytes/mtime, invalid-byte filename/ignored-Unicode alias prevention, discovered control/backslash names, malformed-config refusal without ignored-secret fallback, and catalogue overflow. Launch/resume integration tests execute fake mux/Pi processes with real IPC: they assert journal-before-execution, direct argument handling, visible targeted splits, startup acknowledgement and cancellation. No paid model calls or live desktop operations are used.
 
 An explicit, optional real-GUI test creates a **separate Xvfb display and WezTerm instance**. It verifies three children share the parent's visible tab, subsequent children preserve parent space, arguments/environment remain literal, and launch performs no terminal typing. It then sends deliberate input to the focused child:
 
@@ -198,6 +225,7 @@ Keep actual Pi smoke sessions outside the extension checkout: Pi auto-discovers 
 - `spawn-tool.ts`, `resume-tool.ts`, `management-tools.ts`, `commands.ts`: tool/command registration and input handling.
 - `presentation.ts`, `widget.ts`, `renderers.ts`: result text, status widgets and TUI rendering.
 - `config.ts`, `policy.ts`, `launch-config.ts`: agent discovery, capabilities, guidance and resume settings.
+- `inspection.ts`, `inspection-tools.ts`: bounded read-only filesystem/Git operations and explicitly selected child-only registration.
 - `ipc.ts`, `session.ts`, `run-ledger.ts`, `termination.ts`, `subagent-done.ts`: transport, persistence, subtree cleanup and child lifecycle.
 
 MIT. Originally based on HazAT/pi-interactive-subagents.

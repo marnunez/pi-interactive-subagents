@@ -3,6 +3,7 @@ import { join, resolve } from "node:path";
 import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { muxSetupHint, shellEscape } from "./cmux.ts";
+import { OPTIONAL_CHILD_INSPECTION_TOOLS } from "./inspection.ts";
 
 export const defineTool = <T>(tool: T): T => tool;
 
@@ -70,7 +71,7 @@ export const CHILD_ONLY_TOOLS = new Set(["subagent_done", "set_tab_title", "writ
 
 export function withChildOnlyTools(allToolNames?: string[]): string[] | undefined {
   if (!allToolNames) return undefined;
-  return [...new Set([...allToolNames, ...CHILD_ONLY_TOOLS])];
+  return [...new Set([...allToolNames, ...CHILD_ONLY_TOOLS, ...OPTIONAL_CHILD_INSPECTION_TOOLS])];
 }
 
 export function readJsonFile<T>(path: string): T | null {

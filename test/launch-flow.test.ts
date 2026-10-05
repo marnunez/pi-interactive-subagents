@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, appendFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, appendFileSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { EventEmitter } from 'node:events';
@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import extension from '../pi-extension/subagents/index.ts';
 import { restoreRunLedger } from '../pi-extension/subagents/run-ledger.ts';
+import { getSessionArtifactDir } from '../pi-extension/session-artifacts/paths.ts';
 
 async function fixture(action: (h: any) => Promise<void>) {
   const directory = mkdtempSync(join(tmpdir(), 'pi-launch-flow-'));
@@ -139,6 +140,29 @@ test('resume refuses a removed managed checkout instead of falling back to the p
     git('worktree', 'remove', child.details.worktreePath);
     await assert.rejects(() => h.tools.get('subagent_resume').execute('resume', { sessionPath: child.details.sessionFile }, undefined, undefined, h.ctx), /Managed worktree unavailable/);
     assert.equal(h.readLines('launches.jsonl').length, 1);
+  });
+});
+
+test('reviewer resume preserves saved deny-tools without adding conveniences or unavailable tools', async () => {
+  await fixture(async h => {
+    const agents = join(h.directory, '.pi', 'agents');
+    mkdirSync(agents, { recursive: true });
+    writeFileSync(join(agents, 'reviewer.md'), '---\ntools: subagent_search, subagent_git_inspect\ndeny-tools: set_tab_title,write_artifact,read_artifact\nspawning: false\n---\nReview only.\n');
+    const child = await h.tools.get('subagent').execute('spawn', { name: 'reviewer', agent: 'reviewer', task: 'fixture' }, undefined, undefined, h.ctx);
+    await h.until(() => h.messages.length === 1);
+    const configPath = join(getSessionArtifactDir(child.details.sessionFile), 'context/subagent-config.json');
+    const saved = JSON.parse(readFileSync(configPath, 'utf8'));
+    assert.deepEqual(saved.tools, ['subagent_search', 'subagent_git_inspect', 'subagent_done']);
+    // A changed role definition must not broaden an existing saved selection.
+    writeFileSync(join(agents, 'reviewer.md'), '---\ntools: subagent,write_artifact\n---\nChanged role.\n');
+    await h.tools.get('subagent_resume').execute('resume', { sessionPath: child.details.sessionFile, message: 'follow-up' }, undefined, undefined, h.ctx);
+    await h.until(() => h.messages.length === 2);
+    const launches = h.readLines('launches.jsonl');
+    assert.ok(launches.every((launch: any) => launch.argv[launch.argv.indexOf('--tools') + 1] === saved.tools.join(',')));
+    saved.tools.push('removed_extension_tool');
+    writeFileSync(configPath, JSON.stringify(saved));
+    await assert.rejects(() => h.tools.get('subagent_resume').execute('resume', { sessionPath: child.details.sessionFile }, undefined, undefined, h.ctx), /Unknown tool.*saved tools/);
+    assert.equal(h.readLines('launches.jsonl').length, 2);
   });
 });
 

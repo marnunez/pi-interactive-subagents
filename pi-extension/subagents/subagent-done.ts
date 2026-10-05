@@ -6,6 +6,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
+import { registerInspectionTools } from "./inspection-tools.ts";
 
 const defineTool = <T>(tool: T): T => tool;
 import {
@@ -169,6 +170,7 @@ export function validateSubagentDoneParams(
 }
 
 export default function (pi: ExtensionAPI) {
+  registerInspectionTools(pi);
   let toolNames: string[] = [];
   let denied: string[] = [];
   let expanded = false;

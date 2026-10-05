@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 import { existsSync, unlinkSync } from "node:fs";
 import { prepareLaunch } from "./launch-process.ts";
 import { assertDirectLaunchAvailable, launchVisibleSurface } from "./terminal-launch.ts";
-import { loadAgentDefaults, resolveChildTools } from "./config.ts";
+import { loadAgentDefaults, resolveChildTools, restoreChildTools } from "./config.ts";
 import { readChildRunConfig, legacyChildDefaults, type ChildRunConfig } from "./launch-config.ts";
 import { isMuxAvailable, closeSurface } from "./cmux.ts";
 import { readSubagentSessionCorrelation } from "./session.ts";
@@ -114,7 +114,9 @@ export function registerResumeTool(pi: ExtensionAPI, runtime: RunRuntime, contro
         const restoredConfig = savedConfig ?? legacyChildDefaults(correlation.agent, legacyDefs);
         const config: ChildRunConfig = {
           ...restoredConfig, schemaVersion: 1,
-          tools: resolveChildTools({ ...legacyDefs, tools: restoredConfig.tools?.join(",") }, pi.getActiveTools(), pi.getAllTools().map((tool) => tool.name)),
+          tools: savedConfig
+            ? restoreChildTools(savedConfig.tools, pi.getAllTools().map((tool) => tool.name))
+            : resolveChildTools({ ...legacyDefs, tools: restoredConfig.tools?.join(",") }, pi.getActiveTools(), pi.getAllTools().map((tool) => tool.name)),
           autoExit: false,
         };
         const runId = randomUUID();
