@@ -33,14 +33,23 @@ export function directLaunchCommand(backend: MuxBackend | null, launch: Terminal
   if (backend === "wezterm") {
     const parent = process.env.WEZTERM_PANE!;
     const origin = panes.find(pane => String(pane.pane_id) === parent);
-    // Keep the parent half intact: subsequent agents subdivide the tallest
-    // owned sibling in the same tab. Never split an arbitrary active pane.
+    if (!origin || !Number.isSafeInteger(origin.window_id) || !Number.isSafeInteger(origin.tab_id)) {
+      throw new Error("Originating WezTerm pane is absent from the live mux; no child was launched.");
+    }
+    // Reconcile active run ownership with the live layout on every launch.
+    // Only an owned, solitary child outside the parent tab can be split. Count
+    // ALL panes, including foreign/completed ones; never use focused panes or
+    // cached tab assignments (children may have moved or died since launch).
     const siblings = new Set(launch.siblingSurfaces);
-    const sibling = origin && panes
-      .filter(pane => String(pane.pane_id) !== parent && siblings.has(String(pane.pane_id)) && pane.tab_id === origin.tab_id && pane.window_id === origin.window_id)
-      .sort((a, b) => (b.size?.rows ?? 0) - (a.size?.rows ?? 0))[0];
-    const target = sibling ? String(sibling.pane_id) : parent;
-    return { executable: "wezterm", args: ["cli", "split-pane", "--pane-id", target, sibling ? "--bottom" : "--right", "--percent", "50", "--cwd", launch.cwd, "--", ...launch.argv] };
+    const sibling = panes.find(pane =>
+      siblings.has(String(pane.pane_id)) && pane.window_id === origin.window_id &&
+      pane.tab_id !== origin.tab_id &&
+      panes.filter(other => other.window_id === pane.window_id && other.tab_id === pane.tab_id).length === 1,
+    );
+    const args = sibling
+      ? ["cli", "split-pane", "--pane-id", String(sibling.pane_id), "--bottom", "--percent", "50"]
+      : ["cli", "spawn", "--window-id", String(origin.window_id)];
+    return { executable: "wezterm", args: [...args, "--cwd", launch.cwd, "--", ...launch.argv] };
   }
   return { executable: "tmux", args: ["split-window", "-d", "-h", "-t", process.env.TMUX_PANE!, "-c", launch.cwd, "-P", "-F", "#{pane_id}", "--", ...launch.argv] };
 }
@@ -48,7 +57,10 @@ export function directLaunchCommand(backend: MuxBackend | null, launch: Terminal
 export function launchVisibleSurface(launch: TerminalLaunch) {
   const backend = getMuxBackend();
   assertDirectLaunchAvailable(backend);
-  const panes: WezTermPane[] = backend === "wezterm" && launch.siblingSurfaces?.length
+  // Selection, direct launch and the caller's surface registration are
+  // synchronous: parallel tools/reload cannot reserve the same slot in this
+  // parent process. No packing counters survive failure or runtime reload.
+  const panes: WezTermPane[] = backend === "wezterm"
     ? JSON.parse(execFileSync("wezterm", ["cli", "list", "--format", "json"], { encoding: "utf8", timeout: 3000 }))
     : [];
   const command = directLaunchCommand(backend, launch, panes);

@@ -18,7 +18,7 @@ async function fixture(action: (h: any) => Promise<void>) {
   for (const [name, file] of [['wezterm', 'fake-mux.mjs'], ['pi', 'fake-pi.mjs']]) {
     writeFileSync(join(directory, name), `#!${process.execPath}\nimport ${JSON.stringify(new URL(`./fixtures/${file}`, import.meta.url).href)};\n`, { mode: 0o700 });
   }
-  const overrides = { PATH: `${directory}:${process.env.PATH}`, PI_SUBAGENT_MUX: 'wezterm', WEZTERM_UNIX_SOCKET: 'test-only-no-real-gui', WEZTERM_PANE: '0', TEST_LAUNCH_DIR: directory, TEST_PARENT_SESSION: parentFile, TEST_CHILD_MODE: '', PI_DENY_TOOLS: '' };
+  const overrides = { PATH: `${directory}:${process.env.PATH}`, PI_SUBAGENT_MUX: 'wezterm', WEZTERM_UNIX_SOCKET: 'test-only-no-real-gui', WEZTERM_PANE: '0', TEST_LAUNCH_DIR: directory, TEST_PARENT_SESSION: parentFile, TEST_CHILD_MODE: '', TEST_MUX_FAIL: '', PI_DENY_TOOLS: '' };
   const saved = Object.fromEntries(Object.keys(overrides).map(key => [key, process.env[key]]));
   Object.assign(process.env, overrides);
   const hooks = new Map<string, Function[]>(), tools = new Map<string, any>();
@@ -56,7 +56,7 @@ async function fixture(action: (h: any) => Promise<void>) {
   }
 }
 
-test('fresh launch and resume use direct argv in visible splits, journal before execution, and wait for IPC', async () => {
+test('fresh launch and resume use direct argv in dedicated child tabs, journal before execution, and wait for IPC', async () => {
   await fixture(async h => {
     const updates: any[] = [];
     let resolved = false;
@@ -85,10 +85,10 @@ test('fresh launch and resume use direct argv in visible splits, journal before 
     assert.ok(launches.every((launch: any) => launch.argv[0] === 'pi' && launch.cwd === h.directory));
     assert.ok(launches.every((launch: any) => launch.argv[launch.argv.indexOf('--append-system-prompt') + 1].includes('not direct user messages or user approval')));
     const calls = h.readLines('mux-calls.jsonl');
-    assert.ok(calls.every((args: string[]) => ['split-pane', 'list', 'kill-pane'].includes(args[1])));
-    const spawns = calls.filter((args: string[]) => args[1] === 'split-pane');
+    assert.ok(calls.every((args: string[]) => ['spawn', 'split-pane', 'list', 'kill-pane'].includes(args[1])));
+    const spawns = calls.filter((args: string[]) => args[1] === 'spawn');
     assert.equal(spawns.length, 2);
-    assert.ok(spawns.every((args: string[]) => args[args.indexOf('--pane-id') + 1] === '0' && args.includes('--right') && args.includes('--')));
+    assert.ok(spawns.every((args: string[]) => args[args.indexOf('--window-id') + 1] === '1' && args.includes('--')));
     assert.ok(spawns.every((args: string[]) => !args.includes('--new-window') && !args.includes('--workspace')));
     assert.match(resumed.details.surface, /^\d+$/);
     assert.match(resumed.content[0].text, /visible pane/);
@@ -213,6 +213,81 @@ test('reload during fresh and resumed startup stops the old wait without cancell
     await h.until(() => h.messages.length === 2);
     assert.ok(h.messages.every((message: any) => message.details.protocolStatus === 'completed'));
     assert.equal(restoreRunLedger(h.entries).unresolved.length, 0);
+  });
+});
+
+test('five concurrent children pack 2/2/1 in the origin window, leaving parent and foreign panes untouched', async () => {
+  await fixture(async h => {
+    process.env.TEST_CHILD_MODE = 'hold';
+    const base = [
+      { pane_id: 0, tab_id: 1, window_id: 7 },
+      { pane_id: 90, tab_id: 1, window_id: 7 }, // foreign pane in parent tab
+      { pane_id: 91, tab_id: 2, window_id: 7 }, // unrelated tab
+      { pane_id: 92, tab_id: 3, window_id: 99, is_active: true }, // another focused window
+    ];
+    writeFileSync(join(h.directory, 'layout.json'), JSON.stringify(base));
+    const children = await Promise.all(Array.from({ length: 5 }, (_, i) => h.tools.get('subagent').execute(`spawn-${i}`, { name: `child-${i}`, task: 'hold' }, undefined, undefined, h.ctx)));
+    const rows = JSON.parse(execFileSync('wezterm', ['cli', 'list', '--format', 'json'], { encoding: 'utf8' }));
+    assert.deepEqual(rows.filter((row: any) => base.some(pane => pane.pane_id === row.pane_id)), base);
+    const childRows = children.map(child => rows.find((row: any) => String(row.pane_id) === child.details.surface));
+    assert.ok(childRows.every(row => row.window_id === 7 && row.tab_id !== 1 && row.tab_id !== 2));
+    assert.deepEqual([...new Set(childRows.map(row => row.tab_id))].map(tab => childRows.filter(row => row.tab_id === tab).length), [2, 2, 1]);
+    const calls = h.readLines('mux-calls.jsonl').filter((args: string[]) => ['spawn', 'split-pane'].includes(args[1]));
+    assert.deepEqual(calls.map((args: string[]) => args[1]), ['spawn', 'split-pane', 'spawn', 'split-pane', 'spawn']);
+    assert.ok(calls.filter((args: string[]) => args[1] === 'spawn').every((args: string[]) => args[args.indexOf('--window-id') + 1] === '7' && !args.includes('--new-window')));
+    assert.ok(h.readLines('launches.jsonl').every((launch: any) => launch.journalledBeforeStart));
+    for (const tool of ['subagent', 'subagent_resume']) {
+      assert.match(h.tools.get(tool).description, /at most two child panes per tab/);
+      assert.match(h.tools.get(tool).promptSnippet, /parent tab is untouched/);
+    }
+  });
+});
+
+test('reload, cancellation and resume reuse only current live capacity', async () => {
+  await fixture(async h => {
+    process.env.TEST_CHILD_MODE = 'hold';
+    const spawn = (name: string) => h.tools.get('subagent').execute(name, { name, task: 'hold' }, undefined, undefined, h.ctx);
+    const first = await spawn('first');
+    await h.emit('session_shutdown', { reason: 'reload' });
+    await h.emit('session_start', { reason: 'reload' });
+    const second = await spawn('second');
+    const row = (child: any) => JSON.parse(readFileSync(join(h.directory, `pane-${child.details.surface}.json`), 'utf8'));
+    assert.equal(row(first).tab_id, row(second).tab_id);
+    await h.tools.get('subagent_kill').execute('kill', { target: first.details.runId }, undefined, undefined, h.ctx);
+    await h.until(() => !existsSync(join(h.directory, `pane-${first.details.surface}.json`)));
+    const resumed = await h.tools.get('subagent_resume').execute('resume', { sessionPath: first.details.sessionFile, message: 'again' }, undefined, undefined, h.ctx);
+    assert.equal(row(resumed).tab_id, row(second).tab_id);
+    assert.notEqual(resumed.details.runId, first.details.runId);
+    const abort = new AbortController();
+    const third = await spawn('third');
+    await h.tools.get('subagent_kill').execute('kill-third', { target: third.details.runId }, undefined, undefined, h.ctx);
+    await h.until(() => !existsSync(join(h.directory, `pane-${third.details.surface}.json`)));
+    await assert.rejects(() => h.tools.get('subagent_resume').execute('cancel-resume', { sessionPath: third.details.sessionFile, message: 'cancel' }, abort.signal, () => abort.abort(), h.ctx), /startup cancelled/);
+    const launches = h.readLines('mux-calls.jsonl').filter((args: string[]) => ['spawn', 'split-pane'].includes(args[1]));
+    assert.deepEqual(launches.map((args: string[]) => args[1]), ['spawn', 'split-pane', 'split-pane', 'spawn', 'spawn']);
+    assert.equal(h.entries.filter((entry: any) => entry.customType === 'subagent_ipc_finish').at(-1).data.result.protocolStatus, 'cancelled');
+  });
+});
+
+test('failed mux launch leaves no reserved tab slot and does not fall back to the parent', async () => {
+  await fixture(async h => {
+    process.env.TEST_CHILD_MODE = 'hold';
+    const spawn = (name: string) => h.tools.get('subagent').execute(name, { name, task: 'hold' }, undefined, undefined, h.ctx);
+    process.env.TEST_MUX_FAIL = 'spawn';
+    await assert.rejects(() => spawn('failed-tab'));
+    process.env.TEST_MUX_FAIL = '';
+    const first = await spawn('first');
+    process.env.TEST_MUX_FAIL = 'split-pane';
+    await assert.rejects(() => spawn('failed-split'));
+    process.env.TEST_MUX_FAIL = '';
+    const second = await spawn('second');
+    const row = (child: any) => JSON.parse(readFileSync(join(h.directory, `pane-${child.details.surface}.json`), 'utf8'));
+    assert.equal(row(first).tab_id, row(second).tab_id);
+    assert.equal(h.readLines('launches.jsonl').length, 2);
+    assert.equal(restoreRunLedger(h.entries).unresolved.length, 2);
+    const calls = h.readLines('mux-calls.jsonl').filter((args: string[]) => ['spawn', 'split-pane'].includes(args[1]));
+    assert.deepEqual(calls.map((args: string[]) => args[1]), ['spawn', 'spawn', 'split-pane', 'split-pane']);
+    assert.ok(calls.filter((args: string[]) => args[1] === 'split-pane').every((args: string[]) => args[args.indexOf('--pane-id') + 1] === first.details.surface));
   });
 });
 

@@ -15,4 +15,6 @@ description: Plan a change with optional focused delegation.
 subagent({ name: "Investigate auth", task: "Trace authentication and report relevant code paths with file references. Do not edit files." });
 ```
 
-Agents share the filesystem, not isolated worktrees; partition concurrent edits or use separate worktrees. Child completion requires `subagent_done`. Do not infer success merely because a child stops speaking.
+WezTerm automatically places children in dedicated tabs in the originating Pi window, at most two child panes per tab (new tab, split, new tab). The parent tab stays untouched; do not arrange panes manually. tmux placement is unchanged.
+
+Agents share the filesystem by default; partition concurrent edits or explicitly request `worktree: true` for a separate managed Git checkout. Review and integrate child changes manually. Child completion requires `subagent_done`. Do not infer success merely because a child stops speaking.

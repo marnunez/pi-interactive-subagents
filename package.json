@@ -1,7 +1,7 @@
 {
   "name": "pi-interactive-subagents",
   "version": "2.0.0",
-  "description": "Interactive Pi subagents with direct launches in visible WezTerm and tmux splits",
+  "description": "Interactive Pi subagents with direct launches in visible WezTerm tabs and tmux splits",
   "keywords": [
     "pi-package"
   ],

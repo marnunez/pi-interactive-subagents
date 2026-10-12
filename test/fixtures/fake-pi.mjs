@@ -16,7 +16,7 @@ const client = new ChildIpcClient({
 });
 // Deliberately delayed handshake: a spawn request alone must never mean started.
 setTimeout(() => client.start(), 140);
-setTimeout(() => {
+if (process.env.TEST_CHILD_MODE !== 'hold') setTimeout(() => {
   const result = { schemaVersion: 1, runId, status: 'success', summary: 'fake child completed', completedAt: new Date().toISOString() };
   appendFileSync(sessionFile, JSON.stringify({ type: 'custom', customType: SUBAGENT_DONE_RESULT_TYPE, data: result }) + '\n');
   client.send('completion', result);

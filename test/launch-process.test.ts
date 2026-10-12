@@ -37,13 +37,13 @@ test('direct exec failures are available to the parent without leaking the envir
   } finally { launch.dispose(); }
 });
 
-test('direct launch plans use visible targeted splits and never default to the active pane', () => {
+test('direct launch plans explicitly target the origin window/pane and never default to focus', () => {
   const spec = { name: 'same name', runId: 'one', cwd: tmpdir(), argv: ['/node', '/launcher', '/private-spec'] };
   const old = { WEZTERM_PANE: process.env.WEZTERM_PANE, TMUX_PANE: process.env.TMUX_PANE };
   try {
     process.env.WEZTERM_PANE = '0';
-    const one = directLaunchCommand('wezterm', spec);
-    assert.deepEqual(one.args, ['cli', 'split-pane', '--pane-id', '0', '--right', '--percent', '50', '--cwd', spec.cwd, '--', ...spec.argv]);
+    const one = directLaunchCommand('wezterm', spec, [{ pane_id: 0, tab_id: 1, window_id: 7 }]);
+    assert.deepEqual(one.args, ['cli', 'spawn', '--window-id', '7', '--cwd', spec.cwd, '--', ...spec.argv]);
     assert.ok(!one.args.includes('--new-window') && !one.args.includes('--workspace'));
     process.env.TMUX_PANE = '%9';
     const tmux = directLaunchCommand('tmux', spec);
@@ -63,7 +63,7 @@ test('direct launch plans use visible targeted splits and never default to the a
   for (const backend of ['cmux', 'zellij', null] as const) assert.throws(() => directLaunchCommand(backend, spec), /No terminal input was sent/);
 });
 
-test('subsequent splits target only owned siblings in the originating tab and preserve parent space', () => {
+test('subsequent splits target only solitary owned children outside the originating tab', () => {
   const old = process.env.WEZTERM_PANE;
   try {
     process.env.WEZTERM_PANE = '0';
@@ -73,15 +73,16 @@ test('subsequent splits target only owned siblings in the originating tab and pr
       { pane_id: 1, tab_id: 1, window_id: 1, size: { rows: 200 } }, // Not owned.
       { pane_id: 2, tab_id: 1, window_id: 1, size: { rows: 20 } },
       { pane_id: 3, tab_id: 1, window_id: 1, size: { rows: 40 } },
-      { pane_id: 4, tab_id: 9, window_id: 1, size: { rows: 200 } }, // Other tab.
+      { pane_id: 4, tab_id: 9, window_id: 1, size: { rows: 200 } }, // Owned child tab.
       { pane_id: 5, tab_id: 1, window_id: 9, size: { rows: 200 } }, // Other window.
     ];
     const next = directLaunchCommand('wezterm', spec, panes);
-    assert.equal(next.args[next.args.indexOf('--pane-id') + 1], '3');
+    assert.equal(next.args[next.args.indexOf('--pane-id') + 1], '4');
     assert.ok(next.args.includes('--bottom'));
-    const fallback = directLaunchCommand('wezterm', { ...spec, siblingSurfaces: ['4', '5', '999'] }, panes);
-    assert.equal(fallback.args[fallback.args.indexOf('--pane-id') + 1], '0');
-    assert.ok(fallback.args.includes('--right'));
+    const fallback = directLaunchCommand('wezterm', { ...spec, siblingSurfaces: ['2', '3', '5', '999'] }, panes);
+    assert.equal(fallback.args[1], 'spawn');
+    assert.equal(fallback.args[fallback.args.indexOf('--window-id') + 1], '1');
+    assert.ok(!fallback.args.includes('--pane-id'));
   } finally { if (old === undefined) delete process.env.WEZTERM_PANE; else process.env.WEZTERM_PANE = old; }
 });
 

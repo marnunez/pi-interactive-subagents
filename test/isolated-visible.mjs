@@ -61,10 +61,16 @@ process.stdin.setRawMode(true); process.stdin.resume(); process.stdin.on('data',
       try { window = x(['search', '--onlyvisible', '--class', 'org.wezfurlong.wezterm']).split('\n')[0]; return !!window; } catch { return false; }
     });
     x(['windowfocus', '--sync', window]);
+    // Unrelated panes/tabs and a focused foreign window must not become launch
+    // targets. These are private test processes on this Xvfb display only.
+    mux(['split-pane', '--pane-id', root.pane, '--right', '--', process.execPath, capture, join(directory, 'foreign-parent.json')]);
+    mux(['spawn', '--window-id', String(origin.window_id), '--', process.execPath, capture, join(directory, 'foreign-tab.json')]);
+    mux(['spawn', '--new-window', '--', process.execPath, capture, join(directory, 'foreign-window.json')]);
+    await wait(() => existsSync(join(directory, 'foreign-window.json')));
+    const baseline = panes();
     const childStates = [], surfaces = [];
     const literal = `quotes ' " ; $(touch ${join(directory, 'injected')})`;
-    let parentWidth;
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 5; i++) {
       const state = join(directory, `child-${i}.json`);
       childStates.push(state);
       const launch = prepareLaunch({ argv: [process.execPath, capture, state, literal], cwd: directory, env: { FIXTURE_VALUE: literal }, unset: [] });
@@ -73,12 +79,17 @@ process.stdin.setRawMode(true); process.stdin.resume(); process.stdin.on('data',
       surfaces.push(child.surface);
       await wait(() => existsSync(state));
       const rows = panes(), pane = rows.find(pane => String(pane.pane_id) === child.surface);
-      assert.equal(pane.tab_id, origin.tab_id, 'Child was hidden in another tab');
-      assert.equal(pane.window_id, origin.window_id, 'Child was hidden in another window');
+      assert.notEqual(pane.tab_id, origin.tab_id, 'Parent tab must remain untouched');
+      assert.equal(pane.window_id, origin.window_id, 'Child opened in a foreign or new window');
       assert.equal(pane.workspace, origin.workspace, 'Child was hidden in another workspace');
       assert.ok(pane.size.cols > 0 && pane.size.rows > 0);
-      const width = rows.find(pane => String(pane.pane_id) === root.pane).size.cols;
-      if (parentWidth === undefined) parentWidth = width; else assert.equal(width, parentWidth, 'Further children shrank the parent');
+      for (const previous of baseline) {
+        const current = rows.find(pane => pane.pane_id === previous.pane_id);
+        assert.equal(current.tab_id, previous.tab_id);
+        assert.equal(current.window_id, previous.window_id);
+        assert.deepEqual(current.size, previous.size, 'Launch changed parent/foreign pane space');
+      }
+      assert.ok(rows.filter(other => other.tab_id === pane.tab_id).length <= 2, 'Child tab exceeded two panes');
       const observed = JSON.parse(readFileSync(state, 'utf8'));
       assert.equal(observed.text, '', 'Launcher typed into the terminal');
       assert.equal(observed.arg, literal);
@@ -87,13 +98,16 @@ process.stdin.setRawMode(true); process.stdin.resume(); process.stdin.on('data',
     }
     assert.equal(existsSync(join(directory, 'injected')), false, 'Shell syntax executed');
     const text = 'visible-child-can-receive-user-input';
-    const active = panes().find(pane => pane.is_active && pane.tab_id === origin.tab_id);
+    const childRows = panes().filter(pane => surfaces.includes(String(pane.pane_id)));
+    assert.deepEqual([...new Set(childRows.map(pane => pane.tab_id))].map(tab => childRows.filter(pane => pane.tab_id === tab).length), [2, 2, 1]);
+    const active = panes().find(pane => String(pane.pane_id) === surfaces.at(-1) && pane.is_active);
     assert.ok(surfaces.includes(String(active.pane_id)), 'Expected the visible child to be focused');
+    x(['windowfocus', '--sync', window]);
     x(['type', '--clearmodifiers', '--delay', '4', text]);
     const activeState = childStates[surfaces.indexOf(String(active.pane_id))];
     await wait(() => JSON.parse(readFileSync(activeState, 'utf8')).text === text);
     assert.equal(JSON.parse(readFileSync(rootState, 'utf8')).text, '');
-    console.log('PASS: three direct launches visible in the parent tab; parent space preserved; literal argv/env intact; no launch typing; focused child receives deliberate input.');
+    console.log('PASS: five direct children packed 2/2/1 in dedicated tabs in the origin window; parent/foreign geometry untouched; literal argv/env intact; no launch typing; focused child receives deliberate input.');
     for (const surface of surfaces) mux(['kill-pane', '--pane-id', surface]);
 
     if (process.env.PI_REAL_STARTUP_SMOKE === '1') {
@@ -116,13 +130,14 @@ process.stdin.setRawMode(true); process.stdin.resume(); process.stdin.on('data',
         const child = launchVisibleSurface({ runId, name: 'real Pi smoke', cwd: directory, argv: launch.argv });
         await waitForConnection({ connected: () => ipc.isConnected(runId), failure: launch.failure, timeoutMs: 15000 });
         const pane = panes().find(pane => String(pane.pane_id) === child.surface);
-        assert.equal(pane.tab_id, origin.tab_id);
+        assert.notEqual(pane.tab_id, origin.tab_id);
+        assert.equal(pane.window_id, origin.window_id);
         assert.equal(pane.workspace, origin.workspace);
         ipc.send(runId, 'shutdown', { runId });
         await wait(() => !panes().some(pane => String(pane.pane_id) === child.surface));
         ipc.unregisterChild(runId);
       }
-      console.log('PASS: actual Pi CLI authenticated in visible splits for a fresh session and its resume; no task/model request sent.');
+      console.log('PASS: actual Pi CLI authenticated in dedicated child tabs for a fresh session and its resume; no task/model request sent.');
     }
   } finally {
     await ipc?.close();

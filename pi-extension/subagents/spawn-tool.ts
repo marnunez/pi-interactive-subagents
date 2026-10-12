@@ -2,7 +2,7 @@ import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { loadAgentDefaults } from "./config.ts";
 import { isMuxAvailable } from "./cmux.ts";
-import { defineTool, SUBAGENT_ASYNC_GUIDANCE, SubagentParams, type SubagentParamsValue, muxUnavailableResult } from "./policy.ts";
+import { defineTool, SUBAGENT_ASYNC_GUIDANCE, SUBAGENT_LAYOUT_GUIDANCE, SubagentParams, type SubagentParamsValue, muxUnavailableResult } from "./policy.ts";
 import { launchSubagent } from "./launch.ts";
 import { type RunRuntime, IPC_LAUNCH_ENTRY } from "./runtime.ts";
 import { type RunController } from "./controller.ts";
@@ -15,12 +15,13 @@ export function registerSpawnTool(pi: ExtensionAPI, runtime: RunRuntime, control
       name: "subagent",
       label: "Subagent",
       description:
-        "Launch a sub-agent directly in a visible terminal split without typing shell commands. Terminal focus may change. " +
+        "Launch a sub-agent directly in a visible terminal pane without typing shell commands. " + SUBAGENT_LAYOUT_GUIDANCE + " " +
         "Waits for the child's authenticated startup connection, then returns while the task runs asynchronously. " +
         "Do not fabricate or assume its result. " + SUBAGENT_ASYNC_GUIDANCE,
       promptSnippet:
-        "Spawn a sub-agent asynchronously. Do not fabricate its result. " + SUBAGENT_ASYNC_GUIDANCE,
+        "Spawn a sub-agent asynchronously. " + SUBAGENT_LAYOUT_GUIDANCE + " Do not fabricate its result. " + SUBAGENT_ASYNC_GUIDANCE,
       promptGuidelines: [
+        SUBAGENT_LAYOUT_GUIDANCE,
         "Before passing a named agent to subagent, use subagents_list to verify that it is available in the current project and profile; otherwise omit agent to inherit defaults. Do not infer names from examples or earlier sessions.",
         "After using subagent, never poll child status. If no independent work remains, end the turn silently with no text and no further tool calls; child completion arrives as a steer message and triggers the next turn.",
       ],

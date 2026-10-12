@@ -12,7 +12,7 @@ import { isMuxAvailable, closeSurface } from "./cmux.ts";
 import { readSubagentSessionCorrelation } from "./session.ts";
 import { ensureSessionArtifactDir, getSessionArtifactDir, writeArtifactFile } from "../session-artifacts/paths.ts";
 import { createIpcToken } from "./ipc.ts";
-import { defineTool, SUBAGENT_COMPLETION_INSTRUCTION, SUBAGENT_ASYNC_GUIDANCE, withChildOnlyTools, muxUnavailableResult } from "./policy.ts";
+import { defineTool, SUBAGENT_COMPLETION_INSTRUCTION, SUBAGENT_ASYNC_GUIDANCE, SUBAGENT_LAYOUT_GUIDANCE, withChildOnlyTools, muxUnavailableResult } from "./policy.ts";
 import { type RunningSubagent } from "./types.ts";
 import { childLaunchSpec } from "./launch.ts";
 import { type RunRuntime, IPC_LAUNCH_ENTRY } from "./runtime.ts";
@@ -27,11 +27,12 @@ export function registerResumeTool(pi: ExtensionAPI, runtime: RunRuntime, contro
       name: "subagent_resume",
       label: "Resume Subagent",
       description:
-        "Resume a previous sub-agent session directly in a visible terminal split, without typing shell commands. " +
+        "Resume a previous sub-agent session directly in a visible terminal pane, without typing shell commands. " + SUBAGENT_LAYOUT_GUIDANCE + " " +
         "Waits for authenticated startup, not task completion. Results arrive later via a steer message. " +
         "Use when a sub-agent was cancelled or needs follow-up work. " + SUBAGENT_ASYNC_GUIDANCE,
       promptSnippet:
-        "Resume a completed or cancelled session as a new run in a visible terminal split. Terminal focus may change. " + SUBAGENT_ASYNC_GUIDANCE,
+        "Resume a completed or cancelled session as a new run in a visible terminal pane. " + SUBAGENT_LAYOUT_GUIDANCE + " " + SUBAGENT_ASYNC_GUIDANCE,
+      promptGuidelines: [SUBAGENT_LAYOUT_GUIDANCE],
       parameters: Type.Object({
         sessionPath: Type.String({ description: "Path to the session .jsonl file to resume" }),
         name: Type.Optional(
