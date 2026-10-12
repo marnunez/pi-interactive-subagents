@@ -178,7 +178,7 @@ export function registerResumeTool(pi: ExtensionAPI, runtime: RunRuntime, contro
         startWidgetRefresh();
 
         return {
-          content: [{ type: "text", text: `Session "${name}" resumed and connected in visible pane ${running.surface} (runId: ${runId}).${running.worktreePath ? ` Worktree: ${running.worktreePath}. Review and integrate changes manually; it is retained.` : ""} Terminal focus may change. Task results arrive asynchronously. ${SUBAGENT_ASYNC_GUIDANCE}` }],
+          content: [{ type: "text", text: `Session "${name}" resumed and connected in visible pane ${running.surface} (runId: ${runId}).${running.worktreePath ? ` Worktree: ${running.worktreePath}. Review and integrate changes manually; it is retained.` : ""} ${running.focusWarning ?? (running.surface.startsWith("%") ? "Terminal focus may change." : "Focus remains on the parent pane.")} Task results arrive asynchronously. ${SUBAGENT_ASYNC_GUIDANCE}` }],
           details: {
             id: runId,
             runId,
@@ -186,6 +186,7 @@ export function registerResumeTool(pi: ExtensionAPI, runtime: RunRuntime, contro
             resumeOfRunId: correlation.originatingRunId,
             mode: "resume",
             surface: running.surface,
+            ...(running.focusWarning ? { focusWarning: running.focusWarning } : {}),
             name,
             sessionPath: sessionFile,
             sessionFile,

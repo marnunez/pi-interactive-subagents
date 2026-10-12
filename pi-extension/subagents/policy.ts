@@ -25,7 +25,7 @@ export const SUBAGENT_LAYOUT_GUIDANCE =
   "(first child new tab, second split, third new tab). The parent tab is untouched; no manual arrangement is needed. " +
   "Only live owned child panes are split; full or mixed/foreign tabs are skipped. Pane names are automatic; " +
   "the parent labels dedicated tabs with their child names. Optional set_pane_title progress updates affect only the child's pane. " +
-  "tmux placement is unchanged. Terminal focus may change.";
+  "Focus returns immediately to the parent pane after launch/resume; a restoration failure is reported. tmux placement is unchanged.";
 
 export const SUBAGENT_ASYNC_GUIDANCE =
   "Results are delivered automatically via a steer message; never poll child status. " +

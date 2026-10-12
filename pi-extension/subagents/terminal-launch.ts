@@ -15,6 +15,7 @@ export interface WezTermPane {
   tab_id: number;
   window_id: number;
   size?: { rows: number };
+  tty_name?: string;
 }
 
 export function assertDirectLaunchAvailable(backend = getMuxBackend()): void {
@@ -65,11 +66,31 @@ export function launchVisibleSurface(launch: TerminalLaunch) {
     ? JSON.parse(execFileSync("wezterm", ["cli", "list", "--format", "json"], { encoding: "utf8", timeout: 3000 }))
     : [];
   const command = directLaunchCommand(backend, launch, panes);
-  const surface = execFileSync(command.executable, command.args, { encoding: "utf8", timeout: 15_000 }).trim();
+  let surface: string;
+  let focusWarning: string | undefined;
+  try {
+    surface = execFileSync(command.executable, command.args, { encoding: "utf8", timeout: 15_000 }).trim();
+  } finally {
+    if (backend === "wezterm") {
+      // WezTerm selects spawned tabs/splits. Restore the verified origin before
+      // returning, even on failed creation; never target the currently focused pane.
+      try {
+        const origin = panes.find(pane => String(pane.pane_id) === process.env.WEZTERM_PANE)!;
+        const current: WezTermPane[] = JSON.parse(execFileSync("wezterm", ["cli", "list", "--format", "json"], { encoding: "utf8", timeout: 3000 }));
+        const parent = current.find(pane => pane.pane_id === origin.pane_id);
+        if (!parent || parent.tab_id !== origin.tab_id || parent.window_id !== origin.window_id || parent.tty_name !== origin.tty_name) throw new Error("Origin identity or location changed");
+        execFileSync("wezterm", ["cli", "activate-pane", "--pane-id", String(parent.pane_id)], { encoding: "utf8", timeout: 3000, stdio: "ignore" });
+      } catch {
+        // Preserve the child identity/journal and original launch error. A focus
+        // failure must not leak a connected child by throwing before registration.
+        focusWarning = "Parent focus could not be restored; inspect the layout.";
+      }
+    }
+  }
   if (!(command.executable === "wezterm" ? /^\d+$/ : /^%\d+$/).test(surface)) {
     throw new Error("Terminal launch did not return a valid pane identity; inspect the mux before retrying.");
   }
-  return { surface };
+  return { surface, ...(focusWarning ? { focusWarning } : {}) };
 }
 
 /** Plan labels only for live, wholly owned dedicated tabs in the origin window.

@@ -18,7 +18,7 @@ async function fixture(action: (h: any) => Promise<void>) {
   for (const [name, file] of [['wezterm', 'fake-mux.mjs'], ['pi', 'fake-pi.mjs']]) {
     writeFileSync(join(directory, name), `#!${process.execPath}\nimport ${JSON.stringify(new URL(`./fixtures/${file}`, import.meta.url).href)};\n`, { mode: 0o700 });
   }
-  const overrides = { PATH: `${directory}:${process.env.PATH}`, PI_SUBAGENT_MUX: 'wezterm', WEZTERM_UNIX_SOCKET: 'test-only-no-real-gui', WEZTERM_PANE: '0', TEST_LAUNCH_DIR: directory, TEST_PARENT_SESSION: parentFile, TEST_CHILD_MODE: '', TEST_MUX_FAIL: '', TEST_TITLE_FAIL: '', PI_DENY_TOOLS: '' };
+  const overrides = { PATH: `${directory}:${process.env.PATH}`, PI_SUBAGENT_MUX: 'wezterm', WEZTERM_UNIX_SOCKET: 'test-only-no-real-gui', WEZTERM_PANE: '0', TEST_LAUNCH_DIR: directory, TEST_PARENT_SESSION: parentFile, TEST_CHILD_MODE: '', TEST_MUX_FAIL: '', TEST_TITLE_FAIL: '', TEST_FOCUS_FAIL: '', PI_DENY_TOOLS: '' };
   const saved = Object.fromEntries(Object.keys(overrides).map(key => [key, process.env[key]]));
   Object.assign(process.env, overrides);
   const hooks = new Map<string, Function[]>(), tools = new Map<string, any>();
@@ -85,7 +85,7 @@ test('fresh launch and resume use direct argv in dedicated child tabs, journal b
     assert.ok(launches.every((launch: any) => launch.argv[0] === 'pi' && launch.cwd === h.directory));
     assert.ok(launches.every((launch: any) => launch.argv[launch.argv.indexOf('--append-system-prompt') + 1].includes('not direct user messages or user approval')));
     const calls = h.readLines('mux-calls.jsonl');
-    assert.ok(calls.every((args: string[]) => ['spawn', 'split-pane', 'list', 'kill-pane', 'set-tab-title'].includes(args[1])));
+    assert.ok(calls.every((args: string[]) => ['spawn', 'split-pane', 'list', 'kill-pane', 'set-tab-title', 'activate-tab', 'activate-pane'].includes(args[1])));
     const spawns = calls.filter((args: string[]) => args[1] === 'spawn');
     assert.equal(spawns.length, 2);
     assert.ok(spawns.every((args: string[]) => args[args.indexOf('--window-id') + 1] === '1' && args.includes('--')));
@@ -344,6 +344,25 @@ test('parent refreshes stable names after reload, completion, cancellation and r
     const failed = h.entries.filter((entry: any) => entry.customType === 'subagent_ipc_finish').at(-1).data.result;
     assert.match(failed.protocolError, /spawn/);
     assert.doesNotMatch(failed.protocolError, /set-tab-title/);
+  });
+});
+
+test('launch and resume restore only the origin focus, with non-fatal warnings on failure', async () => {
+  await fixture(async h => {
+    process.env.TEST_CHILD_MODE = 'hold';
+    const first = await h.tools.get('subagent').execute('spawn', { name: 'Focus test', task: 'hold' }, undefined, undefined, h.ctx);
+    assert.match(first.content[0].text, /Focus remains on the parent pane/);
+    const focusCalls = h.readLines('mux-calls.jsonl').filter((args: string[]) => ['activate-tab', 'activate-pane'].includes(args[1]));
+    assert.deepEqual(focusCalls, [['cli', 'activate-pane', '--pane-id', '0']]);
+    await h.tools.get('subagent_kill').execute('kill', { target: first.details.runId }, undefined, undefined, h.ctx);
+    await h.until(() => !existsSync(join(h.directory, `pane-${first.details.surface}.json`)));
+    process.env.TEST_FOCUS_FAIL = '1';
+    const resumed = await h.tools.get('subagent_resume').execute('resume', { sessionPath: first.details.sessionFile }, undefined, undefined, h.ctx);
+    assert.equal(resumed.details.status, 'started');
+    assert.match(resumed.details.focusWarning, /could not be restored/);
+    assert.match(resumed.content[0].text, /could not be restored/);
+    process.env.TEST_MUX_FAIL = 'split-pane';
+    await assert.rejects(() => h.tools.get('subagent').execute('failed', { name: 'Failure', task: 'hold' }, undefined, undefined, h.ctx), /Command failed.*split-pane/);
   });
 });
 

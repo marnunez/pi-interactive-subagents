@@ -86,6 +86,10 @@ process.stdin.setRawMode(true); process.stdin.resume(); process.stdin.on('data',
     await wait(() => originBaseline.every(pane => guiLabel(pane.tab_id) !== undefined));
     const baselineLabels = new Map(originBaseline.map(pane => [pane.tab_id, guiLabel(pane.tab_id)]));
     const literal = `quotes ' " ; $(touch ${join(directory, 'injected')})`;
+    let parentInput = '';
+    mux(['activate-tab', '--tab-id', String(origin.tab_id)]);
+    mux(['activate-pane', '--pane-id', root.pane]);
+    x(['windowfocus', '--sync', window]);
     for (let i = 0; i < 5; i++) {
       const state = join(directory, `child-${i}.json`);
       childStates.push(state);
@@ -115,18 +119,28 @@ process.stdin.setRawMode(true); process.stdin.resume(); process.stdin.on('data',
       assert.equal(observed.arg, literal);
       assert.equal(observed.value, literal);
       assert.equal(observed.cwd, directory);
+      // Actual keyboard input must still reach the originating parent, not
+      // merely a pane marked active inside a background tab.
+      const marker = `parent-${i}`;
+      parentInput += marker;
+      x(['type', '--clearmodifiers', '--delay', '4', marker]);
+      await wait(() => JSON.parse(readFileSync(rootState, 'utf8')).text === parentInput);
+      assert.equal(JSON.parse(readFileSync(state, 'utf8')).text, '');
     }
     assert.equal(existsSync(join(directory, 'injected')), false, 'Shell syntax executed');
     const text = 'visible-child-can-receive-user-input';
     const childRows = panes().filter(pane => surfaces.includes(String(pane.pane_id)));
     assert.deepEqual([...new Set(childRows.map(pane => pane.tab_id))].map(tab => childRows.filter(pane => pane.tab_id === tab).length), [2, 2, 1]);
     const active = panes().find(pane => String(pane.pane_id) === surfaces.at(-1) && pane.is_active);
-    assert.ok(surfaces.includes(String(active.pane_id)), 'Expected the visible child to be focused');
+    assert.ok(surfaces.includes(String(active.pane_id)), 'Expected the last child to be active within its tab');
+    // Selecting a child is now an explicit user action.
+    mux(['activate-tab', '--tab-id', String(active.tab_id)]);
+    mux(['activate-pane', '--pane-id', String(active.pane_id)]);
     x(['windowfocus', '--sync', window]);
     x(['type', '--clearmodifiers', '--delay', '4', text]);
     const activeState = childStates[surfaces.indexOf(String(active.pane_id))];
     await wait(() => JSON.parse(readFileSync(activeState, 'utf8')).text === text);
-    assert.equal(JSON.parse(readFileSync(rootState, 'utf8')).text, '');
+    assert.equal(JSON.parse(readFileSync(rootState, 'utf8')).text, parentInput);
     const childTabs = [...new Set(childRows.map(pane => pane.tab_id))];
     const labels = ['isolated-test-0 | isolated-test-1', 'isolated-test-2 | isolated-test-3', terminalTitle(runs[4].name)];
     await wait(() => childTabs.every((tab, i) => guiLabel(tab) === labels[i]));
@@ -145,7 +159,7 @@ process.stdin.setRawMode(true); process.stdin.resume(); process.stdin.on('data',
     refreshChildTabTitles(runs.slice(1));
     await wait(() => guiLabel(childTabs[0]) === runs[1].name);
     for (const [tabId, label] of baselineLabels) assert.equal(guiLabel(tabId), label, 'Parent/foreign GUI title was overwritten');
-    console.log('PASS: isolated GUI renders automatic child pane names and combined 2/2/1 tab labels without model calls; safe OSC controls; pane progress leaves shared labels unchanged; surviving name remains after completion; parent/foreign titles and geometry untouched; literal argv/env and deliberate input verified.');
+    console.log('PASS: isolated GUI renders automatic child pane names and combined 2/2/1 tab labels without model calls; safe OSC controls; pane progress leaves shared labels unchanged; surviving name remains after completion; parent focus preserved after every launch; parent/foreign titles and geometry untouched; literal argv/env and deliberate input verified.');
     for (const surface of surfaces.slice(1)) mux(['kill-pane', '--pane-id', surface]);
 
     if (process.env.PI_REAL_STARTUP_SMOKE === '1') {

@@ -109,7 +109,7 @@ export function registerSpawnTool(pi: ExtensionAPI, runtime: RunRuntime, control
             {
               type: "text",
               text:
-                `Sub-agent "${params.name}" connected in visible pane ${running.surface} (runId: ${running.runId}).${running.worktreePath ? ` Worktree: ${running.worktreePath}. Review and integrate changes manually; it is retained.` : ""} Terminal focus may change. Task results are delivered asynchronously. ` +
+                `Sub-agent "${params.name}" connected in visible pane ${running.surface} (runId: ${running.runId}).${running.worktreePath ? ` Worktree: ${running.worktreePath}. Review and integrate changes manually; it is retained.` : ""} ${running.focusWarning ?? (running.surface.startsWith("%") ? "Terminal focus may change." : "Focus remains on the parent pane.")} Task results are delivered asynchronously. ` +
                 `Do not generate or assume any result. ${SUBAGENT_ASYNC_GUIDANCE}`,
             },
           ],
@@ -124,6 +124,7 @@ export function registerSpawnTool(pi: ExtensionAPI, runtime: RunRuntime, control
             sessionFile: running.sessionFile,
             worktreePath: running.worktreePath,
             surface: running.surface,
+            ...(running.focusWarning ? { focusWarning: running.focusWarning } : {}),
             status: "started",
           },
         };

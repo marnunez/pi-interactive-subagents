@@ -46,6 +46,7 @@ export interface RunningSubagent {
   task: string;
   agent?: string;
   surface: string;
+  focusWarning?: string;
   startTime: number;
   sessionFile: string;
   worktreePath?: string;

@@ -37,6 +37,11 @@ if (args[1] === 'split-pane' || args[1] === 'spawn') {
   const tabId = Number(args[args.indexOf('--tab-id') + 1]);
   if (!rows.some(row => row.tab_id === tabId)) throw new Error('Missing title target');
   writeFileSync(join(directory, `tab-title-${tabId}.json`), JSON.stringify(args.at(-1)));
+} else if (args[1] === 'activate-tab' || args[1] === 'activate-pane') {
+  if (process.env.TEST_FOCUS_FAIL === '1') process.exit(18);
+  if (args[1] === 'activate-tab') {
+    if (args.includes('--pane-id') && args.includes('--tab-id')) throw new Error('Conflicting tab/pane flags');
+  } else if (!rows.some(row => String(row.pane_id) === args[args.indexOf('--pane-id') + 1])) throw new Error('Missing focus target');
 } else if (args[1] === 'kill-pane') {
   const pid = Number(args[args.indexOf('--pane-id') + 1]);
   // Only a process created by this fixture can be signalled.
