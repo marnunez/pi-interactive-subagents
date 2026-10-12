@@ -191,7 +191,6 @@ export default function (pi: ExtensionAPI) {
   let completionTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
   let completionShutdownRequested = false;
   let latestCtx: ExtensionContext | null = null;
-  let startupTitle: ReturnType<typeof setImmediate> | null = null;
   let runState: "idle" | "running" = "idle";
   let stopUiMonitor: (() => void) | null = null;
   const pendingUiRequests = new PendingExtensionUiRequests();
@@ -318,8 +317,6 @@ export default function (pi: ExtensionAPI) {
   }
 
   function cleanupSessionResources(): void {
-    if (startupTitle) clearImmediate(startupTitle);
-    startupTitle = null;
     clearCompletionDeliveryTimers();
     pendingCompletion = null;
     stopUiMonitor?.();
@@ -387,17 +384,15 @@ export default function (pi: ExtensionAPI) {
     registerChildListener();
     latestCtx = ctx;
     if (runId && ctx.mode === "tui") {
-      const namePane = () => {
-        try { ctx.ui.setTitle(terminalTitle(subagentName)); } catch { /* Cosmetic only. */ }
-      };
-      namePane();
-      // Pi 0.87 rebindCurrentSession resets its default title after awaiting
-      // session_start. Reassert once on the next event-loop turn, not a polling
-      // timer, so later model progress remains free to name this pane.
-      startupTitle = setImmediate(() => {
-        startupTitle = null;
-        if (latestCtx === ctx) namePane();
-      });
+      const title = terminalTitle(subagentName);
+      // Pi rebuilds its default title after awaiting all startup handlers and
+      // provider discovery. Persist the child identity rather than racing that
+      // reset with setImmediate. Only this child session is named; reloads do
+      // not append duplicates, and a renamed resume adopts the new run name.
+      try {
+        if (pi.getSessionName() !== title) pi.setSessionName(title);
+      } catch { /* Cosmetic only; never interrupt IPC or task lifecycle. */ }
+      try { ctx.ui.setTitle(title); } catch { /* Cosmetic only. */ }
     }
     completionShutdownRequested = false;
     runState = ctx.isIdle() ? "idle" : "running";

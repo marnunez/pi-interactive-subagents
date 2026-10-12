@@ -182,6 +182,12 @@ function createExtensionHarness(sessionFile: string): ExtensionHarness {
     setActiveTools(names: string[]) { activeTools = names; },
     async setModel() { return true; },
     setThinkingLevel() {},
+    getSessionName() { return entries.findLast(entry => entry.type === "session_info")?.name; },
+    setSessionName(name: string) {
+      const entry: SessionEntry = { type: "session_info", id: `entry-${++nextEntry}`, parentId: entries.at(-1)?.id ?? null, name };
+      entries.push(entry);
+      appendFileSync(sessionFile, JSON.stringify(entry) + "\n");
+    },
     sendUserMessage() { throw new Error("Parent messages must never be sent as user messages"); },
     sendMessage(message: any, options: any) { messages.push({ message, options }); },
   };
@@ -214,6 +220,37 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
 }
 
 describe("automatic child pane names", () => {
+  it("survives delayed core title resets by persisting only the child's display name", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "child-title-delayed-"));
+    const sessionFile = createSessionFile(dir);
+    configureChildEnv({ runId: "delayed-title" });
+    const h = createExtensionHarness(sessionFile);
+    try {
+      await h.emit("session_start");
+      // Simulate a later startup handler/provider discovery outlasting one
+      // setImmediate, then Pi rebuilding its title from session metadata.
+      await new Promise(resolve => setTimeout(resolve, 25));
+      const name = h.entries.findLast(entry => entry.type === "session_info")?.name;
+      h.ctx.ui.setTitle(name ? `π - ${name} - cwd` : "π - cwd");
+      assert.equal(h.titles.at(-1), "π - Lifecycle Test - cwd");
+      await h.emit("session_shutdown", { reason: "reload" });
+      await h.emit("session_start", { reason: "reload" });
+      assert.equal(h.entries.filter(entry => entry.type === "session_info").length, 1, "Reload must not append duplicate names");
+      h.ctx.ui.setTitle("Optional progress");
+      assert.equal(h.entries.findLast(entry => entry.type === "session_info")?.name, "Lifecycle Test", "Progress must not rename the session");
+      await h.emit("session_shutdown", { reason: "reload" });
+      configureChildEnv({ runId: "new-run" });
+      process.env.PI_SUBAGENT_NAME = "Renamed resume";
+      const resumed = createExtensionHarness(sessionFile);
+      await resumed.emit("session_start");
+      assert.equal(resumed.entries.findLast(entry => entry.type === "session_info")?.name, "Renamed resume");
+      await resumed.emit("session_shutdown", { reason: "reload" });
+    } finally {
+      await h.emit("session_shutdown", { reason: "reload" });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("names startup/reload/resume without any model event or tool request, even with all optional tools denied", async () => {
     const dir = mkdtempSync(join(tmpdir(), "child-title-startup-"));
     const sessionFile = createSessionFile(dir);

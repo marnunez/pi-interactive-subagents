@@ -20,11 +20,11 @@ A persistent parent session and **local WezTerm or tmux** are required for new l
 
 ### Automatic names and optional progress
 
-Every child pane receives its launch/resume **display name automatically**, before any model request. The direct launcher emits a safe OSC title before Pi starts. The child's `session_start` handler sets it through `ctx.ui.setTitle` and reasserts it once on the next event-loop turn because Pi 0.87 resets its default title after startup/reload handlers. No mandatory first-action title tool call is added to the task.
+Every child pane receives its launch/resume **display name automatically**, before any model request. The direct launcher emits a safe OSC title before Pi starts. The child's TUI `session_start` handler sets its own session display name through `pi.setSessionName` (only if different), then sets the initial pane title through `ctx.ui.setTitle`. Pi asynchronously rebuilds its default title after all startup handlers/provider discovery; the persisted name makes that title include the child identity, even with slow extensions. No timing workaround, polling or mandatory first-action title tool call is needed. Parent-selected identity is authoritative on child startup/reload/resume, including forked sessions and explicitly renamed resumes; a manual `/name` in the child is replaced at the next such boundary. The parent's session and tab labels are not changed.
 
 Only the parent manages explicit WezTerm **tab labels**: `Review | Implement` for a pair, `Implement` once Review completes or is cancelled. Labels use stable display names, not child progress text. Launch, resume, parent reload, completion and cancellation re-inspect live ownership and refresh labels. Parent tabs, foreign windows and mixed/foreign tabs are not renamed; at most two wholly owned panes can contribute a label. Cosmetic title/inspection failures cannot fail a successful launch or replace its original lifecycle error.
 
-A child can optionally call `set_pane_title({ title: "Checking logout" })`. It uses only that child's `ctx.ui.setTitle` (OSC), with no mux rename command or session/workspace/window-label operation. An explicit tab label remains stable; a terminal's default window-title rendering may still follow its active pane. `set_tab_title` remains a **pane-only legacy alias**, recognised in explicit role definitions and saved tool snapshots, but is not added or inherited by new runs. Saved selections are restored exactly; denying/narrowing title tools does not prevent automatic names or mandatory completion. Title strings have C0/C1 controls stripped, whitespace normalised and a 160-character Unicode bound; paired names are individually bounded so both remain represented. Arguments and environment values remain literal and unchanged.
+A child can optionally call `set_pane_title({ title: "Checking logout" })`. It uses only that child's `ctx.ui.setTitle` (OSC), with no mux rename command or session/workspace/window-label operation. Progress does not rename the child session or replace its durable identity; Pi's own title-reset operations, such as reload, can clear transient progress text. An explicit tab label remains stable; a terminal's default window-title rendering may still follow its active pane. `set_tab_title` remains a **pane-only legacy alias**, recognised in explicit role definitions and saved tool snapshots, but is not added or inherited by new runs. Saved selections are restored exactly; denying/narrowing title tools does not prevent automatic names or mandatory completion. Title strings have C0/C1 controls stripped, whitespace normalised and a 160-character Unicode bound; paired names are individually bounded so both remain represented. Arguments and environment values remain literal and unchanged.
 
 ## Session versus run
 
@@ -222,6 +222,8 @@ node test/isolated-visible.mjs
 # via explicit test commands. No task prompt or model request is sent.
 PI_REAL_STARTUP_SMOKE=1 node test/isolated-visible.mjs
 ```
+
+The actual Pi smoke adds a deliberately slow later startup handler to reproduce the asynchronous default-title reset. A completion marker and exact post-reset title assertion reject transient bootstrap-title success. Fresh launch, reload and an explicitly renamed resume must retain the child identity; progress remains pane-only.
 
 Keep actual Pi smoke sessions outside the extension checkout: Pi auto-discovers this package there, so loading another installed copy can produce duplicate-tool errors.
 

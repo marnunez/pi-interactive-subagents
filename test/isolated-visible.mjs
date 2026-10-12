@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { prepareLaunch, waitForConnection } from '../pi-extension/subagents/launch-process.ts';
 import { launchVisibleSurface, refreshChildTabTitles } from '../pi-extension/subagents/terminal-launch.ts';
@@ -171,8 +171,20 @@ process.stdin.setRawMode(true); process.stdin.resume(); process.stdin.on('data',
       } });
       await ipc.start();
       const smokeExtension = join(directory, 'title-smoke.ts');
-      writeFileSync(smokeExtension, `import { registerManagementTools } from ${JSON.stringify(fileURLToPath(new URL('../pi-extension/subagents/management-tools.ts', import.meta.url)))};
+      writeFileSync(smokeExtension, `import {existsSync, readFileSync, writeFileSync} from 'node:fs';
+import { registerManagementTools } from ${JSON.stringify(fileURLToPath(new URL('../pi-extension/subagents/management-tools.ts', import.meta.url)))};
 export default function(pi) {
+  // A deliberately slow later startup handler reproduces core's asynchronous
+  // rebind title reset after the old one-shot setImmediate has already run.
+  pi.on('session_start', async () => {
+    await new Promise(resolve => setTimeout(resolve, 100));
+    const path = ${JSON.stringify(directory)} + '/title-ready-' + process.env.PI_SUBAGENT_ID + '.json';
+    const count = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')).count + 1 : 1;
+    writeFileSync(path, JSON.stringify({count, name: pi.getSessionName() ?? null}));
+  });
+  pi.registerCommand('title-smoke-core-reset', {description: 'Isolated test: rebuild default title from session metadata', handler: () => {
+    pi.setSessionName(pi.getSessionName() ?? '');
+  }});
   const tools = new Map();
   registerManagementTools({registerTool: tool => tools.set(tool.name, tool)}, {}, {}, name => ['set_pane_title', 'set_tab_title'].includes(name));
   pi.registerCommand('title-smoke-progress', {description: 'Isolated test: exercise selected pane title tool without a model', handler: async (_args, ctx) => {
@@ -183,46 +195,67 @@ export default function(pi) {
 `);
       const firstRun = crypto.randomUUID();
       const { sessionFile } = createSubagentSession({ sessionDir: directory, cwd: directory, parentSessionId: 'smoke-parent', parentSessionFile: join(directory, 'parent.jsonl'), runId: firstRun, name: 'real Pi smoke', mode: 'fresh', task: '' });
+      const titleReady = runId => {
+        try { return JSON.parse(readFileSync(join(directory, `title-ready-${runId}.json`), 'utf8')); } catch { return undefined; }
+      };
       for (const runId of [firstRun, crypto.randomUUID()]) {
+        const name = runId === firstRun ? 'real Pi smoke' : 'renamed Pi smoke';
+        const defaultTitle = `π - ${name} - ${basename(directory)}`;
         const token = crypto.randomUUID();
         ipc.registerChild(runId, token);
-        const spec = childLaunchSpec(runtime, { schemaVersion: 1, tools: ['subagent_done', runId === firstRun ? 'set_pane_title' : 'set_tab_title'], autoExit: false }, runId, 'real Pi smoke', sessionFile, directory);
+        const spec = childLaunchSpec(runtime, { schemaVersion: 1, tools: ['subagent_done', runId === firstRun ? 'set_pane_title' : 'set_tab_title'], autoExit: false }, runId, name, sessionFile, directory);
         // Test this checkout, not a second copy discovered via installed packages.
         // No prompt is passed, and offline mode forbids package updates.
-        spec.argv.splice(1, 0, '--offline', '--no-extensions', '-e', fileURLToPath(new URL('../pi-extension/subagents/index.ts', import.meta.url)), '-e', smokeExtension);
+        spec.argv.splice(1, 0, '--offline', '--no-extensions', '-e', fileURLToPath(new URL('../pi-extension/subagents/index.ts', import.meta.url)));
+        spec.argv.push('-e', smokeExtension);
         spec.env.PI_SUBAGENT_TOKEN = token;
         const launch = prepareLaunch(spec);
         prepared.push(launch);
-        const child = launchVisibleSurface({ runId, name: 'real Pi smoke', cwd: directory, argv: launch.argv });
-        refreshChildTabTitles([{ surface: child.surface, name: 'real Pi smoke' }]);
+        const child = launchVisibleSurface({ runId, name, cwd: directory, argv: launch.argv });
+        refreshChildTabTitles([{ surface: child.surface, name }]);
         await waitForConnection({ connected: () => ipc.isConnected(runId), failure: launch.failure, timeoutMs: 15000 });
         const pane = panes().find(pane => String(pane.pane_id) === child.surface);
         assert.notEqual(pane.tab_id, origin.tab_id);
         assert.equal(pane.window_id, origin.window_id);
         assert.equal(pane.workspace, origin.workspace);
-        await waitTitle(child.surface, 'real Pi smoke');
-        await wait(() => guiLabel(pane.tab_id) === 'real Pi smoke');
+        await wait(() => titleReady(runId)?.count >= 1);
+        const coreName = titleReady(runId).name;
+        await waitTitle(child.surface, coreName ? `π - ${coreName} - ${basename(directory)}` : `π - ${basename(directory)}`);
+        assert.equal(panes().find(row => String(row.pane_id) === child.surface).title, defaultTitle,
+          'Assert the actual post-reset core title, not a transient bootstrap title');
+        assert.equal(coreName, name, 'Core must have the child name before its late default-title reset');
+        await wait(() => guiLabel(pane.tab_id) === name);
         await wait(() => readyFrames.get(runId) >= 1);
         const readyBeforeReload = readyFrames.get(runId);
+        const titleReadyBeforeReload = titleReady(runId).count;
         mux(['activate-tab', '--tab-id', String(pane.tab_id)]);
         mux(['activate-pane', '--pane-id', child.surface]);
         x(['type', '--clearmodifiers', '--delay', '4', '/title-smoke-progress']);
         x(['key', 'Return']);
         await waitTitle(child.surface, 'Pi progress]2;unsafe');
-        assert.equal(guiLabel(pane.tab_id), 'real Pi smoke', 'Progress tool changed the GUI tab label');
+        assert.equal(guiLabel(pane.tab_id), name, 'Progress tool changed the GUI tab label');
+        assert.equal(titleReady(runId).name, name, 'Progress must not rename the child session');
         // /reload is a deliberate UI command, never a task/model request.
         x(['type', '--clearmodifiers', '--delay', '4', '/reload']);
         x(['key', 'Return']);
         await wait(() => readyFrames.get(runId) > readyBeforeReload);
-        await waitTitle(child.surface, 'real Pi smoke');
-        assert.equal(guiLabel(pane.tab_id), 'real Pi smoke');
+        await wait(() => titleReady(runId)?.count > titleReadyBeforeReload);
+        assert.equal(titleReady(runId).name, name);
+        // /reload resets core UI before handlers; it need not produce the same
+        // final formatter as fresh/resumed rebind. Then deliberately trigger a
+        // supported later core reset and assert its exact durable fallback.
+        await waitTitle(child.surface, name);
+        x(['type', '--clearmodifiers', '--delay', '4', '/title-smoke-core-reset']);
+        x(['key', 'Return']);
+        await waitTitle(child.surface, defaultTitle);
+        assert.equal(guiLabel(pane.tab_id), name);
         ipc.send(runId, 'shutdown', { runId });
         await wait(() => !panes().some(pane => String(pane.pane_id) === child.surface));
         ipc.unregisterChild(runId);
         const entries = readFileSync(sessionFile, 'utf8').trim().split('\n').map(JSON.parse);
         assert.equal(entries.some(entry => entry.type === 'message'), false, 'Smoke unexpectedly sent a task/model request');
       }
-      console.log('PASS: actual Pi CLI fresh/reload/resume automatic names survive Pi startup; new and legacy progress tools change only the pane; GUI tab labels remain stable; no task/model request sent.');
+      console.log('PASS: actual Pi CLI fresh/reload/renamed-resume names survive delayed startup and core default-title resets; new and legacy progress tools change only the pane; GUI tab labels remain stable; no task/model request sent.');
     }
   } catch (error) {
     console.error('Isolated files:', readdirSync(directory));
