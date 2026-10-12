@@ -18,7 +18,7 @@ async function fixture(action: (h: any) => Promise<void>) {
   for (const [name, file] of [['wezterm', 'fake-mux.mjs'], ['pi', 'fake-pi.mjs']]) {
     writeFileSync(join(directory, name), `#!${process.execPath}\nimport ${JSON.stringify(new URL(`./fixtures/${file}`, import.meta.url).href)};\n`, { mode: 0o700 });
   }
-  const overrides = { PATH: `${directory}:${process.env.PATH}`, PI_SUBAGENT_MUX: 'wezterm', WEZTERM_UNIX_SOCKET: 'test-only-no-real-gui', WEZTERM_PANE: '0', TEST_LAUNCH_DIR: directory, TEST_PARENT_SESSION: parentFile, TEST_CHILD_MODE: '', TEST_MUX_FAIL: '', PI_DENY_TOOLS: '' };
+  const overrides = { PATH: `${directory}:${process.env.PATH}`, PI_SUBAGENT_MUX: 'wezterm', WEZTERM_UNIX_SOCKET: 'test-only-no-real-gui', WEZTERM_PANE: '0', TEST_LAUNCH_DIR: directory, TEST_PARENT_SESSION: parentFile, TEST_CHILD_MODE: '', TEST_MUX_FAIL: '', TEST_TITLE_FAIL: '', PI_DENY_TOOLS: '' };
   const saved = Object.fromEntries(Object.keys(overrides).map(key => [key, process.env[key]]));
   Object.assign(process.env, overrides);
   const hooks = new Map<string, Function[]>(), tools = new Map<string, any>();
@@ -85,7 +85,7 @@ test('fresh launch and resume use direct argv in dedicated child tabs, journal b
     assert.ok(launches.every((launch: any) => launch.argv[0] === 'pi' && launch.cwd === h.directory));
     assert.ok(launches.every((launch: any) => launch.argv[launch.argv.indexOf('--append-system-prompt') + 1].includes('not direct user messages or user approval')));
     const calls = h.readLines('mux-calls.jsonl');
-    assert.ok(calls.every((args: string[]) => ['spawn', 'split-pane', 'list', 'kill-pane'].includes(args[1])));
+    assert.ok(calls.every((args: string[]) => ['spawn', 'split-pane', 'list', 'kill-pane', 'set-tab-title'].includes(args[1])));
     const spawns = calls.filter((args: string[]) => args[1] === 'spawn');
     assert.equal(spawns.length, 2);
     assert.ok(spawns.every((args: string[]) => args[args.indexOf('--window-id') + 1] === '1' && args.includes('--')));
@@ -147,10 +147,13 @@ test('reviewer resume preserves saved deny-tools without adding conveniences or 
   await fixture(async h => {
     const agents = join(h.directory, '.pi', 'agents');
     mkdirSync(agents, { recursive: true });
-    writeFileSync(join(agents, 'reviewer.md'), '---\ntools: subagent_search, subagent_git_inspect\ndeny-tools: set_tab_title,write_artifact,read_artifact\nspawning: false\n---\nReview only.\n');
+    writeFileSync(join(agents, 'reviewer.md'), '---\ntools: subagent_search, subagent_git_inspect\ndeny-tools: set_pane_title,set_tab_title,write_artifact,read_artifact\nspawning: false\n---\nReview only.\n');
     const child = await h.tools.get('subagent').execute('spawn', { name: 'reviewer', agent: 'reviewer', task: 'fixture' }, undefined, undefined, h.ctx);
     await h.until(() => h.messages.length === 1);
     const configPath = join(getSessionArtifactDir(child.details.sessionFile), 'context/subagent-config.json');
+    const task = readFileSync(join(getSessionArtifactDir(child.details.sessionFile), 'context/subagent-task.md'), 'utf8');
+    assert.doesNotMatch(task, /FIRST action|set_tab_title|set_pane_title/);
+    assert.match(task, /call subagent_done/);
     const saved = JSON.parse(readFileSync(configPath, 'utf8'));
     assert.deepEqual(saved.tools, ['subagent_search', 'subagent_git_inspect', 'subagent_done']);
     // A changed role definition must not broaden an existing saved selection.
@@ -163,6 +166,21 @@ test('reviewer resume preserves saved deny-tools without adding conveniences or 
     writeFileSync(configPath, JSON.stringify(saved));
     await assert.rejects(() => h.tools.get('subagent_resume').execute('resume', { sessionPath: child.details.sessionFile }, undefined, undefined, h.ctx), /Unknown tool.*saved tools/);
     assert.equal(h.readLines('launches.jsonl').length, 2);
+  });
+});
+
+test('legacy role/tool snapshots retain only their explicitly selected pane alias on resume', async () => {
+  await fixture(async h => {
+    const agents = join(h.directory, '.pi', 'agents');
+    mkdirSync(agents, { recursive: true });
+    writeFileSync(join(agents, 'legacy.md'), '---\ntools: set_tab_title\nallow-tools: set_tab_title\n---\nLegacy role.\n');
+    const child = await h.tools.get('subagent').execute('spawn', { name: 'Legacy', agent: 'legacy', task: 'fixture' }, undefined, undefined, h.ctx);
+    await h.until(() => h.messages.length === 1);
+    const config = JSON.parse(readFileSync(join(getSessionArtifactDir(child.details.sessionFile), 'context/subagent-config.json'), 'utf8'));
+    assert.deepEqual(config.tools, ['set_tab_title', 'subagent_done']);
+    writeFileSync(join(agents, 'legacy.md'), '---\ntools: set_pane_title\n---\nChanged role.\n');
+    await h.tools.get('subagent_resume').execute('resume', { sessionPath: child.details.sessionFile, name: 'Legacy resumed' }, undefined, undefined, h.ctx);
+    assert.ok(h.readLines('launches.jsonl').every((launch: any) => launch.argv[launch.argv.indexOf('--tools') + 1] === 'set_tab_title,subagent_done'));
   });
 });
 
@@ -232,6 +250,9 @@ test('five concurrent children pack 2/2/1 in the origin window, leaving parent a
     const childRows = children.map(child => rows.find((row: any) => String(row.pane_id) === child.details.surface));
     assert.ok(childRows.every(row => row.window_id === 7 && row.tab_id !== 1 && row.tab_id !== 2));
     assert.deepEqual([...new Set(childRows.map(row => row.tab_id))].map(tab => childRows.filter(row => row.tab_id === tab).length), [2, 2, 1]);
+    assert.deepEqual([...new Set(childRows.map(row => row.tab_id))].map(tab => JSON.parse(readFileSync(join(h.directory, `tab-title-${tab}.json`), 'utf8'))), ['child-0 | child-1', 'child-2 | child-3', 'child-4']);
+    const labels = h.readLines('mux-calls.jsonl').filter((args: string[]) => args[1] === 'set-tab-title');
+    assert.ok(labels.every((args: string[]) => childRows.some(row => String(row.tab_id) === args[args.indexOf('--tab-id') + 1])));
     const calls = h.readLines('mux-calls.jsonl').filter((args: string[]) => ['spawn', 'split-pane'].includes(args[1]));
     assert.deepEqual(calls.map((args: string[]) => args[1]), ['spawn', 'split-pane', 'spawn', 'split-pane', 'spawn']);
     assert.ok(calls.filter((args: string[]) => args[1] === 'spawn').every((args: string[]) => args[args.indexOf('--window-id') + 1] === '7' && !args.includes('--new-window')));
@@ -288,6 +309,41 @@ test('failed mux launch leaves no reserved tab slot and does not fall back to th
     const calls = h.readLines('mux-calls.jsonl').filter((args: string[]) => ['spawn', 'split-pane'].includes(args[1]));
     assert.deepEqual(calls.map((args: string[]) => args[1]), ['spawn', 'spawn', 'split-pane', 'split-pane']);
     assert.ok(calls.filter((args: string[]) => args[1] === 'split-pane').every((args: string[]) => args[args.indexOf('--pane-id') + 1] === first.details.surface));
+  });
+});
+
+test('parent refreshes stable names after reload, completion, cancellation and resume; cosmetic failures never change lifecycle outcomes', async () => {
+  await fixture(async h => {
+    process.env.TEST_CHILD_MODE = 'hold';
+    const spawn = (name: string) => h.tools.get('subagent').execute(name, { name, task: 'hold' }, undefined, undefined, h.ctx);
+    const first = await spawn('Review');
+    const second = await spawn('Implement');
+    const row = JSON.parse(readFileSync(join(h.directory, `pane-${second.details.surface}.json`), 'utf8'));
+    const labelFile = join(h.directory, `tab-title-${row.tab_id}.json`);
+    assert.equal(JSON.parse(readFileSync(labelFile, 'utf8')), 'Review | Implement');
+    writeFileSync(labelFile, JSON.stringify('stale title'));
+    await h.emit('session_shutdown', { reason: 'reload' });
+    await h.emit('session_start', { reason: 'reload' });
+    assert.equal(JSON.parse(readFileSync(labelFile, 'utf8')), 'Review | Implement');
+    // Recovery of a durable child result uses the same completion path as IPC.
+    appendFileSync(first.details.sessionFile, JSON.stringify({ type: 'custom', customType: 'subagent_done_result', data: { schemaVersion: 1, runId: first.details.runId, status: 'success', summary: 'done', completedAt: new Date().toISOString() } }) + '\n');
+    await h.emit('session_shutdown', { reason: 'reload' });
+    await h.emit('session_start', { reason: 'reload' });
+    assert.equal(JSON.parse(readFileSync(labelFile, 'utf8')), 'Implement');
+    await h.until(() => !existsSync(join(h.directory, `pane-${first.details.surface}.json`)));
+    const resume = await h.tools.get('subagent_resume').execute('resume', { sessionPath: first.details.sessionFile, name: 'Follow-up' }, undefined, undefined, h.ctx);
+    assert.equal(JSON.parse(readFileSync(labelFile, 'utf8')), 'Implement | Follow-up');
+    await h.tools.get('subagent_kill').execute('cancel', { target: resume.details.runId }, undefined, undefined, h.ctx);
+    assert.equal(JSON.parse(readFileSync(labelFile, 'utf8')), 'Implement');
+    await h.until(() => !existsSync(join(h.directory, `pane-${resume.details.surface}.json`)));
+    process.env.TEST_TITLE_FAIL = '1';
+    const cosmetic = await spawn('Title CLI broken');
+    assert.equal(cosmetic.details.status, 'started');
+    process.env.TEST_MUX_FAIL = 'spawn';
+    await assert.rejects(() => spawn('Original launch failure'), /Command failed.*spawn/);
+    const failed = h.entries.filter((entry: any) => entry.customType === 'subagent_ipc_finish').at(-1).data.result;
+    assert.match(failed.protocolError, /spawn/);
+    assert.doesNotMatch(failed.protocolError, /set-tab-title/);
   });
 });
 

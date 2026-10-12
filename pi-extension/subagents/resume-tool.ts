@@ -36,7 +36,7 @@ export function registerResumeTool(pi: ExtensionAPI, runtime: RunRuntime, contro
       parameters: Type.Object({
         sessionPath: Type.String({ description: "Path to the session .jsonl file to resume" }),
         name: Type.Optional(
-          Type.String({ description: "Display name for the terminal tab. Default: 'Resume'" }),
+          Type.String({ description: "Display name for the child pane and parent-managed tab label. Default: 'Resume'" }),
         ),
         message: Type.Optional(
           Type.String({

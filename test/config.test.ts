@@ -7,6 +7,7 @@ import {
   listAgentDefinitions,
   loadAgentDefaults,
   resolveChildTools,
+  restoreChildTools,
 } from "../pi-extension/subagents/config.ts";
 
 const temporaryDirectories: string[] = [];
@@ -207,7 +208,7 @@ describe("child tool policy", () => {
         "bash",
         "web_search",
         "subagent_done",
-        "set_tab_title",
+        "set_pane_title",
         "write_artifact",
         "read_artifact",
       ],
@@ -225,7 +226,7 @@ describe("child tool policy", () => {
         "read",
         "database_query",
         "subagent_done",
-        "set_tab_title",
+        "set_pane_title",
         "write_artifact",
         "read_artifact",
       ],
@@ -235,18 +236,18 @@ describe("child tool policy", () => {
   it("lets allowTools narrow but never expand the selected tools", () => {
     assert.deepEqual(
       resolveChildTools(
-        { allowTools: "read,database_query,set_tab_title" },
+        { allowTools: "read,database_query,set_pane_title" },
         ["read", "bash"],
         registered,
       ),
-      ["read", "subagent_done", "set_tab_title"],
+      ["read", "subagent_done", "set_pane_title"],
     );
   });
 
   it("applies denials to built-ins and optional child lifecycle tools", () => {
     assert.deepEqual(
       resolveChildTools(
-        { denyTools: "bash,set_tab_title,write_artifact,read_artifact,subagent_done" },
+        { denyTools: "bash,set_pane_title,write_artifact,read_artifact,subagent_done" },
         ["read", "bash"],
         registered,
       ),
@@ -258,25 +259,36 @@ describe("child tool policy", () => {
     assert.deepEqual(
       resolveChildTools(
         {
-          allowTools: "read,subagent,subagents_list,subagent_resume,subagent_kill,subagent_message,set_tab_title",
+          allowTools: "read,subagent,subagents_list,subagent_resume,subagent_kill,subagent_message,set_pane_title",
           spawning: false,
         },
         ["read", "subagent", "subagents_list", "subagent_resume", "subagent_kill", "subagent_message"],
         registered,
       ),
-      ["read", "subagent_done", "set_tab_title"],
+      ["read", "subagent_done", "set_pane_title"],
     );
   });
 
   it("allows mandatory child-only tools without parent registration", () => {
     assert.deepEqual(
       resolveChildTools(
-        { tools: "subagent_done,set_tab_title,write_artifact,read_artifact" },
+        { tools: "subagent_done,set_pane_title,write_artifact,read_artifact" },
         [],
         [],
       ),
-      ["subagent_done", "set_tab_title", "write_artifact", "read_artifact"],
+      ["subagent_done", "set_pane_title", "write_artifact", "read_artifact"],
     );
+  });
+
+  it("recognises the legacy pane alias only when explicitly selected, preserving saved policy", () => {
+    const tools = [...registered, "set_tab_title", "set_pane_title"];
+    assert.equal(resolveChildTools({}, ["read", "set_tab_title"], tools).includes("set_tab_title"), false);
+    const legacy = resolveChildTools({ tools: "set_tab_title", allowTools: "set_tab_title" }, [], []);
+    assert.deepEqual(legacy, ["set_tab_title", "subagent_done"]);
+    assert.deepEqual(restoreChildTools(legacy, []), legacy);
+    assert.deepEqual(restoreChildTools(["subagent_done"], tools), ["subagent_done"]);
+    assert.deepEqual(resolveChildTools({ tools: "set_tab_title,set_pane_title", denyTools: "set_tab_title,set_pane_title,write_artifact,read_artifact" }, [], []), ["subagent_done"]);
+    assert.deepEqual(resolveChildTools({ allowTools: "set_tab_title" }, [], tools), ["subagent_done"]);
   });
 
   it("rejects unknown explicit tool names with a useful error", () => {

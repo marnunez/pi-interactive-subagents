@@ -611,9 +611,9 @@ describe("subagent-done.ts", () => {
       resolveChildActiveTools(
         ["read", "bash", "subagent"],
         [],
-        ["read", "bash", "subagent", "subagent_done", "set_tab_title"],
+        ["read", "bash", "subagent", "subagent_done", "set_pane_title", "set_tab_title"],
       ),
-      ["read", "bash", "subagent", "subagent_done", "set_tab_title"],
+      ["read", "bash", "subagent", "subagent_done", "set_pane_title"],
     );
   });
 

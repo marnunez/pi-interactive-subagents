@@ -3,7 +3,6 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
 import { loadAgentDefaults } from "./config.ts";
-import { isMuxAvailable, renameCurrentTab, renameWorkspace } from "./cmux.ts";
 
 export function registerCommands(pi: ExtensionAPI) {
   // /iterate command — fork the session into a subagent
@@ -56,17 +55,6 @@ export function registerCommands(pi: ExtensionAPI) {
       if (!task) {
         ctx.ui.notify("Usage: /plan <what to build>", "warning");
         return;
-      }
-
-      // Rename workspace and tab to show this is a planning session
-      if (isMuxAvailable()) {
-        try {
-          const label = task.length > 40 ? task.slice(0, 40) + "..." : task;
-          renameWorkspace(`🎯 ${label}`);
-          renameCurrentTab(`🎯 Plan: ${label}`);
-        } catch {
-          // non-critical -- do not block the plan
-        }
       }
 
       // Load the plan skill from the subagents extension directory

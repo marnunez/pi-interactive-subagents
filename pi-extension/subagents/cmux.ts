@@ -1,6 +1,6 @@
 import { execSync, execFileSync } from "node:child_process";
 
-// Backend discovery, cosmetic titles and cleanup only. Direct background launches
+// Backend discovery and cleanup only. Direct background launches
 // live in terminal-launch.ts; interactive shell injection is deliberately absent.
 
 export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm";
@@ -126,90 +126,6 @@ function zellijActionSync(args: string[], surface?: string): string {
     encoding: "utf8",
     env: zellijEnv(surface),
   });
-}
-
-export function renameCurrentTab(title: string): void {
-  const backend = requireMuxBackend();
-
-  if (backend === "cmux") {
-    const surfaceId = process.env.CMUX_SURFACE_ID;
-    if (!surfaceId) throw new Error("CMUX_SURFACE_ID not set");
-    execSync(`cmux rename-tab --surface ${shellEscape(surfaceId)} ${shellEscape(title)}`, {
-      encoding: "utf8",
-    });
-    return;
-  }
-
-  if (backend === "tmux") {
-    const paneId = process.env.TMUX_PANE;
-    if (!paneId) throw new Error("TMUX_PANE not set");
-    const windowId = execFileSync("tmux", ["display-message", "-p", "-t", paneId, "#{window_id}"], {
-      encoding: "utf8",
-    }).trim();
-    execFileSync("tmux", ["rename-window", "-t", windowId, title], { encoding: "utf8" });
-    return;
-  }
-
-  if (backend === "wezterm") {
-    const paneId = process.env.WEZTERM_PANE;
-    const args = ["cli", "set-tab-title"];
-    if (paneId) args.push("--pane-id", paneId);
-    args.push(title);
-    execFileSync("wezterm", args, { encoding: "utf8" });
-    return;
-  }
-
-  zellijActionSync(["rename-tab", title]);
-}
-
-export function renameWorkspace(title: string): void {
-  const backend = requireMuxBackend();
-
-  if (backend === "cmux") {
-    execSync(`cmux workspace-action --action rename --title ${shellEscape(title)}`, {
-      encoding: "utf8",
-    });
-    return;
-  }
-
-  if (backend === "tmux") {
-    if (process.env.PI_SUBAGENT_RENAME_TMUX_SESSION !== "1") {
-      return;
-    }
-
-    const paneId = process.env.TMUX_PANE;
-    if (!paneId) throw new Error("TMUX_PANE not set");
-    const sessionId = execFileSync(
-      "tmux",
-      ["display-message", "-p", "-t", paneId, "#{session_id}"],
-      {
-        encoding: "utf8",
-      },
-    ).trim();
-    execFileSync("tmux", ["rename-session", "-t", sessionId, title], { encoding: "utf8" });
-    return;
-  }
-
-  if (backend === "wezterm") {
-    const paneId = process.env.WEZTERM_PANE;
-    const args = ["cli", "set-window-title"];
-    if (paneId) args.push("--pane-id", paneId);
-    args.push(title);
-    try {
-      execFileSync("wezterm", args, { encoding: "utf8" });
-    } catch {
-      // Optional — window title is cosmetic.
-    }
-    return;
-  }
-
-  // Skip session rename for zellij. rename-session renames the socket file
-  // but the ZELLIJ_SESSION_NAME env var in the parent process keeps the old
-  // name, so all subsequent `zellij action ...` CLI calls fail with
-  // "There is no active session!" because the CLI can't find the socket.
-  // Additionally, pi titles often contain special characters (em dashes,
-  // spaces) that fail zellij's session name validation on lookup.
-  // rename-tab (called separately) is sufficient for user-visible naming.
 }
 
 export function closeSurface(surface: string): void {

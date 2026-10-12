@@ -65,7 +65,7 @@ test("inspection tools are explicit, optional child-only capabilities; denials a
 });
 
 test("resume preserves a reviewer's effective deny-tools selection and fails closed on unavailable tools", () => {
-  const saved = resolveChildTools({ tools: "read,subagent_search,subagent_git_inspect", denyTools: "set_tab_title,write_artifact,read_artifact", spawning: false }, [], ["read"]);
+  const saved = resolveChildTools({ tools: "read,subagent_search,subagent_git_inspect", denyTools: "set_pane_title,set_tab_title,write_artifact,read_artifact", spawning: false }, [], ["read"]);
   assert.deepEqual(restoreChildTools(saved, ["read", "bash", "subagent", "database_query"]), saved);
   assert.deepEqual(restoreChildTools(["read"], ["read"]), ["read", "subagent_done"]);
   assert.throws(() => restoreChildTools(["read", "missing_external"], ["read"]), /Unknown tool.*saved tools/);

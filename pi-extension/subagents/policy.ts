@@ -23,7 +23,9 @@ export const PARENT_MESSAGE_AUTHORITY_GUIDANCE =
 export const SUBAGENT_LAYOUT_GUIDANCE =
   "WezTerm automatically packs children into dedicated tabs in the originating Pi window, at most two child panes per tab " +
   "(first child new tab, second split, third new tab). The parent tab is untouched; no manual arrangement is needed. " +
-  "Only live owned child panes are split; full or mixed/foreign tabs are skipped. tmux placement is unchanged. Terminal focus may change.";
+  "Only live owned child panes are split; full or mixed/foreign tabs are skipped. Pane names are automatic; " +
+  "the parent labels dedicated tabs with their child names. Optional set_pane_title progress updates affect only the child's pane. " +
+  "tmux placement is unchanged. Terminal focus may change.";
 
 export const SUBAGENT_ASYNC_GUIDANCE =
   "Results are delivered automatically via a steer message; never poll child status. " +
@@ -72,7 +74,7 @@ export const SubagentParams = Type.Object({
 
 export type SubagentParamsValue = Static<typeof SubagentParams>;
 
-export const CHILD_ONLY_TOOLS = new Set(["subagent_done", "set_tab_title", "write_artifact"]);
+export const CHILD_ONLY_TOOLS = new Set(["subagent_done", "set_pane_title", "set_tab_title", "write_artifact"]);
 
 export function withChildOnlyTools(allToolNames?: string[]): string[] | undefined {
   if (!allToolNames) return undefined;
@@ -171,16 +173,7 @@ export function customAgentEnvParts(value: string | undefined): string[] {
   return Object.entries(customAgentEnvironment(value)).map(([name, value]) => `${name}=${shellEscape(value)}`);
 }
 
-export function muxUnavailableResult(kind: "subagents" | "tab-title" = "subagents") {
-  if (kind === "tab-title") {
-    return {
-      content: [
-        { type: "text" as const, text: `Terminal multiplexer not available. ${muxSetupHint()}` },
-      ],
-      details: { error: "mux not available" },
-    };
-  }
-
+export function muxUnavailableResult(_kind: "subagents" = "subagents") {
   return {
     content: [
       {

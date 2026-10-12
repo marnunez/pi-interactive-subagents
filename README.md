@@ -11,12 +11,20 @@ A persistent parent session and **local WezTerm or tmux** are required for new l
 ## Visible, direct launching
 
 - **WezTerm:** children automatically occupy dedicated tabs in the originating Pi's **same window**, at most **two child panes per tab**: first child opens a new tab, second splits it vertically, third opens another tab, and so on (five concurrent children: **2/2/1**). The parent tab stays untouched; no manual arrangement is needed. Each launch reads the live parent pane's window ID and explicitly passes `spawn --window-id`, never the active window or `--new-window`. Only a solitary, live, owned child outside the parent tab can be split. Full tabs, tabs containing foreign/completed panes and children moved to another window are skipped. Dead/completed runs are not split targets; freed capacity and moved children are re-evaluated from the live layout and this parent's active run ledger, including after reload or resume. WezTerm normally focuses the new pane/tab; this is intentional, not prevented or reversed.
-- **tmux:** creates a visible, detached split (`split-window -d`) targeting the originating pane, without selecting it.
+- **tmux:** creates a visible, detached split (`split-window -d`) targeting the originating pane, without selecting it. Automatic and optional progress titles use pane OSC naming, never `rename-window` or `rename-session`; placement is unchanged.
 - Both spawn and resume derive placement from their originating pane, never whichever pane/window happens to have focus. New launches do not create hidden workspaces or switch Sway workspaces. The old `workspace` tool argument is removed and legacy agent-definition `workspace` fields no longer control placement. Old run workspace metadata remains readable for recovery.
 - If live origin inspection, tab creation or splitting fails (for example, a zoomed tab or insufficient space), launch fails rather than falling back to the parent or injecting terminal input. Selection, direct launch and surface registration are synchronous within one parent process, so parallel tool calls and reload cannot reserve the same slot. No placement counters survive failures. A user moving/adding panes concurrently with the mux command is outside this transaction; the next launch re-inspects rather than rearranging user panes.
 - Pi arguments and environment overrides travel through a private, one-shot launch file (0700 directory, 0600 file), not terminal input or mux command-line text. A non-interactive launcher spawns Pi with an argument vector and inherited TTY, without a shell. It forwards termination signals and reports spawn failures; it never reads typed input itself.
 - There is no `send-text`, simulated Enter, arbitrary shell-readiness sleep, or switch-focus-and-restore sequence. The two-child WezTerm limit is fixed, not configured by the removed `PI_SUBAGENT_MAX_PANES_PER_TAB`; automatic Sway switching remains removed.
 - Spawn/resume first report **connecting**, then return **connected** only after the child authenticates. This confirms startup, not task completion. Cancellation and startup failure do not return a successful launch result.
+
+### Automatic names and optional progress
+
+Every child pane receives its launch/resume **display name automatically**, before any model request. The direct launcher emits a safe OSC title before Pi starts. The child's `session_start` handler sets it through `ctx.ui.setTitle` and reasserts it once on the next event-loop turn because Pi 0.87 resets its default title after startup/reload handlers. No mandatory first-action title tool call is added to the task.
+
+Only the parent manages explicit WezTerm **tab labels**: `Review | Implement` for a pair, `Implement` once Review completes or is cancelled. Labels use stable display names, not child progress text. Launch, resume, parent reload, completion and cancellation re-inspect live ownership and refresh labels. Parent tabs, foreign windows and mixed/foreign tabs are not renamed; at most two wholly owned panes can contribute a label. Cosmetic title/inspection failures cannot fail a successful launch or replace its original lifecycle error.
+
+A child can optionally call `set_pane_title({ title: "Checking logout" })`. It uses only that child's `ctx.ui.setTitle` (OSC), with no mux rename command or session/workspace/window-label operation. An explicit tab label remains stable; a terminal's default window-title rendering may still follow its active pane. `set_tab_title` remains a **pane-only legacy alias**, recognised in explicit role definitions and saved tool snapshots, but is not added or inherited by new runs. Saved selections are restored exactly; denying/narrowing title tools does not prevent automatic names or mandatory completion. Title strings have C0/C1 controls stripped, whitespace normalised and a 160-character Unicode bound; paired names are individually bounded so both remain represented. Arguments and environment values remain literal and unchanged.
 
 ## Session versus run
 
@@ -101,7 +109,8 @@ Results include run/session IDs, the session path and elapsed time. The model re
 - `subagent_kill`: cancel by ID, name match or `all`. Omit the target only for an explicit user request to inspect running children—not polling.
 - `subagent_message`: send an advisory note to one connected, active child by its exact run ID; wait for delivery acknowledgement, not task completion.
 - `subagent_done`: child-only terminal result.
-- `set_tab_title`: child-only progress title.
+- `set_pane_title`: optional child-only pane progress title; initial naming is automatic.
+- `set_tab_title`: backward-compatible pane-only alias, available only when explicitly selected or restored from a saved selection.
 - `subagent_search`: optional child-only literal file discovery/content search within the child's cwd.
 - `subagent_git_inspect`: optional child-only fixed-operation Git inspection within the child's cwd.
 - `write_artifact`: child-only session artifact storage.
@@ -146,7 +155,7 @@ Supported frontmatter:
 - `env`: whitespace-separated `KEY=value` assignments; reserved run identity, policy and lease variables cannot be overridden.
 - `auto-exit`: opt-in blocked fallback described above.
 
-`subagent_done` is always available. `set_tab_title`, `write_artifact` and `read_artifact` are added unless narrowed/denied. Unknown explicit tool names fail with an error. Update old definitions that relied on implicit extension access: e.g. a worker using todos needs `todo` in `tools`, and browser agents must list `browser_*` tools explicitly.
+`subagent_done` is always available. `set_pane_title`, `write_artifact` and `read_artifact` are added unless narrowed/denied. The legacy `set_tab_title` alias is never automatically granted to new runs; select it explicitly only for compatibility. Unknown explicit tool names fail with an error. Update old definitions that relied on implicit extension access: e.g. a worker using todos needs `todo` in `tools`, and browser agents must list `browser_*` tools explicitly.
 
 Agent bodies and `systemPrompt` are appended as system instructions for both fresh and forked runs. Forks copy validated active conversation history but not the parent's orchestration ledger. Resume restores the saved **effective tool selection exactly**, adding only mandatory `subagent_done`; it does not re-add optional conveniences, inherit newly active parent tools or reread changed role defaults. A saved extension selection that is no longer available fails closed. Legacy sessions without a saved configuration still resolve their role defaults. Stale multiplexer or ancestor run variables are not inherited.
 
@@ -203,13 +212,14 @@ npm test
 
 Tests cover session lineage, run-scoped persistence, completion retry/acknowledgement, reload recovery, cancellation, nested orchestration sockets, tool policy, profile discovery, artifacts and UI-state monitoring. Inspection regressions cover explicit child role selection, saved deny-tools on resume, literal search, adversarial paths/args, bounded output, symlinks, nested cwd and linked worktrees, huge ignored dependency/nested trees, tracked links and directory-to-link replacements, hostile inherited Git environment, disabled execution hooks/diff/textconv/clean/process filters (including local, conditional and worktree config), unchanged index bytes/mtime, invalid-byte filename/ignored-Unicode alias prevention, discovered control/backslash names, malformed-config refusal without ignored-secret fallback, and catalogue overflow. Launch/resume integration tests execute fake mux/Pi processes with real IPC: they assert journal-before-execution, direct argument handling, five concurrent children packed 2/2/1 in the origin window with parent/foreign panes untouched, direct targeted launch failures, reload, resume, startup acknowledgement and cancellation. Unit tests cover live moves, dead/completed children, foreign windows, full/mixed tabs and unchanged tmux argv. No paid model calls or live desktop operations are used.
 
-An explicit, optional real-GUI test creates a **separate Xvfb display and WezTerm instance**. It verifies five children occupy dedicated tabs **2/2/1 in the same origin window**, parent and foreign panes/tabs/windows retain their geometry, arguments/environment remain literal, and launch performs no terminal typing. It then sends deliberate input to the focused child:
+An explicit, optional real-GUI test creates a **separate Xvfb display and WezTerm instance**. It verifies five children occupy dedicated tabs **2/2/1 in the same origin window**, names appear without model calls, the GUI renders combined labels and the surviving child's name after completion, and pane progress leaves shared labels unchanged. Parent/foreign titles and geometry, literal arguments/environment, control-sequence sanitisation and absence of launch typing are checked. It also sends deliberate input to the focused child:
 
 ```sh
 # Requires wezterm, xvfb-run and xdotool on PATH; never targets the desktop display.
 node test/isolated-visible.mjs
 # Also exercise the installed Pi CLI with this checkout's extensions, offline,
-# in a fresh session and a resume. No task prompt or model request is sent.
+# in a fresh session, reload and resume. Exercises both progress tool names
+# via explicit test commands. No task prompt or model request is sent.
 PI_REAL_STARTUP_SMOKE=1 node test/isolated-visible.mjs
 ```
 
@@ -219,7 +229,7 @@ Keep actual Pi smoke sessions outside the extension checkout: Pi auto-discovers 
 
 `pi-extension/subagents/index.ts` only wires together a fresh per-parent runtime and registrations:
 
-- `launch.ts`, `worktree.ts`, `launch-process.ts/.mjs`, `terminal-launch.ts`: session preparation, opt-in Git checkout, private direct process launch and visible, explicitly targeted mux tabs/splits.
+- `launch.ts`, `worktree.ts`, `launch-process.ts/.mjs`, `terminal-launch.ts`, `terminal-title.mjs`: session preparation, opt-in Git checkout, private direct process launch, safe pane titles and parent-owned dedicated tab labels.
 - `controller.ts`, `runtime.ts`, `types.ts`: orchestration, recovery, cancellation, IPC events and instance-owned state.
 - `message-tool.ts`: addressed parent-to-child messaging and delivery acknowledgement.
 - `spawn-tool.ts`, `resume-tool.ts`, `management-tools.ts`, `commands.ts`: tool/command registration and input handling.

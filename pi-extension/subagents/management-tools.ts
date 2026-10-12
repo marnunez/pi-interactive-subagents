@@ -2,7 +2,7 @@ import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import { listAgentDefinitions } from "./config.ts";
-import { isMuxAvailable, renameCurrentTab, renameWorkspace } from "./cmux.ts";
+import { terminalTitle } from "./terminal-title.mjs";
 import { defineTool, SUBAGENT_KILL_GUIDANCE, muxUnavailableResult } from "./policy.ts";
 import { type RunningSubagent } from "./types.ts";
 import { formatElapsed, formatElapsedMMSS, formatSubagentState } from "./presentation.ts";
@@ -60,44 +60,33 @@ export function registerManagementTools(pi: ExtensionAPI, runtime: RunRuntime, c
       },
     }));
 
-  // ── set_tab_title tool ──
-  // Only useful for sub-agents reporting progress to the orchestrator.
-  if (shouldRegister("set_tab_title") && !!process.env.PI_SUBAGENT_NAME)
+  // Pane-only progress. The legacy name is registered only when explicitly
+  // selected (including saved snapshots); it is not granted to new runs.
+  const selected = new Set((process.env.PI_SUBAGENT_TOOLS ?? "").split(",").map(name => name.trim()));
+  for (const name of ["set_pane_title", "set_tab_title"]) {
+    if (process.env.PI_SUBAGENT_NAME === undefined || !shouldRegister(name) ||
+        (name === "set_tab_title" && !selected.has(name))) continue;
     pi.registerTool(defineTool({
-      name: "set_tab_title",
-      label: "Set Tab Title",
-      description:
-        "Update the current tab/window and workspace/session title. Use to show progress during multi-phase workflows " +
-        "(e.g. planning, executing todos, reviewing). Keep titles short and informative.",
-      promptSnippet:
-        "Update the current tab/window and workspace/session title. Use to show progress during multi-phase workflows " +
-        "(e.g. planning, executing todos, reviewing). Keep titles short and informative.",
+      name,
+      label: "Set Pane Title",
+      description: "Update only this child's terminal pane title for optional progress. Initial naming is automatic. " +
+        "Never changes shared tab, window, workspace or session labels. Keep titles short and informative." +
+        (name === "set_tab_title" ? " Legacy pane-only alias for set_pane_title." : ""),
+      promptSnippet: "Optionally update this child's pane title only; shared labels remain parent-managed.",
       parameters: Type.Object({
-        title: Type.String({
-          description: "New tab title (also applied to workspace/session when supported)",
-        }),
+        title: Type.String({ description: "Pane progress title; controls are stripped and length is bounded to 160 characters." }),
       }),
-
-      async execute(_toolCallId, rawParams): Promise<any> {
-        const params = rawParams as { title: string };
-        if (!isMuxAvailable()) {
-          return muxUnavailableResult("tab-title");
-        }
-        try {
-          renameCurrentTab(params.title);
-          renameWorkspace(params.title);
-          return {
-            content: [{ type: "text" as const, text: `Title set to: ${params.title}` }],
-            details: { title: params.title },
-          };
-        } catch (err: any) {
-          return {
-            content: [{ type: "text" as const, text: `Failed to set title: ${err?.message}` }],
-            details: { error: err?.message },
-          };
-        }
+      async execute(_toolCallId, rawParams, _signal, _update, ctx) {
+        const title = terminalTitle((rawParams as { title: string }).title);
+        if (ctx.mode !== "tui") throw new Error("Pane titles require Pi's terminal UI.");
+        ctx.ui.setTitle(title);
+        return {
+          content: [{ type: "text" as const, text: `Pane title set to: ${title}` }],
+          details: { title },
+        };
       },
     }));
+  }
 
   // ── subagent_kill tool ──
   if (shouldRegister("subagent_kill"))

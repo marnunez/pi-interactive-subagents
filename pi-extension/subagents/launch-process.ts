@@ -8,6 +8,7 @@ export interface LaunchSpec {
   cwd: string;
   env: Record<string, string>;
   unset: string[];
+  paneTitle?: string;
 }
 
 /** Secrets and task arguments never enter a shell line or the mux CLI argv. */

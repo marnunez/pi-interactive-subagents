@@ -45,7 +45,7 @@ export function childLaunchSpec(runtime: RunRuntime, config: ChildRunConfig, run
     delete env[key];
     if (process.env[key] !== undefined) env[key] = process.env[key]!;
   }
-  return { argv, cwd, env, unset: [...PROFILE_ENV_NAMES, ...NON_INHERITED_RUNTIME_ENV_NAMES] };
+  return { argv, cwd, env, unset: [...PROFILE_ENV_NAMES, ...NON_INHERITED_RUNTIME_ENV_NAMES], paneTitle: name };
 }
 
 export async function launchSubagent(runtime: RunRuntime,
@@ -139,19 +139,13 @@ export async function launchSubagent(runtime: RunRuntime,
       { ...agentDefs, tools: effectiveTools }, options.activeToolNames, options.allToolNames,
     );
     const denySet = new Set(withChildOnlyTools(options.allToolNames)!.filter((name) => !allowedTools.includes(name)));
-    const agentType = params.agent ?? params.name;
-    const tabTitleInstruction = denySet.has("set_tab_title")
-      ? ""
-      : `As your FIRST action, set the tab title using set_tab_title. ` +
-      `The title MUST start with [${agentType}] followed by a short description of your current task. ` +
-      `Example: "[${agentType}] Analyzing auth module". Keep it concise.`;
     // Combine agent body and user-provided systemPrompt (both are optional).
     // The agent body provides the base role/identity; systemPrompt layers on
     // additional instructions from the caller.
     const identityParts = [agentDefs?.body, params.systemPrompt].filter(Boolean);
     const identity = identityParts.length > 0 ? identityParts.join("\n\n") : null;
     const worktreeHint = managed ? `Your checkout is ${managed.path}. Work only there; do not edit the parent's checkout. Report the path and let the parent review and integrate changes manually.` : "";
-    const fullTask = `${modeHint}\n\n${tabTitleInstruction}\n\n${worktreeHint}\n\n${params.task}`;
+    const fullTask = [modeHint, worktreeHint, params.task].filter(Boolean).join("\n\n");
 
     const qualifiedModelForLock = effectiveModel ? qualifyModelWithProvider(effectiveModel, ctx) : undefined;
 

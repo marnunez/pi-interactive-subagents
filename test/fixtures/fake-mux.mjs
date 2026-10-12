@@ -32,6 +32,11 @@ if (args[1] === 'split-pane' || args[1] === 'spawn') {
   console.log(child.pid);
 } else if (args[1] === 'list') {
   console.log(JSON.stringify(rows));
+} else if (args[1] === 'set-tab-title') {
+  if (process.env.TEST_TITLE_FAIL === '1') process.exit(19);
+  const tabId = Number(args[args.indexOf('--tab-id') + 1]);
+  if (!rows.some(row => row.tab_id === tabId)) throw new Error('Missing title target');
+  writeFileSync(join(directory, `tab-title-${tabId}.json`), JSON.stringify(args.at(-1)));
 } else if (args[1] === 'kill-pane') {
   const pid = Number(args[args.indexOf('--pane-id') + 1]);
   // Only a process created by this fixture can be signalled.

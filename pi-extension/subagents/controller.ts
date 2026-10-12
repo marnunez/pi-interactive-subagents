@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { statSync, existsSync, unlinkSync } from "node:fs";
 import { waitForConnection } from "./launch-process.ts";
-import { surfaceAlive } from "./terminal-launch.ts";
+import { surfaceAlive, refreshChildTabTitles } from "./terminal-launch.ts";
 import { restoreRunLedger, CLOSED_ENTRY, IDENTITY_ENTRY } from "./run-ledger.ts";
 import { collectOpenDescendants, terminateWorkspaceChild } from "./termination.ts";
 import { closeSurface } from "./cmux.ts";
@@ -86,7 +86,10 @@ export function createController(pi: ExtensionAPI, runtime: RunRuntime) {
   });
 
   const completedRuns = new Map<string, SubagentResult>();
-  const cleanupTimers = new Map<string, { timer: ReturnType<typeof setTimeout>; cleanup: (force?: boolean) => void; done: Promise<void> }>();
+  const cleanupTimers = new Map<string, { run: RunningSubagent; timer: ReturnType<typeof setTimeout>; cleanup: (force?: boolean) => void; done: Promise<void> }>();
+  const refreshTitles = () => refreshChildTabTitles(
+    [...runtime.runningSubagents.values()], [...cleanupTimers.values()].map(({ run }) => run.surface),
+  );
   let drainPromise: Promise<void> | undefined;
   const deliverResult = (result: SubagentResult) => pi.sendMessage({
     customType: "subagent_result", content: buildSubagentResultContent(result),
@@ -157,11 +160,13 @@ export function createController(pi: ExtensionAPI, runtime: RunRuntime) {
       const pending = cleanupTimers.get(childId);
       if (pending) clearTimeout(pending.timer);
       cleanupTimers.delete(childId);
+      refreshTitles();
       pi.appendEntry(CLOSED_ENTRY, { id: childId, runId: childId, closedAt: Date.now() });
       resolveCleanup();
     };
     const graceMs = Math.max(2_000, (5 - Number(process.env.PI_SUBAGENT_DEPTH ?? "0")) * 2_000);
-    cleanupTimers.set(childId, { cleanup, done, timer: setTimeout(() => cleanup(true), graceMs) });
+    cleanupTimers.set(childId, { run: running, cleanup, done, timer: setTimeout(() => cleanup(true), graceMs) });
+    refreshTitles();
     updateWidget();
     if (notify) deliverResult(correlatedResult);
     return done;
@@ -204,9 +209,12 @@ export function createController(pi: ExtensionAPI, runtime: RunRuntime) {
     }
   };
 
-  const recordSurface = (running: RunningSubagent) => pi.appendEntry(IDENTITY_ENTRY, {
-    id: running.id, runId: running.runId, surface: running.surface, backgroundWorkspace: running.backgroundWorkspace,
-  });
+  const recordSurface = (running: RunningSubagent) => {
+    pi.appendEntry(IDENTITY_ENTRY, {
+      id: running.id, runId: running.runId, surface: running.surface, backgroundWorkspace: running.backgroundWorkspace,
+    });
+    refreshTitles();
+  };
 
   const drainChildren = (): Promise<void> => {
     if (drainPromise) return drainPromise;
@@ -503,6 +511,7 @@ export function createController(pi: ExtensionAPI, runtime: RunRuntime) {
       );
     }
     reportChildren();
+    refreshTitles();
     if (runtime.runningSubagents.size > 0) startWidgetRefresh();
   });
 

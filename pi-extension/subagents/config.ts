@@ -41,11 +41,12 @@ const SPAWNING_TOOLS = new Set([
 
 const CHILD_TOOLS = [
   "subagent_done",
-  "set_tab_title",
+  "set_pane_title",
   "write_artifact",
   "read_artifact",
 ] as const;
 const MANDATORY_CHILD_TOOL = "subagent_done";
+const LEGACY_CHILD_TOOLS = ["set_tab_title"] as const;
 
 const moduleDir = dirname(fileURLToPath(import.meta.url));
 const bundledAgentsDir = join(moduleDir, "../../agents");
@@ -277,7 +278,7 @@ function assertKnownExplicitTools(
 // Saved tools are the effective selection, not a role's requested defaults.
 // Do not add optional conveniences on resume or silently drop missing tools.
 export function restoreChildTools(saved: readonly string[], registeredToolNames: readonly string[]): string[] {
-  const known = new Set([...registeredToolNames, ...CHILD_TOOLS, ...OPTIONAL_CHILD_INSPECTION_TOOLS]);
+  const known = new Set([...registeredToolNames, ...CHILD_TOOLS, ...LEGACY_CHILD_TOOLS, ...OPTIONAL_CHILD_INSPECTION_TOOLS]);
   assertKnownExplicitTools("saved tools", saved, known);
   return unique([...saved, MANDATORY_CHILD_TOOL]);
 }
@@ -293,7 +294,7 @@ export function resolveChildTools(
   registeredToolNames: string[],
 ): string[] {
   const registered = new Set(registeredToolNames);
-  const knownTools = new Set([...registered, ...CHILD_TOOLS, ...OPTIONAL_CHILD_INSPECTION_TOOLS]);
+  const knownTools = new Set([...registered, ...CHILD_TOOLS, ...LEGACY_CHILD_TOOLS, ...OPTIONAL_CHILD_INSPECTION_TOOLS]);
   const requested = parseToolCsv(defaults.tools);
   const allowed = parseToolCsv(defaults.allowTools);
   const denied = parseToolCsv(defaults.denyTools);
@@ -305,6 +306,7 @@ export function resolveChildTools(
   const selected = defaults.tools !== undefined
     ? unique(requested.filter((name) => registered.has(name) || knownTools.has(name)))
     : unique(activeToolNames.filter((name) => registered.has(name)
+      && !LEGACY_CHILD_TOOLS.some((tool) => tool === name)
       && !OPTIONAL_CHILD_INSPECTION_TOOLS.some((tool) => tool === name)));
 
   for (const tool of CHILD_TOOLS) {

@@ -15,6 +15,6 @@ description: Plan a change with optional focused delegation.
 subagent({ name: "Investigate auth", task: "Trace authentication and report relevant code paths with file references. Do not edit files." });
 ```
 
-WezTerm automatically places children in dedicated tabs in the originating Pi window, at most two child panes per tab (new tab, split, new tab). The parent tab stays untouched; do not arrange panes manually. tmux placement is unchanged.
+WezTerm automatically places children in dedicated tabs in the originating Pi window, at most two child panes per tab (new tab, split, new tab). The parent tab stays untouched; do not arrange panes manually. Pane display names are automatic at startup/resume/reload; never require a first-action model title call. The parent maintains shared tab labels from the child names (e.g. `Review | Implement`), removing finished/cancelled names. Optional child progress uses `set_pane_title` on its own pane only, not the shared tab, workspace or window. `set_tab_title` is a pane-only compatibility alias for explicit/saved selections, not a default tool for new runs. tmux placement is unchanged.
 
 Agents share the filesystem by default; partition concurrent edits or explicitly request `worktree: true` for a separate managed Git checkout. Review and integrate child changes manually. Child completion requires `subagent_done`. Do not infer success merely because a child stops speaking.

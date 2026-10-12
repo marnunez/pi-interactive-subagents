@@ -105,6 +105,7 @@ interface ExtensionHarness {
   ctx: any;
   shutdownCount: () => number;
   messages: any[];
+  titles: string[];
   emit: (eventName: string, event?: Record<string, unknown>) => Promise<void>;
 }
 
@@ -117,12 +118,14 @@ function createExtensionHarness(sessionFile: string): ExtensionHarness {
   const handlers = new Map<string, Array<(event: any, ctx: any) => unknown>>();
   const tools = new Map<string, any>();
   const messages: any[] = [];
+  const titles: string[] = [];
   let shutdowns = 0;
   let nextEntry = entries.length;
   let activeTools: string[] = [];
   const events = new EventEmitter();
 
   const ui = {
+    setTitle(title: string) { titles.push(title); },
     setWidget() {},
     async select() { return undefined; },
     async confirm() { return false; },
@@ -132,6 +135,7 @@ function createExtensionHarness(sessionFile: string): ExtensionHarness {
   };
   const ctx = {
     ui,
+    mode: "tui",
     model: undefined,
     modelRegistry: { find() { return undefined; } },
     sessionManager: {
@@ -192,6 +196,7 @@ function createExtensionHarness(sessionFile: string): ExtensionHarness {
     ctx,
     shutdownCount: () => shutdowns,
     messages,
+    titles,
     async emit(eventName, event = {}) {
       for (const handler of handlers.get(eventName) ?? []) {
         await handler({ type: eventName, ...event }, ctx);
@@ -207,6 +212,49 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
 }
+
+describe("automatic child pane names", () => {
+  it("names startup/reload/resume without any model event or tool request, even with all optional tools denied", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "child-title-startup-"));
+    const sessionFile = createSessionFile(dir);
+    configureChildEnv({ runId: "title-one" });
+    process.env.PI_SUBAGENT_NAME = "Review\u0007\u001b]2;unsafe\u009c";
+    process.env.PI_SUBAGENT_TOOLS = "subagent_done";
+    const h = createExtensionHarness(sessionFile);
+    try {
+      await h.emit("session_start");
+      assert.deepEqual(h.titles, ["Review]2;unsafe"]);
+      await h.emit("session_shutdown", { reason: "reload" });
+      await h.emit("session_start", { reason: "reload" });
+      assert.deepEqual(h.titles, ["Review]2;unsafe", "Review]2;unsafe"]);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(h.titles.at(-1), "Review]2;unsafe", "Name must survive Pi's post-session_start default title");
+      h.ctx.ui.setTitle("Working");
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(h.titles.at(-1), "Working", "Startup naming must not keep overwriting later progress");
+      h.ctx.ui.setTitle = () => { throw new Error("Cosmetic failure"); };
+      await h.emit("session_start", { reason: "reload" });
+      await h.emit("session_shutdown", { reason: "reload" });
+      configureChildEnv({ runId: "title-two" });
+      process.env.PI_SUBAGENT_NAME = "Resumed review";
+      const resumed = createExtensionHarness(sessionFile);
+      await resumed.emit("session_start");
+      assert.deepEqual(resumed.titles, ["Resumed review"]);
+      resumed.ctx.mode = "rpc";
+      await resumed.emit("session_start");
+      assert.equal(resumed.titles.length, 1, "RPC must not set terminal titles");
+      await resumed.emit("session_shutdown", { reason: "reload" });
+      process.env.PI_SUBAGENT_NAME = "";
+      const emptyName = createExtensionHarness(sessionFile);
+      await emptyName.emit("session_start");
+      assert.deepEqual(emptyName.titles, ["Subagent"]);
+      await emptyName.emit("session_shutdown", { reason: "reload" });
+    } finally {
+      await h.emit("session_shutdown", { reason: "reload" });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("run-scoped durable completion", () => {
   it("selects two independent runs, ignores legacy/other results, and rejects conflicts", () => {

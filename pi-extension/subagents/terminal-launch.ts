@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { getMuxBackend, type MuxBackend } from "./cmux.ts";
+import { terminalTitle } from "./terminal-title.mjs";
 
 export interface TerminalLaunch {
   runId: string;
@@ -9,7 +10,7 @@ export interface TerminalLaunch {
   siblingSurfaces?: string[];
 }
 
-interface WezTermPane {
+export interface WezTermPane {
   pane_id: number;
   tab_id: number;
   window_id: number;
@@ -69,6 +70,45 @@ export function launchVisibleSurface(launch: TerminalLaunch) {
     throw new Error("Terminal launch did not return a valid pane identity; inspect the mux before retrying.");
   }
   return { surface };
+}
+
+/** Plan labels only for live, wholly owned dedicated tabs in the origin window.
+ * Retiring panes are still owned until cleanup, but their names leave the label.
+ * No cached tab IDs or focused-pane assumptions survive moves/reload.
+ */
+export function childTabLabels(
+  runs: readonly { surface: string; name: string }[], panes: readonly WezTermPane[],
+  originPane = process.env.WEZTERM_PANE, retiringSurfaces: readonly string[] = [],
+): { tabId: number; title: string }[] {
+  const origin = panes.find(pane => String(pane.pane_id) === originPane);
+  if (!origin || !Number.isSafeInteger(origin.tab_id) || !Number.isSafeInteger(origin.window_id)) return [];
+  const active = new Map(runs.filter(run => /^\d+$/.test(run.surface)).map(run => [run.surface, run.name]));
+  const owned = new Set([...active.keys(), ...retiringSurfaces]);
+  const labels: { tabId: number; title: string }[] = [];
+  for (const tabId of new Set(panes.map(pane => pane.tab_id))) {
+    if (!Number.isSafeInteger(tabId) || tabId === origin.tab_id) continue;
+    const tab = panes.filter(pane => pane.tab_id === tabId);
+    if (!tab.length || tab.length > 2 || tab.some(pane => pane.window_id !== origin.window_id || !owned.has(String(pane.pane_id)))) continue;
+    const names = tab.filter(pane => active.has(String(pane.pane_id)))
+      .sort((a, b) => a.pane_id - b.pane_id)
+      .map(pane => terminalTitle(active.get(String(pane.pane_id))!, "Subagent", 78));
+    if (names.length) labels.push({ tabId, title: terminalTitle(names.join(" | ")) });
+  }
+  return labels;
+}
+
+/** Cosmetic, parent-owned labels. A broken CLI/title must never mask lifecycle errors. */
+export function refreshChildTabTitles(runs: readonly { surface: string; name: string }[], retiringSurfaces: readonly string[] = []): void {
+  if (!runs.some(run => /^\d+$/.test(run.surface))) return;
+  try {
+    if (getMuxBackend() !== "wezterm") return;
+    const panes: WezTermPane[] = JSON.parse(execFileSync("wezterm", ["cli", "list", "--format", "json"], { encoding: "utf8", timeout: 3000 }));
+    for (const { tabId, title } of childTabLabels(runs, panes, process.env.WEZTERM_PANE, retiringSurfaces)) {
+      try {
+        execFileSync("wezterm", ["cli", "set-tab-title", "--tab-id", String(tabId), "--", title], { encoding: "utf8", timeout: 3000, stdio: "ignore" });
+      } catch { /* Best effort, independently for each owned tab. */ }
+    }
+  } catch { /* Failed inspection is not a lifecycle failure. */ }
 }
 
 export function surfaceAlive(surface: string): boolean | undefined {

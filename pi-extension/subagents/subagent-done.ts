@@ -7,6 +7,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { registerInspectionTools } from "./inspection-tools.ts";
+import { terminalTitle } from "./terminal-title.mjs";
 
 const defineTool = <T>(tool: T): T => tool;
 import {
@@ -37,7 +38,7 @@ const MAX_NEXT_STEPS = 20;
 const MAX_NEXT_STEP_CHARS = 500;
 const COMPLETION_RETRY_MS = 250;
 const COMPLETION_ACK_TIMEOUT_MS = 10_000;
-const CHILD_LIFECYCLE_TOOLS = ["subagent_done", "set_tab_title"];
+const CHILD_LIFECYCLE_TOOLS = ["subagent_done"];
 
 const DoneParams = Type.Object({
   status: Type.Union(
@@ -115,7 +116,8 @@ export function resolveChildActiveTools(
 ): string[] {
   const registered = new Set(registeredTools);
   const selected = lockedTools.length > 0 ? lockedTools : activeTools;
-  const lifecycleTools = CHILD_LIFECYCLE_TOOLS.filter((tool) => registered.has(tool));
+  const lifecycleTools = [...CHILD_LIFECYCLE_TOOLS, ...(lockedTools.length ? [] : ["set_pane_title"])]
+    .filter((tool) => registered.has(tool));
   return [...new Set([...selected, ...lifecycleTools])];
 }
 
@@ -189,6 +191,7 @@ export default function (pi: ExtensionAPI) {
   let completionTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
   let completionShutdownRequested = false;
   let latestCtx: ExtensionContext | null = null;
+  let startupTitle: ReturnType<typeof setImmediate> | null = null;
   let runState: "idle" | "running" = "idle";
   let stopUiMonitor: (() => void) | null = null;
   const pendingUiRequests = new PendingExtensionUiRequests();
@@ -315,6 +318,8 @@ export default function (pi: ExtensionAPI) {
   }
 
   function cleanupSessionResources(): void {
+    if (startupTitle) clearImmediate(startupTitle);
+    startupTitle = null;
     clearCompletionDeliveryTimers();
     pendingCompletion = null;
     stopUiMonitor?.();
@@ -381,6 +386,19 @@ export default function (pi: ExtensionAPI) {
     receivedParentMessages.clear();
     registerChildListener();
     latestCtx = ctx;
+    if (runId && ctx.mode === "tui") {
+      const namePane = () => {
+        try { ctx.ui.setTitle(terminalTitle(subagentName)); } catch { /* Cosmetic only. */ }
+      };
+      namePane();
+      // Pi 0.87 rebindCurrentSession resets its default title after awaiting
+      // session_start. Reassert once on the next event-loop turn, not a polling
+      // timer, so later model progress remains free to name this pane.
+      startupTitle = setImmediate(() => {
+        startupTitle = null;
+        if (latestCtx === ctx) namePane();
+      });
+    }
     completionShutdownRequested = false;
     runState = ctx.isIdle() ? "idle" : "running";
 
