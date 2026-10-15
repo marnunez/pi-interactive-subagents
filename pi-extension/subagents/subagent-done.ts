@@ -8,6 +8,7 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { registerInspectionTools } from "./inspection-tools.ts";
 import { terminalTitle } from "./terminal-title.mjs";
+import { CHILD_TOOL_LOADOUT_ENTRY, readChildToolLoadout } from "./config.ts";
 
 const defineTool = <T>(tool: T): T => tool;
 import {
@@ -113,9 +114,12 @@ export function resolveChildActiveTools(
   activeTools: readonly string[],
   lockedTools: readonly string[],
   registeredTools: readonly string[],
+  dynamic = false,
 ): string[] {
   const registered = new Set(registeredTools);
-  const selected = lockedTools.length > 0 ? lockedTools : activeTools;
+  const selected = lockedTools.length > 0
+    ? dynamic ? activeTools.filter((name) => lockedTools.includes(name)) : lockedTools
+    : activeTools;
   const lifecycleTools = [...CHILD_LIFECYCLE_TOOLS, ...(lockedTools.length ? [] : ["set_pane_title"])]
     .filter((tool) => registered.has(tool));
   return [...new Set([...selected, ...lifecycleTools])];
@@ -209,6 +213,39 @@ export default function (pi: ExtensionAPI) {
     .split(",")
     .map((value) => value.trim())
     .filter(Boolean);
+
+  // Absence means a pre-v2 launch: retain its exact visibility lock.
+  const initialToolsCsv = process.env.PI_SUBAGENT_INITIAL_TOOLS;
+  const dynamicTools = initialToolsCsv !== undefined;
+  const initialTools = (initialToolsCsv ?? "").split(",").map((name) => name.trim()).filter(Boolean);
+  if (dynamicTools && (!lockedTools.length || initialTools.some((name) => !lockedTools.includes(name)))) {
+    throw new Error("Invalid initial subagent tools: visibility must be a subset of the permission ceiling.");
+  }
+  let pendingTools: string[] = [];
+  let selectedTools: string[] | undefined;
+  let loadoutEpoch = 0;
+  let loadoutRefreshScheduled = false;
+  const branchLoadout = (ctx: ExtensionContext) => readChildToolLoadout(
+    ctx.sessionManager.getBranch?.() ?? ctx.sessionManager.getEntries(), ctx.sessionManager.getSessionId(),
+  );
+  const applyLoadout = (selected: readonly string[]) => {
+    const registered = pi.getAllTools().map((tool) => tool.name);
+    const names = resolveChildActiveTools(selected, lockedTools, registered, dynamicTools);
+    pendingTools = names.filter((name) => !registered.includes(name));
+    selectedTools = names;
+    pi.setActiveTools(names);
+    toolNames = names.slice().sort();
+  };
+  const persistLoadout = (ctx: ExtensionContext) => {
+    if (!dynamicTools) return;
+    const names = resolveChildActiveTools([...(selectedTools ?? initialTools), ...pendingTools], lockedTools,
+      pi.getAllTools().map((tool) => tool.name), true);
+    toolNames = names.slice().sort();
+    const previous = branchLoadout(ctx);
+    if (JSON.stringify(previous) !== JSON.stringify(names)) {
+      pi.appendEntry(CHILD_TOOL_LOADOUT_ENTRY, { sessionId: ctx.sessionManager.getSessionId(), activeTools: names });
+    }
+  };
 
   const ipc = runId && socketPath && token
     ? new ChildIpcClient({
@@ -317,6 +354,8 @@ export default function (pi: ExtensionAPI) {
   }
 
   function cleanupSessionResources(): void {
+    loadoutEpoch++;
+    loadoutRefreshScheduled = false;
     clearCompletionDeliveryTimers();
     pendingCompletion = null;
     stopUiMonitor?.();
@@ -421,6 +460,10 @@ export default function (pi: ExtensionAPI) {
       });
     });
 
+    // Restore this session's active branch, never a forked parent's loadout or eager preset.
+    applyLoadout(dynamicTools ? branchLoadout(ctx) ?? initialTools : pi.getActiveTools());
+    persistLoadout(ctx);
+
     ipc?.start();
     ipc?.send("ready", {
       sessionId: ctx.sessionManager.getSessionId(),
@@ -430,7 +473,6 @@ export default function (pi: ExtensionAPI) {
     });
     if (persistedCompletion) beginCompletionDelivery(persistedCompletion);
 
-    toolNames = resolveChildActiveTools(pi.getActiveTools(), lockedTools, pi.getAllTools().map((t) => t.name)).sort();
     denied = (process.env.PI_DENY_TOOLS ?? "")
       .split(",")
       .map((s) => s.trim())
@@ -452,11 +494,15 @@ export default function (pi: ExtensionAPI) {
       }
     }
     if (lockedThinking) pi.setThinkingLevel(lockedThinking as any);
-    pi.setActiveTools(resolveChildActiveTools(
-      pi.getActiveTools(),
-      lockedTools,
-      pi.getAllTools().map((tool) => tool.name),
-    ));
+    applyLoadout([...(dynamicTools ? selectedTools ?? initialTools : pi.getActiveTools()), ...pendingTools]);
+    if (latestCtx) persistLoadout(latestCtx);
+  });
+
+  // A search can add declarations within a turn. Keep them across later runs/reload/resume.
+  pi.on("tool_result", (_event, ctx) => { persistLoadout(ctx); });
+  pi.on("agent_end", (_event, ctx) => { persistLoadout(ctx); });
+  pi.on("session_tree", (_event, ctx) => {
+    if (dynamicTools) applyLoadout(branchLoadout(ctx) ?? initialTools);
   });
 
   pi.on("agent_start", () => {
@@ -530,6 +576,37 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool(defineTool({
     name: "subagent_done",
     label: "Subagent Done",
+    exposure: "model-only",
+    // Pi's --tools registry refresh reactivates all allowed direct tools, even after an
+    // unrelated registration. Hide those accidental declarations without changing permissions.
+    // Deferred/codemode declarations are added only deliberately (e.g. by tool_search).
+    prepareLoadout(loadout: { declared: readonly { name: string }[]; registered: readonly { name: string }[]; getExposure(name: string): string }) {
+      if (!dynamicTools || !selectedTools) return;
+      for (const tool of loadout.declared) {
+        if (lockedTools.includes(tool.name) && ["deferred", "codemode"].includes(loadout.getExposure(tool.name))
+          && !selectedTools.includes(tool.name)) selectedTools.push(tool.name);
+      }
+      const declared = new Set(loadout.declared.map((tool) => tool.name));
+      const missingSelected = loadout.registered.some((tool) => selectedTools!.includes(tool.name)
+        && !declared.has(tool.name) && loadout.getExposure(tool.name) !== "hidden");
+      if (missingSelected && !loadoutRefreshScheduled) {
+        loadoutRefreshScheduled = true;
+        const epoch = loadoutEpoch;
+        // setActiveTools invokes prepareLoadout again: wait until this registry refresh
+        // finishes rather than recurse into it. Retry late deferred connections in this run.
+        queueMicrotask(() => {
+          if (epoch !== loadoutEpoch || !latestCtx) return;
+          loadoutRefreshScheduled = false;
+          try {
+            applyLoadout(selectedTools ?? initialTools);
+            persistLoadout(latestCtx);
+          } catch (error) {
+            latestCtx.ui.notify(`Could not restore selected child tools: ${String(error)}`, "error");
+          }
+        });
+      }
+      return { hiddenDeclarations: loadout.declared.filter((tool) => !selectedTools!.includes(tool.name)).map((tool) => tool.name) };
+    },
     description:
       "Finish the current subagent run with success, failed, or blocked. Each run accepts one terminal result. " +
       "Persists a structured result, ends the current run after parent acknowledgement, and leaves the session resumable. " +

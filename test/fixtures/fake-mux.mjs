@@ -24,6 +24,7 @@ if (args[1] === 'split-pane' || args[1] === 'spawn') {
   const journal = readFileSync(process.env.TEST_PARENT_SESSION, 'utf8').trim().split('\n').map(JSON.parse);
   appendFileSync(join(directory, 'launches.jsonl'), JSON.stringify({
     argv: spec.argv, cwd: spec.cwd, runId: spec.env.PI_SUBAGENT_ID,
+    allowedTools: spec.env.PI_SUBAGENT_TOOLS, initialTools: spec.env.PI_SUBAGENT_INITIAL_TOOLS,
     journalledBeforeStart: journal.some(entry => entry.customType === 'subagent_ipc_launch' && entry.data.runId === spec.env.PI_SUBAGENT_ID),
   }) + '\n');
   const child = spawn(argv[0], argv.slice(1), { stdio: 'ignore', detached: true });

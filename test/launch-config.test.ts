@@ -18,12 +18,20 @@ test("resume distinguishes missing snapshots from malformed or unsupported snaps
   const path = join(dir, "config.json");
   try {
     assert.equal(readChildRunConfig(path), undefined);
-    for (const invalid of ["{", "{}", '{"tools":null,"autoExit":false}', '{"tools":[42],"autoExit":false}', '{"schemaVersion":2,"tools":[],"autoExit":false}']) {
+    for (const invalid of ["{", "{}", '{"tools":null,"autoExit":false}', '{"tools":[42],"autoExit":false}',
+      '{"schemaVersion":2,"tools":[],"autoExit":false}',
+      '{"schemaVersion":3,"tools":[],"autoExit":false}',
+      '{"schemaVersion":2,"tools":["read"],"initialTools":["write"],"autoExit":false}',
+      '{"schemaVersion":1,"tools":["read"],"initialTools":[],"autoExit":false}',
+      '{"tools":["*"],"autoExit":false}', '{"tools":["+write"],"autoExit":false}']) {
       writeFileSync(path, invalid);
       assert.throws(() => readChildRunConfig(path), /configuration/);
     }
     const config = { schemaVersion: 1, tools: ["read", "subagent_done"], autoExit: false, skills: "uv", systemPrompt: "role" };
     writeFileSync(path, JSON.stringify(config));
     assert.deepEqual(readChildRunConfig(path), config);
+    const dynamic = { ...config, schemaVersion: 2, tools: [...config.tools, "browser_navigate"], initialTools: ["read", "subagent_done"] };
+    writeFileSync(path, JSON.stringify(dynamic));
+    assert.deepEqual(readChildRunConfig(path), dynamic);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

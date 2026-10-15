@@ -30,6 +30,7 @@ const CHILD_ENV_NAMES = [
   "PI_SUBAGENT_MODEL",
   "PI_SUBAGENT_THINKING",
   "PI_SUBAGENT_TOOLS",
+  "PI_SUBAGENT_INITIAL_TOOLS",
 ] as const;
 const ORIGINAL_CHILD_ENV = new Map(
   CHILD_ENV_NAMES.map((name) => [name, process.env[name]]),
@@ -99,6 +100,7 @@ function createSessionFile(dir: string, entries: SessionEntry[] = []): string {
 
 interface ExtensionHarness {
   events: EventEmitter;
+  pi: any;
   entries: SessionEntry[];
   handlers: Map<string, Array<(event: any, ctx: any) => unknown>>;
   tools: Map<string, any>;
@@ -142,6 +144,7 @@ function createExtensionHarness(sessionFile: string): ExtensionHarness {
       getSessionId() { return "child-session-id"; },
       getSessionFile() { return sessionFile; },
       getEntries() { return entries; },
+      getBranch() { return entries; },
     },
     isIdle() { return true; },
     async abort() {},
@@ -176,10 +179,17 @@ function createExtensionHarness(sessionFile: string): ExtensionHarness {
       appendFileSync(sessionFile, JSON.stringify(entry) + "\n");
     },
     getAllTools() {
-      return [...tools.values()].map((tool) => ({ name: tool.name }));
+      return [...tools.values()];
     },
     getActiveTools() { return activeTools; },
-    setActiveTools(names: string[]) { activeTools = names; },
+    setActiveTools(names: string[]) {
+      activeTools = names.filter(name => tools.has(name));
+      for (const name of activeTools) tools.get(name)?.prepareLoadout?.({
+        declared: activeTools.map(name => tools.get(name)),
+        registered: [...tools.values()],
+        getExposure: (name: string) => tools.get(name)?.exposure ?? "direct",
+      });
+    },
     async setModel() { return true; },
     setThinkingLevel() {},
     getSessionName() { return entries.findLast(entry => entry.type === "session_info")?.name; },
@@ -196,6 +206,7 @@ function createExtensionHarness(sessionFile: string): ExtensionHarness {
 
   return {
     events,
+    pi,
     entries,
     handlers,
     tools,
@@ -218,6 +229,95 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
 }
+
+describe("separate child permissions and visibility", () => {
+  it("keeps discovery within the ceiling across turns, reload, resume and branch changes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "child-loadout-"));
+    const sessionFile = createSessionFile(dir);
+    configureChildEnv({ runId: "dynamic-one" });
+    process.env.PI_SUBAGENT_TOOLS = "read,tool_search,codemode,browser_navigate,subagent_done";
+    process.env.PI_SUBAGENT_INITIAL_TOOLS = "read,tool_search,codemode,subagent_done";
+    const setup = () => {
+      const h = createExtensionHarness(sessionFile);
+      for (const name of ["read", "tool_search", "codemode", "browser_navigate", "forbidden"]) h.tools.set(name, { name, exposure: name === "browser_navigate" ? "deferred" : "direct" });
+      // Simulate startup presets eagerly enabling everything before the child hook.
+      h.pi.setActiveTools([...h.tools.keys()]);
+      return h;
+    };
+    const h = setup();
+    try {
+      await h.emit("session_start");
+      assert.ok(!h.pi.getActiveTools().includes("browser_navigate"));
+      const branchPoint = h.entries.slice();
+      h.pi.setActiveTools([...h.pi.getActiveTools(), "browser_navigate", "forbidden"]);
+      await h.emit("tool_result", { toolName: "tool_search" });
+      await h.emit("before_agent_start");
+      assert.ok(h.pi.getActiveTools().includes("browser_navigate"));
+      assert.ok(!h.pi.getActiveTools().includes("forbidden"));
+      const gate = h.handlers.get("tool_call")![0];
+      assert.equal((await gate({ toolName: "browser_navigate", parentToolCallId: "script/1" }, h.ctx)), undefined);
+      assert.equal((await gate({ toolName: "forbidden", parentToolCallId: "script/1" }, h.ctx) as any).block, true);
+      assert.equal((await gate({ toolName: "forbidden" }, h.ctx) as any).block, true);
+      await h.emit("session_shutdown", { reason: "reload" });
+      const reload = setup();
+      await reload.emit("session_start");
+      assert.ok(reload.pi.getActiveTools().includes("browser_navigate"));
+      await reload.emit("session_shutdown", { reason: "reload" });
+      process.env.PI_SUBAGENT_ID = "dynamic-resume";
+      const resumed = setup();
+      await resumed.emit("session_start");
+      assert.ok(resumed.pi.getActiveTools().includes("browser_navigate"));
+      resumed.ctx.sessionManager.getBranch = () => branchPoint;
+      await resumed.emit("session_tree");
+      assert.ok(!resumed.pi.getActiveTools().includes("browser_navigate"), "An abandoned branch's discovery must not leak");
+      await resumed.emit("session_shutdown", { reason: "reload" });
+      const fork = setup();
+      fork.ctx.sessionManager.getSessionId = () => "different-child-session";
+      await fork.emit("session_start");
+      assert.ok(!fork.pi.getActiveTools().includes("browser_navigate"), "Fork history is not the new child's visibility policy");
+      await fork.emit("session_shutdown", { reason: "reload" });
+    } finally {
+      await h.emit("session_shutdown", { reason: "reload" });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("retains pending declarations while a permitted tool reconnects", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "child-loadout-pending-"));
+    const sessionFile = createSessionFile(dir);
+    configureChildEnv({ runId: "pending" });
+    process.env.PI_SUBAGENT_TOOLS = "read,mcp__docs__search,subagent_done";
+    process.env.PI_SUBAGENT_INITIAL_TOOLS = "read,mcp__docs__search,subagent_done";
+    const h = createExtensionHarness(sessionFile);
+    h.tools.set("read", { name: "read" });
+    try {
+      await h.emit("session_start");
+      await h.emit("before_agent_start");
+      const snapshot = h.entries.findLast((entry: any) => entry.customType === "subagent_tool_loadout")?.data as { activeTools: string[] } | undefined;
+      assert.ok(snapshot?.activeTools.includes("mcp__docs__search"));
+      h.tools.set("mcp__docs__search", { name: "mcp__docs__search", exposure: "deferred" });
+      h.pi.setActiveTools(h.pi.getActiveTools()); // Native registry refresh runs prepareLoadout.
+      await Promise.resolve();
+      assert.ok(h.pi.getActiveTools().includes("mcp__docs__search"), "Registration recovers during this run, without a second before_agent_start");
+      h.pi.setActiveTools(["read", "subagent_done"]); // Queue another retry, then invalidate it.
+      await h.emit("session_shutdown", { reason: "reload" });
+      assert.ok(!h.pi.getActiveTools().includes("mcp__docs__search"), "Queued work must not mutate a shutdown/reloaded extension");
+    } finally {
+      await h.emit("session_shutdown", { reason: "reload" });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a visibility override outside the saved permissions before startup", () => {
+    const dir = mkdtempSync(join(tmpdir(), "child-loadout-invalid-"));
+    try {
+      configureChildEnv({ runId: "invalid" });
+      process.env.PI_SUBAGENT_TOOLS = "read,subagent_done";
+      process.env.PI_SUBAGENT_INITIAL_TOOLS = "write";
+      assert.throws(() => createExtensionHarness(createSessionFile(dir)), /subset of the permission ceiling/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
 
 describe("automatic child pane names", () => {
   it("survives delayed core title resets by persisting only the child's display name", async () => {

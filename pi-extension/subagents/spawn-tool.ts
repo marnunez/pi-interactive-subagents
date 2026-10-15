@@ -1,6 +1,6 @@
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { loadAgentDefaults } from "./config.ts";
+import { loadAgentDefaults, parentVisibleTools } from "./config.ts";
 import { isMuxAvailable } from "./cmux.ts";
 import { defineTool, SUBAGENT_ASYNC_GUIDANCE, SUBAGENT_LAYOUT_GUIDANCE, SubagentParams, type SubagentParamsValue, muxUnavailableResult } from "./policy.ts";
 import { launchSubagent } from "./launch.ts";
@@ -84,9 +84,10 @@ export function registerSpawnTool(pi: ExtensionAPI, runtime: RunRuntime, control
         }
 
         // Prepare a durable run, then create its pane with a direct programme argv.
-        const allToolNames = pi.getAllTools().map((t: any) => t.name);
+        const toolMetadata = pi.getAllTools();
+        const allToolNames = toolMetadata.map((tool) => tool.name);
         const running = await launchSubagent(runtime, params, ctx, {
-          allToolNames, activeToolNames: pi.getActiveTools(), projectTrusted: ctx.isProjectTrusted(),
+          allToolNames, toolMetadata, activeToolNames: parentVisibleTools(pi.getActiveTools(), ctx.sessionManager), projectTrusted: ctx.isProjectTrusted(),
           onPrepared: (running) => {
             pi.appendEntry(IPC_LAUNCH_ENTRY, serializeRunning(running));
             runtime.runningSubagents.set(running.id, running);

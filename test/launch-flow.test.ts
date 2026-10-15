@@ -48,7 +48,7 @@ async function fixture(action: (h: any) => Promise<void>) {
   };
   try {
     await emit('session_start');
-    await action({ directory, tools, entries, messages, ctx, readLines, until, emit });
+    await action({ directory, tools, entries, messages, ctx, pi, readLines, until, emit });
   } finally {
     await emit('session_shutdown', { reason: 'reload' });
     for (const [key, value] of Object.entries(saved)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
@@ -96,6 +96,37 @@ test('fresh launch and resume use direct argv in dedicated child tabs, journal b
     const ledger = restoreRunLedger(h.entries);
     assert.equal(ledger.unresolved.length, 0);
     assert.equal(ledger.finishes.size, 2);
+  });
+});
+
+test('deferred permissions survive launch and resume without inheriting a broader later parent selection', async () => {
+  await fixture(async h => {
+    const metadata = [{ name: 'read', exposure: 'direct' }, { name: 'tool_search', exposure: 'model-only' }, { name: 'browser_navigate', exposure: 'deferred' }];
+    h.pi.getAllTools = () => metadata;
+    h.pi.getActiveTools = () => ['read', 'tool_search'];
+    const child = await h.tools.get('subagent').execute('spawn', { name: 'dynamic', task: 'fixture', initialTools: 'read,tool_search' }, undefined, undefined, h.ctx);
+    await h.until(() => h.messages.length === 1);
+    const configPath = join(getSessionArtifactDir(child.details.sessionFile), 'context/subagent-config.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    assert.equal(config.schemaVersion, 2);
+    assert.ok(config.tools.includes('browser_navigate'));
+    assert.deepEqual(config.initialTools, ['read', 'tool_search', 'subagent_done']);
+    metadata.push({ name: 'new_service', exposure: 'deferred' });
+    h.pi.getActiveTools = () => ['read', 'tool_search', 'new_service'];
+    await h.tools.get('subagent_resume').execute('resume', { sessionPath: child.details.sessionFile }, undefined, undefined, h.ctx);
+    await h.until(() => h.messages.length === 2);
+    const launches = h.readLines('launches.jsonl');
+    assert.ok(launches.every((launch: any) => launch.allowedTools === config.tools.join(',')));
+    assert.ok(launches.every((launch: any) => launch.initialTools === config.initialTools.join(',')));
+    // Migrate an old snapshot without expanding it to newly registered deferred tools.
+    delete config.initialTools;
+    config.schemaVersion = 1;
+    config.tools = ['read', 'subagent_done'];
+    writeFileSync(configPath, JSON.stringify(config));
+    await h.tools.get('subagent_resume').execute('resume', { sessionPath: child.details.sessionFile }, undefined, undefined, h.ctx);
+    const legacy = h.readLines('launches.jsonl').at(-1);
+    assert.equal(legacy.allowedTools, 'read,subagent_done');
+    assert.equal(legacy.initialTools, 'read,subagent_done');
   });
 });
 

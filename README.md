@@ -103,7 +103,7 @@ Results include run/session IDs, the session path and elapsed time. The model re
 
 ## Tools and commands
 
-- `subagent`: spawn with `name`, `task`, optional `agent`, `model`, `systemPrompt`, `tools`, `skills`, `cwd`, `fork`, `worktree` (opt-in).
+- `subagent`: spawn with `name`, `task`, optional `agent`, `model`, `systemPrompt`, `tools` (permission ceiling), `initialTools` (initially visible subset), `skills`, `cwd`, `fork`, `worktree` (opt-in).
 - `subagents_list`: list effective definitions.
 - `subagent_resume`: reuse a session with optional `name` and `message`. Without a message it opens interactively. Saved role/model/tools are restored; automatic exit is disabled.
 - `subagent_kill`: cancel by ID, name match or `all`. Omit the target only for an explicit user request to inspect running children—not polling.
@@ -145,7 +145,8 @@ Bundled defaults use `openai-codex/gpt-6-luna` for the scout and `openai-codex/g
 Supported frontmatter:
 
 - `model`, `thinking`: model and reasoning defaults; explicit tool-call model overrides the definition.
-- `tools`: **strict allowlist across built-ins and extension tools**. If absent, inherit the parent's active tools, not every registered tool.
+- `tools`: **strict allowlist across built-ins, extension and MCP tools**, whether initially visible or deferred. If absent, inherit the parent's active tools plus registered `deferred`/`codemode` tools, not inactive direct or hidden tools. Within a child run, inherit its saved permission ceiling instead; nested spawn/resume cannot exceed that ceiling.
+- `initial-tools`: optional initially visible subset of the allowed tools (`initialTools` in the tool call overrides it). By default, allowed deferred/codemode tools stay undeclared when a discovery tool is initially visible; explicit roles keep their allowed direct tools visible, while inherited children keep the parent's visible direct tools and optional child conveniences. Without a visible `tool_search` or `codemode`, selected deferred tools are declared directly so existing strict roles do not lose access. Unknown or denied initial tools fail rather than granting access.
 - `allow-tools`: narrow that selection further.
 - `deny-tools`: remove tools, including built-ins. Denials and `spawning: false` always win over optional allowlists.
 - `spawning: false`: disable spawn/list/resume/kill tools.
@@ -157,7 +158,24 @@ Supported frontmatter:
 
 `subagent_done` is always available. `set_pane_title`, `write_artifact` and `read_artifact` are added unless narrowed/denied. The legacy `set_tab_title` alias is never automatically granted to new runs; select it explicitly only for compatibility. Unknown explicit tool names fail with an error. Update old definitions that relied on implicit extension access: e.g. a worker using todos needs `todo` in `tools`, and browser agents must list `browser_*` tools explicitly.
 
-Agent bodies and `systemPrompt` are appended as system instructions for both fresh and forked runs. Forks copy validated active conversation history but not the parent's orchestration ledger. Resume restores the saved **effective tool selection exactly**, adding only mandatory `subagent_done`; it does not re-add optional conveniences, inherit newly active parent tools or reread changed role defaults. A saved extension selection that is no longer available fails closed. Legacy sessions without a saved configuration still resolve their role defaults. Stale multiplexer or ancestor run variables are not inherited.
+Agent bodies and `systemPrompt` are appended as system instructions for both fresh and forked runs. Forks copy validated active conversation history but not the parent's orchestration ledger or child visibility snapshots. Resume restores the saved **permission ceiling exactly**, adding only mandatory `subagent_done`; it does not re-add optional conveniences, inherit newly active parent tools or reread changed role defaults. Version 2 launch snapshots save both `tools` and `initialTools`; older snapshots use their original tools for both. A saved extension selection that is no longer available, or exceeds a resuming child's permissions, fails closed. Legacy sessions without a saved configuration still resolve their role defaults. Stale multiplexer or ancestor run variables are not inherited.
+
+### Deferred discovery (Pi v1)
+
+Permissions and declarations are separate. For example, with a `web_search` extension that registers its tool as `deferred`:
+
+```yaml
+tools: read, tool_search, web_search
+initial-tools: read, tool_search
+```
+
+The child starts with `read`, `tool_search` and mandatory completion visible, then searches for `web_search` when needed. Optional child conveniences are still allowed unless narrowed/denied, but are not declared by this explicit initial selection. `initialTools` alone cannot grant a tool outside `tools`. Ordinary roles without this field continue working; reviewer restrictions and `spawning: false` remain in force. Deferred tools are also callable through codemode when codemode is allowed. `subagent_done` is model-only, never callable from a script.
+
+Launches pass the whole permission ceiling to Pi's `--tools` so permitted extension tools remain registered, then select initial declarations before the first model request. Unselected MCP tools/resources are explicitly excluded when Pi's implicit MCP retention would otherwise bypass the registry allowlist. Child `tool_call` enforcement checks every direct or nested call against the ceiling; discovery does not grant permissions. A nested child cannot regain tools denied to its parent, even through an explicit role or a saved resume configuration.
+
+Discovered declarations are stored in session-local, active-branch `subagent_tool_loadout` entries, separate from the permission snapshot. They survive later prompts, reload and resume; `/tree` restores the selected branch's declarations. Forked parent snapshots are ignored. Temporarily unregistered permitted tools, such as reconnecting MCP tools, remain pending rather than losing their saved declarations. Pi's registry refresh can reactivate allowed direct tools internally. A `prepareLoadout` hook keeps those accidental declarations out of model requests without losing genuine deferred-tool discoveries; persistence and nested inheritance use the selected visibility, not that expanded internal active set. Selected tools that reconnect asynchronously are activated after the registry refresh, before the next model turn; queued retries are cancelled on reload/shutdown. Preset changes cannot replace the run's initial/branch visibility policy.
+
+Merely hiding an existing `direct` tool does **not** make it discoverable: native `tool_search` finds `deferred` and `codemode` tools. Such extensions must opt into those exposures. Inactive direct tools are not inherited accidentally, and tool exposure is not a sandbox or mutation-approval policy.
 
 **These are capability-selection controls, not a sandbox.** Bash and extensions run with the same Unix-user authority as Pi. Neither profiles nor tool allowlists provide filesystem isolation.
 
@@ -208,7 +226,11 @@ Startup allows at most two minutes for the authenticated connection; an observed
 ```sh
 npm install
 npm test
+# Optional native Pi v1 integration; absolute path to the SDK from the installation to test:
+PI_OFFLINE=1 PI_V1_SDK_PATH=/path/to/pi/dist/index.js npm run test:pi-v1
 ```
+
+The Pi v1 integration uses a scripted local faux provider: no remote model calls, user credentials, live services or GUI operations. It verifies initial schema omission, native tool search and direct/nested execution, filtering of forbidden extension/MCP tools, asynchronous registry refreshes and selected deferred reconnections during a run, tree navigation, reload and resume. Standard regressions cover legacy launch snapshots, nested permission ceilings, denied initial tools and branch-local discovery.
 
 Tests cover session lineage, run-scoped persistence, completion retry/acknowledgement, reload recovery, cancellation, nested orchestration sockets, tool policy, profile discovery, artifacts and UI-state monitoring. Inspection regressions cover explicit child role selection, saved deny-tools on resume, literal search, adversarial paths/args, bounded output, symlinks, nested cwd and linked worktrees, huge ignored dependency/nested trees, tracked links and directory-to-link replacements, hostile inherited Git environment, disabled execution hooks/diff/textconv/clean/process filters (including local, conditional and worktree config), unchanged index bytes/mtime, invalid-byte filename/ignored-Unicode alias prevention, discovered control/backslash names, malformed-config refusal without ignored-secret fallback, and catalogue overflow. Launch/resume integration tests execute fake mux/Pi processes with real IPC: they assert journal-before-execution, direct argument handling, five concurrent children packed 2/2/1 in the origin window with parent/foreign panes untouched, direct targeted launch failures, reload, resume, startup acknowledgement and cancellation. Unit tests cover live moves, dead/completed children, foreign windows, full/mixed tabs and unchanged tmux argv. No paid model calls or live desktop operations are used.
 

@@ -8,6 +8,7 @@ import { OPTIONAL_CHILD_INSPECTION_TOOLS } from "./inspection.ts";
 export interface AgentDefaults {
   model?: string;
   tools?: string;
+  initialTools?: string;
   skills?: string;
   thinking?: string;
   denyTools?: string;
@@ -175,6 +176,7 @@ function defaultsFrom(content: string): AgentDefaults | null {
   return {
     model: scalarString(frontmatter.model),
     tools: toolString(frontmatter.tools),
+    initialTools: toolString(frontmatter["initial-tools"]),
     skills: toolString(frontmatter.skill) ?? toolString(frontmatter.skills),
     thinking: scalarString(frontmatter.thinking),
     denyTools: toolString(frontmatter["deny-tools"]),
@@ -277,10 +279,68 @@ function assertKnownExplicitTools(
 
 // Saved tools are the effective selection, not a role's requested defaults.
 // Do not add optional conveniences on resume or silently drop missing tools.
-export function restoreChildTools(saved: readonly string[], registeredToolNames: readonly string[]): string[] {
+export function restoreChildTools(saved: readonly string[], registeredToolNames: readonly string[], ceiling?: readonly string[]): string[] {
   const known = new Set([...registeredToolNames, ...CHILD_TOOLS, ...LEGACY_CHILD_TOOLS, ...OPTIONAL_CHILD_INSPECTION_TOOLS]);
   assertKnownExplicitTools("saved tools", saved, known);
+  assertWithinCeiling("saved tools", saved, ceiling);
   return unique([...saved, MANDATORY_CHILD_TOOL]);
+}
+
+export interface ToolMetadata {
+  name: string;
+  exposure?: string;
+}
+
+/** A nested run cannot grant tools outside its own saved capability selection. */
+export function parentToolCeiling(env: NodeJS.ProcessEnv = process.env): string[] | undefined {
+  if (!env.PI_SUBAGENT_ID || env.PI_SUBAGENT_TOOLS === undefined) return undefined;
+  return unique([...parseToolCsv(env.PI_SUBAGENT_TOOLS), MANDATORY_CHILD_TOOL]);
+}
+
+export const CHILD_TOOL_LOADOUT_ENTRY = "subagent_tool_loadout";
+
+/** Only this session's selected branch may supply its discovered declarations. */
+export function readChildToolLoadout(entries: readonly unknown[], sessionId: string): string[] | undefined {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i] as any;
+    if (entry.type === "custom" && entry.customType === CHILD_TOOL_LOADOUT_ENTRY
+      && entry.data?.sessionId === sessionId && Array.isArray(entry.data.activeTools)
+      && entry.data.activeTools.every((name: unknown) => typeof name === "string")) return entry.data.activeTools;
+  }
+  return undefined;
+}
+
+/** getActiveTools also includes declarations hidden by prepareLoadout; do not inherit those. */
+export function parentVisibleTools(active: string[], session: { getBranch(): readonly unknown[]; getSessionId(): string }): string[] {
+  return parentToolCeiling() ? readChildToolLoadout(session.getBranch(), session.getSessionId()) ?? active : active;
+}
+
+function assertWithinCeiling(field: string, names: readonly string[], ceiling?: readonly string[]): void {
+  if (!ceiling) return;
+  const forbidden = names.filter((name) => name !== MANDATORY_CHILD_TOOL && !ceiling.includes(name));
+  if (forbidden.length) throw new Error(`Tools in ${field} exceed the parent subagent's permissions: ${unique(forbidden).join(", ")}`);
+}
+
+/** Visibility never grants permissions. Deferred tools are omitted unless explicitly requested. */
+export function resolveChildInitialTools(
+  requested: string | undefined,
+  tools: readonly string[],
+  active: readonly string[],
+  metadata: readonly ToolMetadata[],
+  explicitTools = false,
+): string[] {
+  const exposure = new Map(metadata.map((tool) => [tool.name, tool.exposure]));
+  const selected = requested === undefined
+    ? tools.filter((name) => !["deferred", "codemode", "hidden"].includes(exposure.get(name) ?? "direct")
+      && (explicitTools || active.includes(name) || CHILD_TOOLS.some((tool) => tool === name)))
+    : parseToolCsv(requested);
+  // Existing strict roles must not lose tools when an extension adopts deferred exposure.
+  // Without an initially visible discovery mechanism, declare their optional tools directly.
+  if (requested === undefined && !selected.includes("tool_search") && !selected.includes("codemode")) {
+    selected.push(...tools.filter((name) => ["deferred", "codemode"].includes(exposure.get(name) ?? "direct")));
+  }
+  assertKnownExplicitTools("initialTools (initial-tools)", selected, new Set(tools));
+  return unique([...selected, MANDATORY_CHILD_TOOL]);
 }
 
 export function resolveChildTools(
@@ -292,6 +352,7 @@ export function resolveChildTools(
   },
   activeToolNames: string[],
   registeredToolNames: string[],
+  policy: { metadata?: readonly ToolMetadata[]; ceiling?: readonly string[] } = {},
 ): string[] {
   const registered = new Set(registeredToolNames);
   const knownTools = new Set([...registered, ...CHILD_TOOLS, ...LEGACY_CHILD_TOOLS, ...OPTIONAL_CHILD_INSPECTION_TOOLS]);
@@ -303,9 +364,15 @@ export function resolveChildTools(
   if (defaults.allowTools !== undefined) assertKnownExplicitTools("allowTools", allowed, knownTools);
   if (defaults.denyTools !== undefined) assertKnownExplicitTools("denyTools", denied, knownTools);
 
+  const hidden = new Set(policy.metadata?.filter((tool) => tool.exposure === "hidden").map((tool) => tool.name));
+  if (requested.some((name) => hidden.has(name))) throw new Error("Hidden tools cannot be granted to a subagent.");
+  const inherited = policy.ceiling ?? [
+    ...activeToolNames,
+    ...(policy.metadata ?? []).filter((tool) => tool.exposure === "deferred" || tool.exposure === "codemode").map((tool) => tool.name),
+  ];
   const selected = defaults.tools !== undefined
-    ? unique(requested.filter((name) => registered.has(name) || knownTools.has(name)))
-    : unique(activeToolNames.filter((name) => registered.has(name)
+    ? unique(requested)
+    : unique(inherited.filter((name) => registered.has(name) && !hidden.has(name)
       && !LEGACY_CHILD_TOOLS.some((tool) => tool === name)
       && !OPTIONAL_CHILD_INSPECTION_TOOLS.some((tool) => tool === name)));
 
@@ -316,11 +383,15 @@ export function resolveChildTools(
   const allowSet = defaults.allowTools === undefined ? null : new Set(allowed);
   const denySet = new Set(denied);
 
-  return selected.filter((name) => {
+  const result = selected.filter((name) => {
     if (name === MANDATORY_CHILD_TOOL) return true;
     if (allowSet && !allowSet.has(name)) return false;
     if (denySet.has(name)) return false;
     if (defaults.spawning === false && SPAWNING_TOOLS.has(name)) return false;
+    // Optional child conveniences are not an escape from an ancestor's denial.
+    if (policy.ceiling && CHILD_TOOLS.some((tool) => tool === name) && !policy.ceiling.includes(name)) return false;
     return true;
   });
+  assertWithinCeiling("tools", result, policy.ceiling);
+  return result;
 }

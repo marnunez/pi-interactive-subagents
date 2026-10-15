@@ -14,6 +14,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test test/*.ts",
+    "test:pi-v1": "node test/pi-v1-runtime.mjs",
     "test:visible": "node test/isolated-visible.mjs"
   },
   "peerDependencies": {

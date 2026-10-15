@@ -53,7 +53,10 @@ export const SubagentParams = Type.Object({
     Type.String({ description: "Comma-separated skills (overrides agent default)" }),
   ),
   tools: Type.Optional(
-    Type.String({ description: "Comma-separated tools (overrides agent default)" }),
+    Type.String({ description: "Strict comma-separated allowed tools, including deferred tools (overrides agent default)" }),
+  ),
+  initialTools: Type.Optional(
+    Type.String({ description: "Comma-separated initially visible subset of allowed tools. Other allowed deferred tools remain discoverable." }),
   ),
   cwd: Type.Optional(
     Type.String({
@@ -138,7 +141,7 @@ export const NON_INHERITED_RUNTIME_ENV_NAMES = [
   "PI_SESSION_LEASE_OWNER_PID", "PI_SESSION_LEASE_OWNER_NONCE",
   "PI_DENY_TOOLS", "PI_SUBAGENT_NAME", "PI_SUBAGENT_ID", "PI_SUBAGENT_SOCKET",
   "PI_SUBAGENT_TOKEN", "PI_SUBAGENT_AUTO_EXIT", "PI_SUBAGENT_MODEL",
-  "PI_SUBAGENT_THINKING", "PI_SUBAGENT_TOOLS", "PI_SUBAGENT_AGENT", "PI_SUBAGENT_DEPTH",
+  "PI_SUBAGENT_THINKING", "PI_SUBAGENT_TOOLS", "PI_SUBAGENT_INITIAL_TOOLS", "PI_SUBAGENT_AGENT", "PI_SUBAGENT_DEPTH",
 ] as const;
 
 export function inheritedProfileEnvParts(): string[] {

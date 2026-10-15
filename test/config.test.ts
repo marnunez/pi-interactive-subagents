@@ -108,6 +108,7 @@ describe("agent configuration", () => {
         'description: "Quoted: description"',
         "model: 'provider/model'",
         "tools: [read, custom_tool]",
+        "initial-tools: [read]",
         "skills: [one, two]",
         "spawning: false",
         "max-instances: 2",
@@ -119,6 +120,7 @@ describe("agent configuration", () => {
     assert.deepEqual(loadAgentDefaults("filename-agent", cwd), {
       model: "provider/model",
       tools: "read,custom_tool",
+      initialTools: "read",
       skills: "one,two",
       thinking: undefined,
       denyTools: undefined,

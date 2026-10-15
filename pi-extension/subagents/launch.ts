@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { mkdirSync, rmSync } from "node:fs";
 import { prepareLaunch, type LaunchSpec } from "./launch-process.ts";
 import { assertDirectLaunchAvailable, launchVisibleSurface } from "./terminal-launch.ts";
-import { loadAgentDefaults, resolveChildTools } from "./config.ts";
+import { loadAgentDefaults, resolveChildTools, resolveChildInitialTools, parentToolCeiling, type ToolMetadata } from "./config.ts";
 import { type ChildRunConfig } from "./launch-config.ts";
 import { closeSurface } from "./cmux.ts";
 import { createSubagentSession, selectForkHistory, type SessionEntry, type SubagentSessionMode } from "./session.ts";
@@ -23,7 +23,13 @@ export function forkConversation(branch: SessionEntry[]): SessionEntry[] {
 }
 
 export function childLaunchSpec(runtime: RunRuntime, config: ChildRunConfig, runId: string, name: string, sessionFile: string, cwd: string, promptPath?: string): LaunchSpec {
+  // --tools retains the full capability registry; session_start selects initial declarations.
   const argv = ["pi", "--session", sessionFile, "--tools", config.tools.join(",")];
+  // Pi v1 otherwise retains every MCP tool when --tools contains no mcp__ entry.
+  if (!config.tools.some((name) => name.startsWith("mcp__"))) {
+    const resources = ["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"];
+    argv.push("--exclude-tools", ["mcp__*", ...resources.filter((name) => !config.tools.includes(name))].join(","));
+  }
   if (config.model) argv.push("--model", config.thinking ? `${config.model}:${config.thinking}` : config.model);
   argv.push("--append-system-prompt", [config.systemPrompt, PARENT_MESSAGE_AUTHORITY_GUIDANCE].filter(Boolean).join("\n\n"));
   for (const skill of config.skills?.split(",").map((skill) => skill.trim()).filter(Boolean) ?? []) argv.push(`/skill:${skill}`);
@@ -38,6 +44,7 @@ export function childLaunchSpec(runtime: RunRuntime, config: ChildRunConfig, run
     PI_SUBAGENT_DEPTH: String(Number(process.env.PI_SUBAGENT_DEPTH ?? "0") + 1),
     PI_SUBAGENT_TOOLS: config.tools.join(","),
   });
+  if (config.initialTools !== undefined) env.PI_SUBAGENT_INITIAL_TOOLS = config.initialTools.join(",");
   if (config.agent) env.PI_SUBAGENT_AGENT = config.agent;
   if (config.model) env.PI_SUBAGENT_MODEL = config.model;
   if (config.thinking) env.PI_SUBAGENT_THINKING = config.thinking;
@@ -61,6 +68,7 @@ export async function launchSubagent(runtime: RunRuntime,
   },
   options: {
     allToolNames: string[];
+    toolMetadata?: ToolMetadata[];
     activeToolNames: string[];
     projectTrusted: boolean;
     onPrepared: (running: RunningSubagent) => void;
@@ -137,6 +145,11 @@ export async function launchSubagent(runtime: RunRuntime,
     const modeHint = SUBAGENT_COMPLETION_INSTRUCTION;
     const allowedTools = resolveChildTools(
       { ...agentDefs, tools: effectiveTools }, options.activeToolNames, options.allToolNames,
+      { metadata: options.toolMetadata, ceiling: parentToolCeiling() },
+    );
+    const initialTools = resolveChildInitialTools(
+      params.initialTools ?? agentDefs?.initialTools, allowedTools, options.activeToolNames,
+      options.toolMetadata ?? [], effectiveTools !== undefined,
     );
     const denySet = new Set(withChildOnlyTools(options.allToolNames)!.filter((name) => !allowedTools.includes(name)));
     // Combine agent body and user-provided systemPrompt (both are optional).
@@ -152,10 +165,10 @@ export async function launchSubagent(runtime: RunRuntime,
     // Keep the launch task with the child session so it moves atomically with the transcript.
     const artifactDir = ensureSessionArtifactDir(subagentSessionFile);
     const config: ChildRunConfig = {
-      schemaVersion: 1, skills: effectiveSkills, env: agentDefs?.env,
+      schemaVersion: 2, skills: effectiveSkills, env: agentDefs?.env,
       systemPrompt: identity ?? undefined,
       agent: params.agent, model: qualifiedModelForLock, thinking: effectiveThinking,
-      tools: allowedTools, autoExit: effectiveAutoExit,
+      tools: allowedTools, initialTools, autoExit: effectiveAutoExit,
     };
     writeArtifactFile(artifactDir, "context/subagent-config.json", JSON.stringify(config));
     const taskPath = writeArtifactFile(artifactDir, "context/subagent-task.md", fullTask);

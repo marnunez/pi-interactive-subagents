@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 import { existsSync, unlinkSync } from "node:fs";
 import { prepareLaunch } from "./launch-process.ts";
 import { assertDirectLaunchAvailable, launchVisibleSurface } from "./terminal-launch.ts";
-import { loadAgentDefaults, resolveChildTools, restoreChildTools } from "./config.ts";
+import { loadAgentDefaults, resolveChildTools, restoreChildTools, resolveChildInitialTools, parentToolCeiling, parentVisibleTools, type ToolMetadata } from "./config.ts";
 import { readChildRunConfig, legacyChildDefaults, type ChildRunConfig } from "./launch-config.ts";
 import { isMuxAvailable, closeSurface } from "./cmux.ts";
 import { readSubagentSessionCorrelation } from "./session.ts";
@@ -113,11 +113,19 @@ export function registerResumeTool(pi: ExtensionAPI, runtime: RunRuntime, contro
         const legacyDefs = !savedConfig && correlation.agent
           ? loadAgentDefaults(correlation.agent, correlation.cwd, correlation.cwd === ctx.cwd && ctx.isProjectTrusted()) : null;
         const restoredConfig = savedConfig ?? legacyChildDefaults(correlation.agent, legacyDefs);
+        const metadata: ToolMetadata[] = pi.getAllTools();
+        const registered = metadata.filter((tool) => tool.exposure !== "hidden").map((tool) => tool.name);
+        const activeTools = parentVisibleTools(pi.getActiveTools(), ctx.sessionManager);
+        const tools = savedConfig
+          ? restoreChildTools(savedConfig.tools, registered, parentToolCeiling())
+          : resolveChildTools({ ...legacyDefs, tools: restoredConfig.tools?.join(",") }, activeTools, registered,
+            { metadata, ceiling: parentToolCeiling() });
         const config: ChildRunConfig = {
-          ...restoredConfig, schemaVersion: 1,
-          tools: savedConfig
-            ? restoreChildTools(savedConfig.tools, pi.getAllTools().map((tool) => tool.name))
-            : resolveChildTools({ ...legacyDefs, tools: restoredConfig.tools?.join(",") }, pi.getActiveTools(), pi.getAllTools().map((tool) => tool.name)),
+          ...restoredConfig, schemaVersion: 2, tools,
+          // Old snapshots meant both permissions and visibility. Never reinterpret them broadly.
+          initialTools: savedConfig
+            ? resolveChildInitialTools((savedConfig.initialTools ?? savedConfig.tools).join(","), tools, [], metadata)
+            : resolveChildInitialTools(legacyDefs?.initialTools, tools, activeTools, metadata, restoredConfig.tools !== undefined),
           autoExit: false,
         };
         const runId = randomUUID();
