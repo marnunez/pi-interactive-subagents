@@ -4,7 +4,6 @@ import { spawnSync } from 'node:child_process';
 import { terminalTitle, paneTitleOsc } from '../pi-extension/subagents/terminal-title.mjs';
 import { childTabLabels } from '../pi-extension/subagents/terminal-launch.ts';
 import { registerManagementTools } from '../pi-extension/subagents/management-tools.ts';
-import { resolveChildActiveTools } from '../pi-extension/subagents/subagent-done.ts';
 import { prepareLaunch } from '../pi-extension/subagents/launch-process.ts';
 import { registerCommands } from '../pi-extension/subagents/commands.ts';
 
@@ -70,9 +69,6 @@ test('progress and legacy alias call only ctx.ui.setTitle; deny/selected snapsho
     }
     assert.deepEqual(titles, ['Checking]2;payload', 'Checking]2;payload']);
     assert.equal(register('set_tab_title,set_pane_title', ['set_tab_title', 'set_pane_title']).size, 0);
-    const names = ['read', 'subagent_done', 'set_pane_title', 'set_tab_title'];
-    assert.deepEqual(resolveChildActiveTools(names, ['read', 'subagent_done'], names), ['read', 'subagent_done']);
-    assert.deepEqual(resolveChildActiveTools(names, ['set_tab_title'], names), ['set_tab_title', 'subagent_done']);
   } finally {
     for (const [key, value] of [['PI_SUBAGENT_NAME', saved.name], ['PI_SUBAGENT_TOOLS', saved.tools]]) {
       if (value === undefined) delete process.env[key!]; else process.env[key!] = value;

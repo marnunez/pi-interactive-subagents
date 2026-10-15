@@ -1,5 +1,5 @@
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { SUBAGENT_ASYNC_GUIDANCE, SUBAGENT_KILL_GUIDANCE, withChildOnlyTools, qualifyModelWithProvider, resolveEffectiveChildCwd, inheritedProfileEnvParts, inheritedProfileEnvUnsets, customAgentEnvParts } from "./policy.ts";
+import { SUBAGENT_ASYNC_GUIDANCE, SUBAGENT_KILL_GUIDANCE, qualifyModelWithProvider, resolveEffectiveChildCwd, inheritedProfileEnvParts, inheritedProfileEnvUnsets, customAgentEnvParts } from "./policy.ts";
 import { borderLine, renderSubagentWidgetLines } from "./presentation.ts";
 import { forkConversation } from "./launch.ts";
 import { createRunRuntime } from "./runtime.ts";
@@ -16,7 +16,6 @@ export const __test__ = {
   borderLine,
   renderSubagentWidgetLines,
   qualifyModelWithProvider,
-  withChildOnlyTools,
   resolveEffectiveChildCwd,
   inheritedProfileEnvParts,
   inheritedProfileEnvUnsets,
@@ -29,7 +28,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   const runtime = createRunRuntime();
   const controller = createController(pi, runtime);
   const denied = new Set((process.env.PI_DENY_TOOLS ?? '').split(',').map(name => name.trim()).filter(Boolean));
-  const shouldRegister = (name: string) => !denied.has(name);
+  const allowed = process.env.PI_SUBAGENT_ID && process.env.PI_SUBAGENT_TOOLS !== undefined
+    ? new Set(process.env.PI_SUBAGENT_TOOLS.split(",").map((name) => name.trim())) : undefined;
+  const shouldRegister = (name: string) => !denied.has(name) && (!allowed || allowed.has(name));
   registerSpawnTool(pi, runtime, controller, shouldRegister);
   registerResumeTool(pi, runtime, controller, shouldRegister);
   registerManagementTools(pi, runtime, controller, shouldRegister);

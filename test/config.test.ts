@@ -56,11 +56,10 @@ describe("agent configuration", () => {
     const cwd = temporaryDirectory("empty-cwd");
     const profile = temporaryDirectory("empty-profile");
     process.env.PI_CODING_AGENT_DIR = profile;
-    writeAgent(profile, "empty-tools", "tools: []\nallow-tools: []");
+    writeAgent(profile, "empty-tools", "tools: []");
     const defaults = loadAgentDefaults("empty-tools", cwd)!;
     assert.equal(defaults.tools, "");
-    assert.equal(defaults.allowTools, "");
-    assert.deepEqual(resolveChildTools(defaults, ["read", "bash"], ["read", "bash"]), ["subagent_done"]);
+    assert.deepEqual(resolveChildTools(defaults, ["read", "bash"]), ["codemode", "subagent_done"]);
   });
   it("uses trusted project definitions before profile definitions", () => {
     const cwd = temporaryDirectory("cwd");
@@ -108,11 +107,9 @@ describe("agent configuration", () => {
         'description: "Quoted: description"',
         "model: 'provider/model'",
         "tools: [read, custom_tool]",
-        "initial-tools: [read]",
         "skills: [one, two]",
         "spawning: false",
         "max-instances: 2",
-        "auto-exit: true",
       ].join("\n"),
       "Agent instructions.\n",
     );
@@ -120,17 +117,13 @@ describe("agent configuration", () => {
     assert.deepEqual(loadAgentDefaults("filename-agent", cwd), {
       model: "provider/model",
       tools: "read,custom_tool",
-      initialTools: "read",
       skills: "one,two",
       thinking: undefined,
-      denyTools: undefined,
-      allowTools: undefined,
       spawning: false,
       maxInstances: 2,
       cwd: undefined,
       workspace: undefined,
       env: undefined,
-      autoExit: true,
       body: "Agent instructions.",
     });
     assert.equal(loadAgentDefaults("frontmatter-alias", cwd), null);
@@ -189,118 +182,56 @@ describe("agent configuration", () => {
 });
 
 describe("child tool policy", () => {
-  const registered = [
-    "read",
-    "bash",
-    "edit",
-    "subagent",
-    "subagents_list",
-    "subagent_resume",
-    "subagent_kill",
-    "subagent_message",
-    "web_search",
-    "database_query",
-  ];
+  const registered = ["read", "bash", "edit", "subagent", "subagents_list", "subagent_resume", "subagent_kill", "subagent_message", "web_search", "database_query"];
 
-  it("inherits only the parent's active preset when tools are not explicit", () => {
-    assert.deepEqual(
-      resolveChildTools({}, ["read", "bash", "web_search"], registered),
-      [
-        "read",
-        "bash",
-        "web_search",
-        "subagent_done",
-        "set_pane_title",
-        "write_artifact",
-        "read_artifact",
-      ],
-    );
+  it("trusted peers inherit permitted registered tools, not active schemas", () => {
+    const tools = resolveChildTools({}, registered);
+    assert.ok(registered.every((name) => tools.includes(name)));
+    assert.ok(["codemode", "subagent_done", "write_artifact"].every((name) => tools.includes(name)));
   });
 
-  it("treats explicit built-in and extension tools as a strict allowlist", () => {
-    assert.deepEqual(
-      resolveChildTools(
-        { tools: "read,database_query" },
-        ["read", "bash", "web_search"],
-        registered,
-      ),
-      [
-        "read",
-        "database_query",
-        "subagent_done",
-        "set_pane_title",
-        "write_artifact",
-        "read_artifact",
-      ],
-    );
+  it("roles have a positive allowlist with only common codemode and handback added", () => {
+    assert.deepEqual(resolveChildTools({ tools: "read,database_query" }, registered),
+      ["read", "database_query", "codemode", "subagent_done"]);
+    assert.deepEqual(resolveChildTools({ tools: "" }, registered), ["codemode", "subagent_done"]);
   });
 
-  it("lets allowTools narrow but never expand the selected tools", () => {
-    assert.deepEqual(
-      resolveChildTools(
-        { allowTools: "read,database_query,set_pane_title" },
-        ["read", "bash"],
-        registered,
-      ),
-      ["read", "subagent_done", "set_pane_title"],
-    );
+  it("new extensions never expand a restricted role", () => {
+    const before = resolveChildTools({ tools: "read" }, registered);
+    assert.deepEqual(resolveChildTools({ tools: "read" }, [...registered, "send_email", "browser_eval"]), before);
+    assert.ok(!before.includes("write_artifact"));
   });
 
-  it("applies denials to built-ins and optional child lifecycle tools", () => {
-    assert.deepEqual(
-      resolveChildTools(
-        { denyTools: "bash,set_pane_title,write_artifact,read_artifact,subagent_done" },
-        ["read", "bash"],
-        registered,
-      ),
-      ["read", "subagent_done"],
-    );
+  it("spawning false excludes the orchestration family even when listed", () => {
+    assert.deepEqual(resolveChildTools({ tools: "read,subagent,subagents_list,subagent_resume,subagent_kill,subagent_message", spawning: false }, registered),
+      ["read", "codemode", "subagent_done"]);
   });
 
-  it("does not let allowTools bypass spawning false", () => {
-    assert.deepEqual(
-      resolveChildTools(
-        {
-          allowTools: "read,subagent,subagents_list,subagent_resume,subagent_kill,subagent_message,set_pane_title",
-          spawning: false,
-        },
-        ["read", "subagent", "subagents_list", "subagent_resume", "subagent_kill", "subagent_message"],
-        registered,
-      ),
-      ["read", "subagent_done", "set_pane_title"],
-    );
+  it("child-only conveniences must be explicitly selected by restricted roles", () => {
+    assert.deepEqual(resolveChildTools({ tools: "write_artifact,set_pane_title" }, []),
+      ["write_artifact", "set_pane_title", "codemode", "subagent_done"]);
   });
 
-  it("allows mandatory child-only tools without parent registration", () => {
-    assert.deepEqual(
-      resolveChildTools(
-        { tools: "subagent_done,set_pane_title,write_artifact,read_artifact" },
-        [],
-        [],
-      ),
-      ["subagent_done", "set_pane_title", "write_artifact", "read_artifact"],
-    );
-  });
-
-  it("recognises the legacy pane alias only when explicitly selected, preserving saved policy", () => {
-    const tools = [...registered, "set_tab_title", "set_pane_title"];
-    assert.equal(resolveChildTools({}, ["read", "set_tab_title"], tools).includes("set_tab_title"), false);
-    const legacy = resolveChildTools({ tools: "set_tab_title", allowTools: "set_tab_title" }, [], []);
-    assert.deepEqual(legacy, ["set_tab_title", "subagent_done"]);
+  it("recognises the legacy pane alias only when explicitly selected or saved", () => {
+    assert.equal(resolveChildTools({}, [...registered, "set_tab_title"]).includes("set_tab_title"), false);
+    const legacy = resolveChildTools({ tools: "set_tab_title" }, []);
+    assert.deepEqual(legacy, ["set_tab_title", "codemode", "subagent_done"]);
     assert.deepEqual(restoreChildTools(legacy, []), legacy);
-    assert.deepEqual(restoreChildTools(["subagent_done"], tools), ["subagent_done"]);
-    assert.deepEqual(resolveChildTools({ tools: "set_tab_title,set_pane_title", denyTools: "set_tab_title,set_pane_title,write_artifact,read_artifact" }, [], []), ["subagent_done"]);
-    assert.deepEqual(resolveChildTools({ allowTools: "set_tab_title" }, [], tools), ["subagent_done"]);
+    assert.deepEqual(restoreChildTools(["read", "subagent_done"], registered), ["read", "subagent_done", "codemode"]);
   });
 
-  it("rejects unknown explicit tool names with a useful error", () => {
-    assert.throws(
-      () => resolveChildTools({ tools: "read,typo_tool" }, ["read"], registered),
-      /Unknown tool in tools: typo_tool.*registered tool name/,
-    );
-    assert.throws(
-      () => resolveChildTools({ denyTools: "missing_tool" }, ["read"], registered),
-      /Unknown tool in denyTools: missing_tool/,
-    );
+  it("rejects unknown explicit tool names", () => {
+    assert.throws(() => resolveChildTools({ tools: "read,typo_tool" }, registered), /Unknown tool in tools: typo_tool/);
+  });
+
+  it("rejects removed policy fields instead of ignoring them or falling through to a broader role", () => {
+    const cwd = temporaryDirectory("migration-cwd");
+    const profile = temporaryDirectory("migration-profile");
+    process.env.PI_CODING_AGENT_DIR = profile;
+    writeAgent(profile, "policy", "tools: read,bash");
+    for (const field of ["deny-tools", "allow-tools", "initial-tools", "auto-exit"]) {
+      writeProjectAgent(cwd, "policy", `tools: read\n${field}: []`);
+      assert.throws(() => loadAgentDefaults("policy", cwd), /Unsupported agent field/);
+    }
   });
 });

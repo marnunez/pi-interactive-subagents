@@ -8,7 +8,6 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { registerInspectionTools } from "./inspection-tools.ts";
 import { terminalTitle } from "./terminal-title.mjs";
-import { CHILD_TOOL_LOADOUT_ENTRY, readChildToolLoadout } from "./config.ts";
 
 const defineTool = <T>(tool: T): T => tool;
 import {
@@ -16,10 +15,8 @@ import {
   resolveExistingArtifactPath,
 } from "../session-artifacts/paths.ts";
 import {
-  findLastAssistantMessage,
   readRunCompletion,
   SUBAGENT_DONE_RESULT_TYPE,
-  type SessionEntry,
   type SubagentArtifactRef,
   type SubagentDoneResult,
 } from "./session.ts";
@@ -39,7 +36,6 @@ const MAX_NEXT_STEPS = 20;
 const MAX_NEXT_STEP_CHARS = 500;
 const COMPLETION_RETRY_MS = 250;
 const COMPLETION_ACK_TIMEOUT_MS = 10_000;
-const CHILD_LIFECYCLE_TOOLS = ["subagent_done"];
 
 const DoneParams = Type.Object({
   status: Type.Union(
@@ -110,21 +106,6 @@ function assertBoundedString(value: unknown, label: string, maxChars: number, re
   }
 }
 
-export function resolveChildActiveTools(
-  activeTools: readonly string[],
-  lockedTools: readonly string[],
-  registeredTools: readonly string[],
-  dynamic = false,
-): string[] {
-  const registered = new Set(registeredTools);
-  const selected = lockedTools.length > 0
-    ? dynamic ? activeTools.filter((name) => lockedTools.includes(name)) : lockedTools
-    : activeTools;
-  const lifecycleTools = [...CHILD_LIFECYCLE_TOOLS, ...(lockedTools.length ? [] : ["set_pane_title"])]
-    .filter((tool) => registered.has(tool));
-  return [...new Set([...selected, ...lifecycleTools])];
-}
-
 export function validateSubagentDoneParams(
   params: DoneParamsValue,
   artifactDir: string,
@@ -177,7 +158,6 @@ export function validateSubagentDoneParams(
 
 export default function (pi: ExtensionAPI) {
   registerInspectionTools(pi);
-  let toolNames: string[] = [];
   let denied: string[] = [];
   let expanded = false;
   let completionSent = false;
@@ -206,45 +186,23 @@ export default function (pi: ExtensionAPI) {
   const runId = process.env.PI_SUBAGENT_ID ?? "";
   const socketPath = process.env.PI_SUBAGENT_SOCKET ?? "";
   const token = process.env.PI_SUBAGENT_TOKEN ?? "";
-  const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
+  const autoExit = false; // Legacy metadata only; idle never completes a delegation.
   const lockedModel = process.env.PI_SUBAGENT_MODEL;
   const lockedThinking = process.env.PI_SUBAGENT_THINKING;
-  const lockedTools = (process.env.PI_SUBAGENT_TOOLS ?? "")
-    .split(",")
-    .map((value) => value.trim())
-    .filter(Boolean);
+  // Permissions are independent of Pi's active declarations and native discovery.
+  // Do not broaden a saved ceiling (including old policies without codemode).
+  const toolsCsv = process.env.PI_SUBAGENT_TOOLS;
+  const allowedTools = toolsCsv === undefined ? null : new Set([
+    ...toolsCsv.split(",").map((value) => value.trim()).filter(Boolean),
+    "subagent_done",
+  ]);
 
-  // Absence means a pre-v2 launch: retain its exact visibility lock.
-  const initialToolsCsv = process.env.PI_SUBAGENT_INITIAL_TOOLS;
-  const dynamicTools = initialToolsCsv !== undefined;
-  const initialTools = (initialToolsCsv ?? "").split(",").map((name) => name.trim()).filter(Boolean);
-  if (dynamicTools && (!lockedTools.length || initialTools.some((name) => !lockedTools.includes(name)))) {
-    throw new Error("Invalid initial subagent tools: visibility must be a subset of the permission ceiling.");
-  }
-  let pendingTools: string[] = [];
-  let selectedTools: string[] | undefined;
-  let loadoutEpoch = 0;
-  let loadoutRefreshScheduled = false;
-  const branchLoadout = (ctx: ExtensionContext) => readChildToolLoadout(
-    ctx.sessionManager.getBranch?.() ?? ctx.sessionManager.getEntries(), ctx.sessionManager.getSessionId(),
-  );
-  const applyLoadout = (selected: readonly string[]) => {
-    const registered = pi.getAllTools().map((tool) => tool.name);
-    const names = resolveChildActiveTools(selected, lockedTools, registered, dynamicTools);
-    pendingTools = names.filter((name) => !registered.includes(name));
-    selectedTools = names;
-    pi.setActiveTools(names);
-    toolNames = names.slice().sort();
-  };
-  const persistLoadout = (ctx: ExtensionContext) => {
-    if (!dynamicTools) return;
-    const names = resolveChildActiveTools([...(selectedTools ?? initialTools), ...pendingTools], lockedTools,
-      pi.getAllTools().map((tool) => tool.name), true);
-    toolNames = names.slice().sort();
-    const previous = branchLoadout(ctx);
-    if (JSON.stringify(previous) !== JSON.stringify(names)) {
-      pi.appendEntry(CHILD_TOOL_LOADOUT_ENTRY, { sessionId: ctx.sessionManager.getSessionId(), activeTools: names });
-    }
+  const ensureCommonTools = () => {
+    const active = pi.getActiveTools();
+    const missing = pi.getAllTools().map((tool) => tool.name).filter((name) =>
+      (name === "subagent_done" || name === "codemode")
+      && (!allowedTools || allowedTools.has(name)) && !active.includes(name));
+    if (missing.length) pi.setActiveTools([...active, ...missing]);
   };
 
   const ipc = runId && socketPath && token
@@ -354,8 +312,6 @@ export default function (pi: ExtensionAPI) {
   }
 
   function cleanupSessionResources(): void {
-    loadoutEpoch++;
-    loadoutRefreshScheduled = false;
     clearCompletionDeliveryTimers();
     pendingCompletion = null;
     stopUiMonitor?.();
@@ -369,6 +325,7 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setWidget(
       "subagent-tools",
       (_tui: any, theme: any) => {
+        const toolNames = pi.getActiveTools().slice().sort();
         const box = new Box(1, 0, (text: string) => theme.bg("toolSuccessBg", text));
 
         const label = subagentAgent || subagentName;
@@ -460,9 +417,8 @@ export default function (pi: ExtensionAPI) {
       });
     });
 
-    // Restore this session's active branch, never a forked parent's loadout or eager preset.
-    applyLoadout(dynamicTools ? branchLoadout(ctx) ?? initialTools : pi.getActiveTools());
-    persistLoadout(ctx);
+    // Keep common interfaces reachable without replacing Pi's discovered tools.
+    ensureCommonTools();
 
     ipc?.start();
     ipc?.send("ready", {
@@ -481,8 +437,8 @@ export default function (pi: ExtensionAPI) {
     renderWidget(ctx, null);
   });
 
-  // Reassert parent-selected settings after startup presets ran. Without an explicit
-  // tool lock, preserve the preset's selection while keeping child lifecycle tools active.
+  // Reassert parent-selected model settings after startup presets ran.
+  // Pi alone owns tool discovery and visibility throughout the session.
   pi.on("before_agent_start", async () => {
     if (lockedModel?.includes("/")) {
       const slash = lockedModel.indexOf("/");
@@ -494,15 +450,7 @@ export default function (pi: ExtensionAPI) {
       }
     }
     if (lockedThinking) pi.setThinkingLevel(lockedThinking as any);
-    applyLoadout([...(dynamicTools ? selectedTools ?? initialTools : pi.getActiveTools()), ...pendingTools]);
-    if (latestCtx) persistLoadout(latestCtx);
-  });
-
-  // A search can add declarations within a turn. Keep them across later runs/reload/resume.
-  pi.on("tool_result", (_event, ctx) => { persistLoadout(ctx); });
-  pi.on("agent_end", (_event, ctx) => { persistLoadout(ctx); });
-  pi.on("session_tree", (_event, ctx) => {
-    if (dynamicTools) applyLoadout(branchLoadout(ctx) ?? initialTools);
+    ensureCommonTools();
   });
 
   pi.on("agent_start", () => {
@@ -517,29 +465,11 @@ export default function (pi: ExtensionAPI) {
     });
   });
 
-  pi.on("agent_settled", (_event, ctx) => {
+  pi.on("agent_settled", () => {
     runState = "idle";
+    // A pause, interrupt, or ordinary final reply is not a delegation result.
+    // Only subagent_done can persist and deliver a terminal completion.
     ipc?.send("settled", { timestamp: Date.now(), autoExit });
-    refreshChildren();
-    if (!autoExit || completionSent || pendingChildren > 0) return;
-
-    const entries = ctx.sessionManager.getEntries() as unknown as SessionEntry[];
-    const report = findLastAssistantMessage(entries) ?? "Subagent settled without a textual final response.";
-    const boundedReport = report
-      .split("\n")
-      .slice(0, MAX_REPORT_LINES)
-      .join("\n")
-      .slice(0, MAX_REPORT_CHARS)
-      .trim();
-    const result: SubagentDoneResult = {
-      schemaVersion: 1,
-      runId,
-      status: "blocked",
-      summary: "Subagent settled without calling subagent_done; no explicit outcome was reported.",
-      report: boundedReport,
-      completedAt: new Date().toISOString(),
-    };
-    persistAndDeliverCompletion(result);
   });
 
   pi.on("session_shutdown", async (event, ctx) => {
@@ -556,9 +486,10 @@ export default function (pi: ExtensionAPI) {
     unsubscribeChildren?.();
   });
 
-  // Enforce the run's selected tools even if another extension changes active tools.
+  // Applies equally to direct calls and nested codemode calls, even if another
+  // extension activates a forbidden tool or discovery finds its declaration.
   pi.on("tool_call", (event) => {
-    if (lockedTools.length && !lockedTools.includes(event.toolName) && event.toolName !== "subagent_done") {
+    if (allowedTools && !allowedTools.has(event.toolName)) {
       return { block: true, reason: `Tool ${event.toolName} is not allowed for this subagent run.` };
     }
     if (completionSent) return { block: true, reason: "This run is already complete; resume the session as a new run.", terminate: true };
@@ -577,36 +508,6 @@ export default function (pi: ExtensionAPI) {
     name: "subagent_done",
     label: "Subagent Done",
     exposure: "model-only",
-    // Pi's --tools registry refresh reactivates all allowed direct tools, even after an
-    // unrelated registration. Hide those accidental declarations without changing permissions.
-    // Deferred/codemode declarations are added only deliberately (e.g. by tool_search).
-    prepareLoadout(loadout: { declared: readonly { name: string }[]; registered: readonly { name: string }[]; getExposure(name: string): string }) {
-      if (!dynamicTools || !selectedTools) return;
-      for (const tool of loadout.declared) {
-        if (lockedTools.includes(tool.name) && ["deferred", "codemode"].includes(loadout.getExposure(tool.name))
-          && !selectedTools.includes(tool.name)) selectedTools.push(tool.name);
-      }
-      const declared = new Set(loadout.declared.map((tool) => tool.name));
-      const missingSelected = loadout.registered.some((tool) => selectedTools!.includes(tool.name)
-        && !declared.has(tool.name) && loadout.getExposure(tool.name) !== "hidden");
-      if (missingSelected && !loadoutRefreshScheduled) {
-        loadoutRefreshScheduled = true;
-        const epoch = loadoutEpoch;
-        // setActiveTools invokes prepareLoadout again: wait until this registry refresh
-        // finishes rather than recurse into it. Retry late deferred connections in this run.
-        queueMicrotask(() => {
-          if (epoch !== loadoutEpoch || !latestCtx) return;
-          loadoutRefreshScheduled = false;
-          try {
-            applyLoadout(selectedTools ?? initialTools);
-            persistLoadout(latestCtx);
-          } catch (error) {
-            latestCtx.ui.notify(`Could not restore selected child tools: ${String(error)}`, "error");
-          }
-        });
-      }
-      return { hiddenDeclarations: loadout.declared.filter((tool) => !selectedTools!.includes(tool.name)).map((tool) => tool.name) };
-    },
     description:
       "Finish the current subagent run with success, failed, or blocked. Each run accepts one terminal result. " +
       "Persists a structured result, ends the current run after parent acknowledgement, and leaves the session resumable. " +

@@ -2,7 +2,6 @@
 name: reviewer
 description: Code review agent - reviews changes for quality, security, and correctness
 tools: read, subagent_search, subagent_git_inspect
-deny-tools: write_artifact
 model: openai-codex/gpt-6-sol
 thinking: medium
 spawning: false

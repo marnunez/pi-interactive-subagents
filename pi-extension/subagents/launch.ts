@@ -4,13 +4,13 @@ import { fileURLToPath } from "node:url";
 import { mkdirSync, rmSync } from "node:fs";
 import { prepareLaunch, type LaunchSpec } from "./launch-process.ts";
 import { assertDirectLaunchAvailable, launchVisibleSurface } from "./terminal-launch.ts";
-import { loadAgentDefaults, resolveChildTools, resolveChildInitialTools, parentToolCeiling, type ToolMetadata } from "./config.ts";
+import { loadAgentDefaults, resolveChildTools, parentToolCeiling, type ToolMetadata } from "./config.ts";
 import { type ChildRunConfig } from "./launch-config.ts";
 import { closeSurface } from "./cmux.ts";
 import { createSubagentSession, selectForkHistory, type SessionEntry, type SubagentSessionMode } from "./session.ts";
 import { ensureSessionArtifactDir, getSessionArtifactDir, writeArtifactFile } from "../session-artifacts/paths.ts";
 import { createIpcToken } from "./ipc.ts";
-import { PARENT_MESSAGE_AUTHORITY_GUIDANCE, SUBAGENT_COMPLETION_INSTRUCTION, type SubagentParamsValue, withChildOnlyTools, qualifyModelWithProvider, resolveEffectiveChildCwd, PROFILE_ENV_NAMES, NON_INHERITED_RUNTIME_ENV_NAMES, customAgentEnvironment } from "./policy.ts";
+import { PARENT_MESSAGE_AUTHORITY_GUIDANCE, SUBAGENT_COMPLETION_INSTRUCTION, type SubagentParamsValue, qualifyModelWithProvider, resolveEffectiveChildCwd, PROFILE_ENV_NAMES, NON_INHERITED_RUNTIME_ENV_NAMES, customAgentEnvironment } from "./policy.ts";
 import { type RunningSubagent } from "./types.ts";
 import { type RunRuntime } from "./runtime.ts";
 import { createManagedWorktree, discardCleanManagedWorktree } from "./worktree.ts";
@@ -23,7 +23,7 @@ export function forkConversation(branch: SessionEntry[]): SessionEntry[] {
 }
 
 export function childLaunchSpec(runtime: RunRuntime, config: ChildRunConfig, runId: string, name: string, sessionFile: string, cwd: string, promptPath?: string): LaunchSpec {
-  // --tools retains the full capability registry; session_start selects initial declarations.
+  // A single capability ceiling; Pi manages exposure, discovery and transcript declarations.
   const argv = ["pi", "--session", sessionFile, "--tools", config.tools.join(",")];
   // Pi v1 otherwise retains every MCP tool when --tools contains no mcp__ entry.
   if (!config.tools.some((name) => name.startsWith("mcp__"))) {
@@ -31,7 +31,7 @@ export function childLaunchSpec(runtime: RunRuntime, config: ChildRunConfig, run
     argv.push("--exclude-tools", ["mcp__*", ...resources.filter((name) => !config.tools.includes(name))].join(","));
   }
   if (config.model) argv.push("--model", config.thinking ? `${config.model}:${config.thinking}` : config.model);
-  argv.push("--append-system-prompt", [config.systemPrompt, PARENT_MESSAGE_AUTHORITY_GUIDANCE].filter(Boolean).join("\n\n"));
+  argv.push("--append-system-prompt", [config.systemPrompt, SUBAGENT_COMPLETION_INSTRUCTION, PARENT_MESSAGE_AUTHORITY_GUIDANCE].filter(Boolean).join("\n\n"));
   for (const skill of config.skills?.split(",").map((skill) => skill.trim()).filter(Boolean) ?? []) argv.push(`/skill:${skill}`);
   argv.push("-e", join(dirname(fileURLToPath(import.meta.url)), "subagent-done.ts"));
   if (promptPath) argv.push(`@${promptPath}`);
@@ -40,11 +40,9 @@ export function childLaunchSpec(runtime: RunRuntime, config: ChildRunConfig, run
     PATH: process.env.PATH ?? "",
     PI_SUBAGENT_NAME: name, PI_SUBAGENT_ID: runId,
     PI_SUBAGENT_SOCKET: runtime.parentIpcSocketPath!, PI_SUBAGENT_TOKEN: "", // filled by the caller
-    PI_SUBAGENT_AUTO_EXIT: config.autoExit ? "1" : "0",
     PI_SUBAGENT_DEPTH: String(Number(process.env.PI_SUBAGENT_DEPTH ?? "0") + 1),
     PI_SUBAGENT_TOOLS: config.tools.join(","),
   });
-  if (config.initialTools !== undefined) env.PI_SUBAGENT_INITIAL_TOOLS = config.initialTools.join(",");
   if (config.agent) env.PI_SUBAGENT_AGENT = config.agent;
   if (config.model) env.PI_SUBAGENT_MODEL = config.model;
   if (config.thinking) env.PI_SUBAGENT_THINKING = config.thinking;
@@ -69,13 +67,15 @@ export async function launchSubagent(runtime: RunRuntime,
   options: {
     allToolNames: string[];
     toolMetadata?: ToolMetadata[];
-    activeToolNames: string[];
     projectTrusted: boolean;
     onPrepared: (running: RunningSubagent) => void;
     onLaunched: (running: RunningSubagent) => void;
     onFailed: (running: RunningSubagent, error: unknown) => void;
   },
 ): Promise<RunningSubagent> {
+  if ("tools" in params || "initialTools" in params) {
+    throw new Error("Per-call tool overrides are not supported. Choose an agent role with a tools allowlist.");
+  }
   assertDirectLaunchAvailable();
   const startTime = Date.now();
   const runId = randomUUID();
@@ -90,10 +90,8 @@ export async function launchSubagent(runtime: RunRuntime,
   const depth = Number(process.env.PI_SUBAGENT_DEPTH ?? "0");
   if (!Number.isSafeInteger(depth) || depth >= 4) throw new Error("Subagent nesting limit (4) reached.");
   const effectiveModel = params.model ?? agentDefs?.model;
-  const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
-  const effectiveAutoExit = agentDefs?.autoExit ?? false;
 
   const parentSessionFile = ctx.sessionManager.getSessionFile();
   if (!parentSessionFile) throw new Error("No session file");
@@ -138,43 +136,32 @@ export async function launchSubagent(runtime: RunRuntime,
 
   try {
 
-    // Build the task message
-    // When forking, the sub-agent already has the full conversation context.
-    // Only send the user's task as a clean message — no wrapper instructions
-    // that would confuse the agent into thinking it needs to restart.
-    const modeHint = SUBAGENT_COMPLETION_INSTRUCTION;
     const allowedTools = resolveChildTools(
-      { ...agentDefs, tools: effectiveTools }, options.activeToolNames, options.allToolNames,
+      agentDefs ?? {}, options.allToolNames,
       { metadata: options.toolMetadata, ceiling: parentToolCeiling() },
     );
-    const initialTools = resolveChildInitialTools(
-      params.initialTools ?? agentDefs?.initialTools, allowedTools, options.activeToolNames,
-      options.toolMetadata ?? [], effectiveTools !== undefined,
-    );
-    const denySet = new Set(withChildOnlyTools(options.allToolNames)!.filter((name) => !allowedTools.includes(name)));
     // Combine agent body and user-provided systemPrompt (both are optional).
     // The agent body provides the base role/identity; systemPrompt layers on
     // additional instructions from the caller.
     const identityParts = [agentDefs?.body, params.systemPrompt].filter(Boolean);
     const identity = identityParts.length > 0 ? identityParts.join("\n\n") : null;
     const worktreeHint = managed ? `Your checkout is ${managed.path}. Work only there; do not edit the parent's checkout. Report the path and let the parent review and integrate changes manually.` : "";
-    const fullTask = [modeHint, worktreeHint, params.task].filter(Boolean).join("\n\n");
+    const fullTask = [worktreeHint, params.task].filter(Boolean).join("\n\n");
 
     const qualifiedModelForLock = effectiveModel ? qualifyModelWithProvider(effectiveModel, ctx) : undefined;
 
     // Keep the launch task with the child session so it moves atomically with the transcript.
     const artifactDir = ensureSessionArtifactDir(subagentSessionFile);
     const config: ChildRunConfig = {
-      schemaVersion: 2, skills: effectiveSkills, env: agentDefs?.env,
+      schemaVersion: 3, skills: effectiveSkills, env: agentDefs?.env,
       systemPrompt: identity ?? undefined,
       agent: params.agent, model: qualifiedModelForLock, thinking: effectiveThinking,
-      tools: allowedTools, initialTools, autoExit: effectiveAutoExit,
+      tools: allowedTools,
     };
     writeArtifactFile(artifactDir, "context/subagent-config.json", JSON.stringify(config));
     const taskPath = writeArtifactFile(artifactDir, "context/subagent-task.md", fullTask);
     const spec = childLaunchSpec(runtime, config, runId, params.name, subagentSessionFile, effectiveCwd, taskPath);
     spec.env.PI_SUBAGENT_TOKEN = ipcToken;
-    spec.env.PI_DENY_TOOLS = [...denySet].join(",");
     launch = prepareLaunch(spec);
     runtime.parentIpcServer.registerChild(runId, ipcToken);
     registeredWithIpc = true;
@@ -193,7 +180,7 @@ export async function launchSubagent(runtime: RunRuntime,
       sessionFile: subagentSessionFile,
       worktreePath: managed?.path,
       ipcToken,
-      autoExit: effectiveAutoExit,
+      autoExit: false,
       config,
       launch,
     };

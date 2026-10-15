@@ -30,7 +30,6 @@ const CHILD_ENV_NAMES = [
   "PI_SUBAGENT_MODEL",
   "PI_SUBAGENT_THINKING",
   "PI_SUBAGENT_TOOLS",
-  "PI_SUBAGENT_INITIAL_TOOLS",
 ] as const;
 const ORIGINAL_CHILD_ENV = new Map(
   CHILD_ENV_NAMES.map((name) => [name, process.env[name]]),
@@ -108,6 +107,7 @@ interface ExtensionHarness {
   shutdownCount: () => number;
   messages: any[];
   titles: string[];
+  activeToolUpdates: string[][];
   emit: (eventName: string, event?: Record<string, unknown>) => Promise<void>;
 }
 
@@ -124,6 +124,7 @@ function createExtensionHarness(sessionFile: string): ExtensionHarness {
   let shutdowns = 0;
   let nextEntry = entries.length;
   let activeTools: string[] = [];
+  const activeToolUpdates: string[][] = [];
   const events = new EventEmitter();
 
   const ui = {
@@ -183,12 +184,8 @@ function createExtensionHarness(sessionFile: string): ExtensionHarness {
     },
     getActiveTools() { return activeTools; },
     setActiveTools(names: string[]) {
+      activeToolUpdates.push([...names]);
       activeTools = names.filter(name => tools.has(name));
-      for (const name of activeTools) tools.get(name)?.prepareLoadout?.({
-        declared: activeTools.map(name => tools.get(name)),
-        registered: [...tools.values()],
-        getExposure: (name: string) => tools.get(name)?.exposure ?? "direct",
-      });
     },
     async setModel() { return true; },
     setThinkingLevel() {},
@@ -214,6 +211,7 @@ function createExtensionHarness(sessionFile: string): ExtensionHarness {
     shutdownCount: () => shutdowns,
     messages,
     titles,
+    activeToolUpdates,
     async emit(eventName, event = {}) {
       for (const handler of handlers.get(eventName) ?? []) {
         await handler({ type: eventName, ...event }, ctx);
@@ -230,93 +228,105 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
   }
 }
 
-describe("separate child permissions and visibility", () => {
-  it("keeps discovery within the ceiling across turns, reload, resume and branch changes", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "child-loadout-"));
-    const sessionFile = createSessionFile(dir);
-    configureChildEnv({ runId: "dynamic-one" });
+describe("native discovery and child execution permissions", () => {
+  it("keeps common codemode/handback reachable without owning discovery across turns and reload", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "child-native-discovery-"));
+    configureChildEnv({ runId: "native-discovery" });
     process.env.PI_SUBAGENT_TOOLS = "read,tool_search,codemode,browser_navigate,subagent_done";
-    process.env.PI_SUBAGENT_INITIAL_TOOLS = "read,tool_search,codemode,subagent_done";
-    const setup = () => {
-      const h = createExtensionHarness(sessionFile);
-      for (const name of ["read", "tool_search", "codemode", "browser_navigate", "forbidden"]) h.tools.set(name, { name, exposure: name === "browser_navigate" ? "deferred" : "direct" });
-      // Simulate startup presets eagerly enabling everything before the child hook.
-      h.pi.setActiveTools([...h.tools.keys()]);
-      return h;
-    };
-    const h = setup();
+    const h = createExtensionHarness(createSessionFile(dir));
+    for (const name of ["read", "tool_search", "codemode", "browser_navigate"]) {
+      h.tools.set(name, { name, exposure: name === "browser_navigate" ? "deferred" : "direct" });
+    }
+    h.pi.setActiveTools(["read", "tool_search", "codemode"]);
     try {
       await h.emit("session_start");
-      assert.ok(!h.pi.getActiveTools().includes("browser_navigate"));
-      const branchPoint = h.entries.slice();
-      h.pi.setActiveTools([...h.pi.getActiveTools(), "browser_navigate", "forbidden"]);
-      await h.emit("tool_result", { toolName: "tool_search" });
+      assert.deepEqual(h.pi.getActiveTools(), ["read", "tool_search", "codemode", "subagent_done"]);
+      assert.equal(h.tools.get("subagent_done").prepareLoadout, undefined);
+      // Native discovery can activate or withdraw a declaration without a child snapshot.
+      for (const visible of [true, false, true]) {
+        const tools = ["read", "tool_search", "codemode", "subagent_done", ...(visible ? ["browser_navigate"] : [])];
+        h.pi.setActiveTools(tools);
+        const updates = h.activeToolUpdates.length;
+        await h.emit("tool_result", { toolName: "tool_search" });
+        await h.emit("agent_end");
+        await h.emit("session_tree");
+        await h.emit("before_agent_start");
+        await Promise.resolve();
+        assert.deepEqual(h.pi.getActiveTools(), tools);
+        assert.equal(h.activeToolUpdates.length, updates, "Lifecycle events must not reset native declarations");
+      }
+      h.pi.setActiveTools(["read", "browser_navigate"]); // A preset hid the common interfaces.
       await h.emit("before_agent_start");
+      assert.ok(h.pi.getActiveTools().includes("codemode"));
+      assert.ok(h.pi.getActiveTools().includes("subagent_done"));
+      assert.ok(h.pi.getActiveTools().includes("browser_navigate"), "Re-adding common interfaces must preserve discoveries");
+      await h.emit("session_shutdown", { reason: "reload" });
+      const updates = h.activeToolUpdates.length;
+      await h.emit("session_start", { reason: "reload" });
       assert.ok(h.pi.getActiveTools().includes("browser_navigate"));
-      assert.ok(!h.pi.getActiveTools().includes("forbidden"));
-      const gate = h.handlers.get("tool_call")![0];
-      assert.equal((await gate({ toolName: "browser_navigate", parentToolCallId: "script/1" }, h.ctx)), undefined);
-      assert.equal((await gate({ toolName: "forbidden", parentToolCallId: "script/1" }, h.ctx) as any).block, true);
-      assert.equal((await gate({ toolName: "forbidden" }, h.ctx) as any).block, true);
-      await h.emit("session_shutdown", { reason: "reload" });
-      const reload = setup();
-      await reload.emit("session_start");
-      assert.ok(reload.pi.getActiveTools().includes("browser_navigate"));
-      await reload.emit("session_shutdown", { reason: "reload" });
-      process.env.PI_SUBAGENT_ID = "dynamic-resume";
-      const resumed = setup();
-      await resumed.emit("session_start");
-      assert.ok(resumed.pi.getActiveTools().includes("browser_navigate"));
-      resumed.ctx.sessionManager.getBranch = () => branchPoint;
-      await resumed.emit("session_tree");
-      assert.ok(!resumed.pi.getActiveTools().includes("browser_navigate"), "An abandoned branch's discovery must not leak");
-      await resumed.emit("session_shutdown", { reason: "reload" });
-      const fork = setup();
-      fork.ctx.sessionManager.getSessionId = () => "different-child-session";
-      await fork.emit("session_start");
-      assert.ok(!fork.pi.getActiveTools().includes("browser_navigate"), "Fork history is not the new child's visibility policy");
-      await fork.emit("session_shutdown", { reason: "reload" });
+      assert.equal(h.activeToolUpdates.length, updates, "An active handback tool needs no startup reset");
+      assert.equal(h.entries.some(entry => entry.type === "custom"), false, "Discovery must not persist custom entries");
     } finally {
       await h.emit("session_shutdown", { reason: "reload" });
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it("retains pending declarations while a permitted tool reconnects", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "child-loadout-pending-"));
-    const sessionFile = createSessionFile(dir);
-    configureChildEnv({ runId: "pending" });
-    process.env.PI_SUBAGENT_TOOLS = "read,mcp__docs__search,subagent_done";
-    process.env.PI_SUBAGENT_INITIAL_TOOLS = "read,mcp__docs__search,subagent_done";
-    const h = createExtensionHarness(sessionFile);
-    h.tools.set("read", { name: "read" });
+  it("blocks direct and nested forbidden calls even if another extension activates them", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "child-permissions-"));
+    configureChildEnv({ runId: "read-only" });
+    process.env.PI_SUBAGENT_TOOLS = "read,codemode,subagent_search,subagent_git_inspect,subagent_done";
+    const h = createExtensionHarness(createSessionFile(dir));
+    for (const name of ["read", "codemode", "tool_search", "write", "edit", "bash"]) h.tools.set(name, { name });
+    h.pi.setActiveTools(["read", "codemode"]);
     try {
       await h.emit("session_start");
+      assert.ok(!h.pi.getActiveTools().includes("tool_search"), "There is no automatic role discovery fallback");
+      // Visibility is not an authorisation boundary, including for codemode's nested calls.
+      h.pi.setActiveTools([...h.tools.keys()]);
       await h.emit("before_agent_start");
-      const snapshot = h.entries.findLast((entry: any) => entry.customType === "subagent_tool_loadout")?.data as { activeTools: string[] } | undefined;
-      assert.ok(snapshot?.activeTools.includes("mcp__docs__search"));
-      h.tools.set("mcp__docs__search", { name: "mcp__docs__search", exposure: "deferred" });
-      h.pi.setActiveTools(h.pi.getActiveTools()); // Native registry refresh runs prepareLoadout.
-      await Promise.resolve();
-      assert.ok(h.pi.getActiveTools().includes("mcp__docs__search"), "Registration recovers during this run, without a second before_agent_start");
-      h.pi.setActiveTools(["read", "subagent_done"]); // Queue another retry, then invalidate it.
-      await h.emit("session_shutdown", { reason: "reload" });
-      assert.ok(!h.pi.getActiveTools().includes("mcp__docs__search"), "Queued work must not mutate a shutdown/reloaded extension");
+      const gate = h.handlers.get("tool_call")![0];
+      for (const parentToolCallId of [undefined, "script/1", "script/1/2"]) {
+        for (const toolName of ["read", "codemode", "subagent_search", "subagent_git_inspect", "subagent_done"]) {
+          assert.equal(await gate({ toolName, parentToolCallId }, h.ctx), undefined);
+        }
+        for (const toolName of ["write", "edit", "bash", "tool_search", "unregistered"]) {
+          const blocked = await gate({ toolName, parentToolCallId }, h.ctx) as any;
+          assert.equal(blocked.block, true);
+          assert.match(blocked.reason, /not allowed for this subagent run/);
+        }
+      }
     } finally {
       await h.emit("session_shutdown", { reason: "reload" });
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it("rejects a visibility override outside the saved permissions before startup", () => {
-    const dir = mkdtempSync(join(tmpdir(), "child-loadout-invalid-"));
-    try {
-      configureChildEnv({ runId: "invalid" });
-      process.env.PI_SUBAGENT_TOOLS = "read,subagent_done";
-      process.env.PI_SUBAGENT_INITIAL_TOOLS = "write";
-      assert.throws(() => createExtensionHarness(createSessionFile(dir)), /subset of the permission ceiling/);
-    } finally { rmSync(dir, { recursive: true, force: true }); }
-  });
+  for (const ceiling of ["read,subagent_done", ""]) {
+    it(`does not broaden a saved permission ceiling (${ceiling || "empty"})`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "child-saved-permissions-"));
+      configureChildEnv({ runId: "saved-policy" });
+      process.env.PI_SUBAGENT_TOOLS = ceiling;
+      const h = createExtensionHarness(createSessionFile(dir));
+      h.tools.set("codemode", { name: "codemode" });
+      h.tools.set("read", { name: "read" });
+      h.pi.setActiveTools(["read", "codemode"]);
+      try {
+        await h.emit("session_start");
+        await h.emit("before_agent_start");
+        const gate = h.handlers.get("tool_call")![0];
+        assert.equal((await gate({ toolName: "codemode" }, h.ctx) as any).block, true);
+        assert.equal((await gate({ toolName: "codemode", parentToolCallId: "script/1" }, h.ctx) as any).block, true);
+        assert.equal(await gate({ toolName: "subagent_done" }, h.ctx), undefined);
+        const readResult = await gate({ toolName: "read" }, h.ctx) as any;
+        if (ceiling) assert.equal(readResult, undefined);
+        else assert.equal(readResult.block, true, "An explicit empty ceiling is not unrestricted");
+      } finally {
+        await h.emit("session_shutdown", { reason: "reload" });
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
 });
 
 describe("automatic child pane names", () => {
@@ -462,7 +472,7 @@ describe("run-scoped durable completion", () => {
 });
 
 describe("child descendant guard", () => {
-  it("does not auto-complete or explicitly complete while children are pending", async () => {
+  it("keeps settled runs open and refuses explicit handback while children are pending", async () => {
     const dir = mkdtempSync(join(tmpdir(), "child-descendants-"));
     configureChildEnv({ runId: "parent-run", autoExit: true });
     const h = createExtensionHarness(createSessionFile(dir));
@@ -663,34 +673,99 @@ describe("child completion delivery", () => {
     }
   });
 
-  it("records automatic settling as blocked and preserves the assistant report", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "child-lifecycle-fallback-"));
-    const assistantEntry = {
-      type: "message",
-      id: "assistant-final",
-      parentId: null,
-      timestamp: "2026-09-25T12:00:00.000Z",
-      message: {
-        role: "assistant",
-        content: [{ type: "text", text: "I could not establish an explicit outcome." }],
-      },
-    } as SessionEntry;
-    const sessionFile = createSessionFile(dir, [assistantEntry]);
-    configureChildEnv({ runId: "run-fallback", autoExit: true });
-    const harness = createExtensionHarness(sessionFile);
+  for (const outcome of ["ordinary final reply", "idle pause", "user interrupt", "assistant error"]) {
+    it(`does not hand back on ${outcome}, even with the old auto-exit flag`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "child-explicit-handback-"));
+      const assistantEntry = {
+        type: "message",
+        id: "assistant-final",
+        parentId: null,
+        timestamp: "2026-09-25T12:00:00.000Z",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "This is an ordinary response, not a delegation result." }],
+          stopReason: outcome === "user interrupt" ? "aborted" : outcome === "assistant error" ? "error" : "stop",
+        },
+      } as SessionEntry;
+      const sessionFile = createSessionFile(dir, outcome === "idle pause" ? [] : [assistantEntry]);
+      const socketPath = join(dir, "parent.sock");
+      const token = "e".repeat(64);
+      const runId = "explicit-handback";
+      const frames: any[] = [];
+      const server = new ParentIpcServer({ socketPath, onMessage(message) {
+        frames.push(message);
+        if (message.type === "completion") server.send(runId, "completion_ack", { runId });
+      } });
+      server.registerChild(runId, token);
+      await server.start();
+      configureChildEnv({ runId, socketPath, token, autoExit: true });
+      process.env.PI_SUBAGENT_TOOLS = "read,codemode,subagent_done";
+      const h = createExtensionHarness(sessionFile);
+      let aborts = 0;
+      h.ctx.abort = async () => { aborts++; };
+      try {
+        await h.emit("session_start");
+        await waitFor(() => server.isConnected(runId));
+        await h.emit("agent_start");
+        if (outcome === "user interrupt") await h.ctx.abort();
+        if (outcome !== "idle pause") await h.emit("message_end");
+        await h.emit("agent_end");
+        await h.emit("agent_settled");
+        await waitFor(() => frames.some(frame => frame.type === "settled"));
+        assert.equal(aborts, outcome === "user interrupt" ? 1 : 0);
+        assert.equal(readRunCompletion(sessionFile, runId), undefined);
+        assert.equal(frames.some(frame => frame.type === "completion"), false, "Idle status is not a terminal result");
+        assert.equal(h.shutdownCount(), 0, "The visible session must remain available");
+        const gate = h.handlers.get("tool_call")![0];
+        assert.equal(await gate({ toolName: "read" }, h.ctx), undefined, "The delegation is still active");
+        assert.equal(await gate({ toolName: "read", parentToolCallId: "script/1" }, h.ctx), undefined);
+        // A later turn may explicitly finish the same delegation after the pause.
+        await h.emit("before_agent_start");
+        await h.emit("agent_start");
+        await h.tools.get("subagent_done").execute("done", { status: "success", summary: "Explicitly handed back" }, undefined, undefined, h.ctx);
+        await waitFor(() => h.shutdownCount() === 1);
+        assert.equal(readRunCompletion(sessionFile, runId)?.summary, "Explicitly handed back");
+        assert.equal(frames.filter(frame => frame.type === "completion").length, 1);
+        assert.equal((await gate({ toolName: "read" }, h.ctx) as any).terminate, true);
+      } finally {
+        await h.emit("session_shutdown", { reason: "quit" });
+        await server.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
 
-    try {
-      await harness.emit("session_start", { reason: "startup" });
-      await harness.emit("agent_settled");
-
-      const result = readRunCompletion(sessionFile, "run-fallback");
-      assert.equal(result?.status, "blocked");
-      assert.match(result?.summary ?? "", /no explicit outcome/i);
-      assert.equal(result?.report, "I could not establish an explicit outcome.");
-      assert.equal(result?.runId, "run-fallback");
-    } finally {
-      await harness.emit("session_shutdown", { reason: "quit" });
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
+  for (const signal of ["abort", "shutdown"]) {
+    it(`keeps deliberate ${signal} separate from structured handback`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "child-cancellation-"));
+      const sessionFile = createSessionFile(dir);
+      const socketPath = join(dir, "parent.sock");
+      const token = "f".repeat(64);
+      const runId = "cancelled-child";
+      const frames: any[] = [];
+      const server = new ParentIpcServer({ socketPath, onMessage(message) { frames.push(message); } });
+      server.registerChild(runId, token);
+      await server.start();
+      configureChildEnv({ runId, socketPath, token, autoExit: true });
+      const h = createExtensionHarness(sessionFile);
+      let aborts = 0;
+      h.ctx.abort = async () => { aborts++; };
+      try {
+        await h.emit("session_start");
+        await waitFor(() => server.isConnected(runId));
+        server.send(runId, signal, { runId });
+        await waitFor(() => aborts === 1);
+        await h.emit("agent_settled");
+        await waitFor(() => frames.some(frame => frame.type === "settled"));
+        assert.equal(readRunCompletion(sessionFile, runId), undefined);
+        assert.equal(frames.some(frame => frame.type === "completion"), false);
+        assert.equal(h.shutdownCount(), signal === "shutdown" ? 1 : 0);
+        if (signal === "shutdown") assert.ok(frames.some(frame => frame.type === "shutdown_ready"));
+      } finally {
+        await h.emit("session_shutdown", { reason: "quit" });
+        await server.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
 });

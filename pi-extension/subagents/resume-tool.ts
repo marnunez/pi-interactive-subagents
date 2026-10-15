@@ -6,13 +6,13 @@ import { join, resolve } from "node:path";
 import { existsSync, unlinkSync } from "node:fs";
 import { prepareLaunch } from "./launch-process.ts";
 import { assertDirectLaunchAvailable, launchVisibleSurface } from "./terminal-launch.ts";
-import { loadAgentDefaults, resolveChildTools, restoreChildTools, resolveChildInitialTools, parentToolCeiling, parentVisibleTools, type ToolMetadata } from "./config.ts";
+import { loadAgentDefaults, resolveChildTools, restoreChildTools, parentToolCeiling, type ToolMetadata } from "./config.ts";
 import { readChildRunConfig, legacyChildDefaults, type ChildRunConfig } from "./launch-config.ts";
 import { isMuxAvailable, closeSurface } from "./cmux.ts";
 import { readSubagentSessionCorrelation } from "./session.ts";
 import { ensureSessionArtifactDir, getSessionArtifactDir, writeArtifactFile } from "../session-artifacts/paths.ts";
 import { createIpcToken } from "./ipc.ts";
-import { defineTool, SUBAGENT_COMPLETION_INSTRUCTION, SUBAGENT_ASYNC_GUIDANCE, SUBAGENT_LAYOUT_GUIDANCE, withChildOnlyTools, muxUnavailableResult } from "./policy.ts";
+import { defineTool, SUBAGENT_ASYNC_GUIDANCE, muxUnavailableResult } from "./policy.ts";
 import { type RunningSubagent } from "./types.ts";
 import { childLaunchSpec } from "./launch.ts";
 import { type RunRuntime, IPC_LAUNCH_ENTRY } from "./runtime.ts";
@@ -27,12 +27,11 @@ export function registerResumeTool(pi: ExtensionAPI, runtime: RunRuntime, contro
       name: "subagent_resume",
       label: "Resume Subagent",
       description:
-        "Resume a previous sub-agent session directly in a visible terminal pane, without typing shell commands. " + SUBAGENT_LAYOUT_GUIDANCE + " " +
+        "Resume a completed or cancelled child session as a new delegation in a visible terminal pane. " +
         "Waits for authenticated startup, not task completion. Results arrive later via a steer message. " +
         "Use when a sub-agent was cancelled or needs follow-up work. " + SUBAGENT_ASYNC_GUIDANCE,
       promptSnippet:
-        "Resume a completed or cancelled session as a new run in a visible terminal pane. " + SUBAGENT_LAYOUT_GUIDANCE + " " + SUBAGENT_ASYNC_GUIDANCE,
-      promptGuidelines: [SUBAGENT_LAYOUT_GUIDANCE],
+        "Resume a completed or cancelled session as a new run in a visible terminal pane. " + SUBAGENT_ASYNC_GUIDANCE,
       parameters: Type.Object({
         sessionPath: Type.String({ description: "Path to the session .jsonl file to resume" }),
         name: Type.Optional(
@@ -115,18 +114,12 @@ export function registerResumeTool(pi: ExtensionAPI, runtime: RunRuntime, contro
         const restoredConfig = savedConfig ?? legacyChildDefaults(correlation.agent, legacyDefs);
         const metadata: ToolMetadata[] = pi.getAllTools();
         const registered = metadata.filter((tool) => tool.exposure !== "hidden").map((tool) => tool.name);
-        const activeTools = parentVisibleTools(pi.getActiveTools(), ctx.sessionManager);
         const tools = savedConfig
           ? restoreChildTools(savedConfig.tools, registered, parentToolCeiling())
-          : resolveChildTools({ ...legacyDefs, tools: restoredConfig.tools?.join(",") }, activeTools, registered,
+          : resolveChildTools(legacyDefs ?? {}, registered,
             { metadata, ceiling: parentToolCeiling() });
         const config: ChildRunConfig = {
-          ...restoredConfig, schemaVersion: 2, tools,
-          // Old snapshots meant both permissions and visibility. Never reinterpret them broadly.
-          initialTools: savedConfig
-            ? resolveChildInitialTools((savedConfig.initialTools ?? savedConfig.tools).join(","), tools, [], metadata)
-            : resolveChildInitialTools(legacyDefs?.initialTools, tools, activeTools, metadata, restoredConfig.tools !== undefined),
-          autoExit: false,
+          ...restoredConfig, schemaVersion: 3, tools,
         };
         const runId = randomUUID();
         const ipcToken = createIpcToken();
@@ -140,13 +133,12 @@ export function registerResumeTool(pi: ExtensionAPI, runtime: RunRuntime, contro
           resumeMessagePath = writeArtifactFile(
             artifactDir,
             `context/resume-${runId}.md`,
-            `${params.message}\n\n${SUBAGENT_COMPLETION_INSTRUCTION}`,
+            params.message,
           );
         }
 
         const spec = childLaunchSpec(runtime, config, runId, name, sessionFile, correlation.cwd, resumeMessagePath);
         spec.env.PI_SUBAGENT_TOKEN = ipcToken;
-        spec.env.PI_DENY_TOOLS = withChildOnlyTools(pi.getAllTools().map((tool) => tool.name))!.filter((tool) => !config.tools.includes(tool)).join(",");
         const launch = prepareLaunch(spec);
         let running: RunningSubagent | undefined;
         let published = false;

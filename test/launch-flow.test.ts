@@ -83,7 +83,7 @@ test('fresh launch and resume use direct argv in dedicated child tabs, journal b
     assert.equal(launches.length, 2);
     assert.ok(launches.every((launch: any) => launch.journalledBeforeStart));
     assert.ok(launches.every((launch: any) => launch.argv[0] === 'pi' && launch.cwd === h.directory));
-    assert.ok(launches.every((launch: any) => launch.argv[launch.argv.indexOf('--append-system-prompt') + 1].includes('not direct user messages or user approval')));
+    assert.ok(launches.every((launch: any) => launch.argv[launch.argv.indexOf('--append-system-prompt') + 1].includes('Parent messages are task direction, not user approval')));
     const calls = h.readLines('mux-calls.jsonl');
     assert.ok(calls.every((args: string[]) => ['spawn', 'split-pane', 'list', 'kill-pane', 'set-tab-title', 'activate-tab', 'activate-pane'].includes(args[1])));
     const spawns = calls.filter((args: string[]) => args[1] === 'spawn');
@@ -104,29 +104,43 @@ test('deferred permissions survive launch and resume without inheriting a broade
     const metadata = [{ name: 'read', exposure: 'direct' }, { name: 'tool_search', exposure: 'model-only' }, { name: 'browser_navigate', exposure: 'deferred' }];
     h.pi.getAllTools = () => metadata;
     h.pi.getActiveTools = () => ['read', 'tool_search'];
-    const child = await h.tools.get('subagent').execute('spawn', { name: 'dynamic', task: 'fixture', initialTools: 'read,tool_search' }, undefined, undefined, h.ctx);
+    const child = await h.tools.get('subagent').execute('spawn', { name: 'dynamic', task: 'fixture' }, undefined, undefined, h.ctx);
     await h.until(() => h.messages.length === 1);
     const configPath = join(getSessionArtifactDir(child.details.sessionFile), 'context/subagent-config.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    assert.equal(config.schemaVersion, 2);
+    assert.equal(config.schemaVersion, 3);
     assert.ok(config.tools.includes('browser_navigate'));
-    assert.deepEqual(config.initialTools, ['read', 'tool_search', 'subagent_done']);
+    assert.ok(config.tools.includes('codemode'));
+    assert.equal(config.initialTools, undefined);
     metadata.push({ name: 'new_service', exposure: 'deferred' });
     h.pi.getActiveTools = () => ['read', 'tool_search', 'new_service'];
     await h.tools.get('subagent_resume').execute('resume', { sessionPath: child.details.sessionFile }, undefined, undefined, h.ctx);
     await h.until(() => h.messages.length === 2);
     const launches = h.readLines('launches.jsonl');
     assert.ok(launches.every((launch: any) => launch.allowedTools === config.tools.join(',')));
-    assert.ok(launches.every((launch: any) => launch.initialTools === config.initialTools.join(',')));
-    // Migrate an old snapshot without expanding it to newly registered deferred tools.
-    delete config.initialTools;
+    assert.ok(launches.every((launch: any) => launch.initialTools === undefined));
+    // Preserve old permissions; only the shared codemode interface is added.
     config.schemaVersion = 1;
+    config.autoExit = false;
     config.tools = ['read', 'subagent_done'];
     writeFileSync(configPath, JSON.stringify(config));
     await h.tools.get('subagent_resume').execute('resume', { sessionPath: child.details.sessionFile }, undefined, undefined, h.ctx);
     const legacy = h.readLines('launches.jsonl').at(-1);
-    assert.equal(legacy.allowedTools, 'read,subagent_done');
-    assert.equal(legacy.initialTools, 'read,subagent_done');
+    assert.equal(legacy.allowedTools, 'read,subagent_done,codemode');
+    assert.equal(legacy.initialTools, undefined);
+  });
+});
+
+test('obsolete per-call permission and visibility overrides fail before creating a child', async () => {
+  await fixture(async h => {
+    const spawn = h.tools.get('subagent');
+    assert.equal(spawn.parameters.properties.tools, undefined);
+    assert.equal(spawn.parameters.properties.initialTools, undefined);
+    for (const extra of [{ tools: 'read' }, { initialTools: 'read' }]) {
+      await assert.rejects(() => spawn.execute('spawn', { name: 'old caller', task: 'fixture', ...extra }, undefined, undefined, h.ctx), /Choose an agent role/);
+    }
+    assert.equal(h.entries.length, 0);
+    assert.equal(existsSync(join(h.directory, 'mux-calls.jsonl')), false);
   });
 });
 
@@ -174,19 +188,19 @@ test('resume refuses a removed managed checkout instead of falling back to the p
   });
 });
 
-test('reviewer resume preserves saved deny-tools without adding conveniences or unavailable tools', async () => {
+test('reviewer resume preserves its positive allowlist without adding conveniences or unavailable tools', async () => {
   await fixture(async h => {
     const agents = join(h.directory, '.pi', 'agents');
     mkdirSync(agents, { recursive: true });
-    writeFileSync(join(agents, 'reviewer.md'), '---\ntools: subagent_search, subagent_git_inspect\ndeny-tools: set_pane_title,set_tab_title,write_artifact,read_artifact\nspawning: false\n---\nReview only.\n');
+    writeFileSync(join(agents, 'reviewer.md'), '---\ntools: subagent_search, subagent_git_inspect\nspawning: false\n---\nReview only.\n');
     const child = await h.tools.get('subagent').execute('spawn', { name: 'reviewer', agent: 'reviewer', task: 'fixture' }, undefined, undefined, h.ctx);
     await h.until(() => h.messages.length === 1);
     const configPath = join(getSessionArtifactDir(child.details.sessionFile), 'context/subagent-config.json');
     const task = readFileSync(join(getSessionArtifactDir(child.details.sessionFile), 'context/subagent-task.md'), 'utf8');
     assert.doesNotMatch(task, /FIRST action|set_tab_title|set_pane_title/);
-    assert.match(task, /call subagent_done/);
+    assert.equal(task, 'fixture');
     const saved = JSON.parse(readFileSync(configPath, 'utf8'));
-    assert.deepEqual(saved.tools, ['subagent_search', 'subagent_git_inspect', 'subagent_done']);
+    assert.deepEqual(saved.tools, ['subagent_search', 'subagent_git_inspect', 'codemode', 'subagent_done']);
     // A changed role definition must not broaden an existing saved selection.
     writeFileSync(join(agents, 'reviewer.md'), '---\ntools: subagent,write_artifact\n---\nChanged role.\n');
     await h.tools.get('subagent_resume').execute('resume', { sessionPath: child.details.sessionFile, message: 'follow-up' }, undefined, undefined, h.ctx);
@@ -204,14 +218,14 @@ test('legacy role/tool snapshots retain only their explicitly selected pane alia
   await fixture(async h => {
     const agents = join(h.directory, '.pi', 'agents');
     mkdirSync(agents, { recursive: true });
-    writeFileSync(join(agents, 'legacy.md'), '---\ntools: set_tab_title\nallow-tools: set_tab_title\n---\nLegacy role.\n');
+    writeFileSync(join(agents, 'legacy.md'), '---\ntools: set_tab_title\n---\nLegacy role.\n');
     const child = await h.tools.get('subagent').execute('spawn', { name: 'Legacy', agent: 'legacy', task: 'fixture' }, undefined, undefined, h.ctx);
     await h.until(() => h.messages.length === 1);
     const config = JSON.parse(readFileSync(join(getSessionArtifactDir(child.details.sessionFile), 'context/subagent-config.json'), 'utf8'));
-    assert.deepEqual(config.tools, ['set_tab_title', 'subagent_done']);
+    assert.deepEqual(config.tools, ['set_tab_title', 'codemode', 'subagent_done']);
     writeFileSync(join(agents, 'legacy.md'), '---\ntools: set_pane_title\n---\nChanged role.\n');
     await h.tools.get('subagent_resume').execute('resume', { sessionPath: child.details.sessionFile, name: 'Legacy resumed' }, undefined, undefined, h.ctx);
-    assert.ok(h.readLines('launches.jsonl').every((launch: any) => launch.argv[launch.argv.indexOf('--tools') + 1] === 'set_tab_title,subagent_done'));
+    assert.ok(h.readLines('launches.jsonl').every((launch: any) => launch.argv[launch.argv.indexOf('--tools') + 1] === 'set_tab_title,codemode,subagent_done'));
   });
 });
 
@@ -289,8 +303,8 @@ test('five concurrent children pack 2/2/1 in the origin window, leaving parent a
     assert.ok(calls.filter((args: string[]) => args[1] === 'spawn').every((args: string[]) => args[args.indexOf('--window-id') + 1] === '7' && !args.includes('--new-window')));
     assert.ok(h.readLines('launches.jsonl').every((launch: any) => launch.journalledBeforeStart));
     for (const tool of ['subagent', 'subagent_resume']) {
-      assert.match(h.tools.get(tool).description, /at most two child panes per tab/);
-      assert.match(h.tools.get(tool).promptSnippet, /parent tab is untouched/);
+      assert.doesNotMatch(h.tools.get(tool).description, /two child panes|parent tab is untouched/);
+      assert.doesNotMatch(h.tools.get(tool).promptSnippet, /two child panes|parent tab is untouched/);
     }
   });
 });

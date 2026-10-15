@@ -6,7 +6,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { loadAgentDefaults, resolveChildTools, restoreChildTools } from "../pi-extension/subagents/config.ts";
-import { withChildOnlyTools } from "../pi-extension/subagents/policy.ts";
 import { registerInspectionTools } from "../pi-extension/subagents/inspection-tools.ts";
 import { boundedOutput, inspectionGitEnvironment, inspectChildGit, INSPECTION_MAX_BYTES, INSPECTION_MAX_LINES, searchChild } from "../pi-extension/subagents/inspection.ts";
 
@@ -29,15 +28,13 @@ function repository(root: string) {
   git(root, "add", "."); git(root, "commit", "-qm", "initial");
 }
 
-test("inspection tools are explicit, optional child-only capabilities; denials and spawning false win", () => {
+test("inspection tools are explicit child-only capabilities; spawning false still applies", () => {
   const optional = ["subagent_search", "subagent_git_inspect"];
-  assert.ok(withChildOnlyTools([])!.includes(optional[0]));
-  assert.ok(resolveChildTools({}, ["read", ...optional], ["read", ...optional]).every((name) => !optional.includes(name)));
-  const tools = resolveChildTools({ tools: "read,subagent_search,subagent_git_inspect,subagent", spawning: false }, [], ["read", "subagent"]);
+  assert.ok(resolveChildTools({}, ["read", ...optional]).every((name) => !optional.includes(name)));
+  const tools = resolveChildTools({ tools: "read,subagent_search,subagent_git_inspect,subagent", spawning: false }, ["read", "subagent"]);
   assert.ok(optional.every((tool) => tools.includes(tool)));
   assert.equal(tools.includes("subagent"), false);
-  assert.equal(resolveChildTools({ tools: optional.join(","), denyTools: optional.join(",") }, [], []).some((name) => optional.includes(name)), false);
-  assert.equal(resolveChildTools({ tools: "read", allowTools: optional.join(",") }, [], ["read"]).some((name) => optional.includes(name)), false);
+  assert.equal(resolveChildTools({ tools: "read" }, ["read", ...optional]).some((name) => optional.includes(name)), false);
   for (const [env, expected] of [
     [{}, []],
     [{ PI_SUBAGENT_TOOLS: optional.join(",") }, []],
@@ -54,7 +51,7 @@ test("inspection tools are explicit, optional child-only capabilities; denials a
   try {
     process.env.PI_CODING_AGENT_DIR = join(process.cwd(), '.test-tmp', 'empty-profile');
     const reviewer = loadAgentDefaults("reviewer", process.cwd(), false)!;
-    const selected = resolveChildTools(reviewer, [], ["read", "bash"]);
+    const selected = resolveChildTools(reviewer, ["read", "bash"]);
     assert.ok(optional.every((tool) => selected.includes(tool)));
     assert.equal(selected.includes("bash"), false);
     assert.equal(selected.includes("write_artifact"), false);
@@ -64,10 +61,10 @@ test("inspection tools are explicit, optional child-only capabilities; denials a
   }
 });
 
-test("resume preserves a reviewer's effective deny-tools selection and fails closed on unavailable tools", () => {
-  const saved = resolveChildTools({ tools: "read,subagent_search,subagent_git_inspect", denyTools: "set_pane_title,set_tab_title,write_artifact,read_artifact", spawning: false }, [], ["read"]);
+test("resume preserves a reviewer's positive allowlist and fails closed on unavailable tools", () => {
+  const saved = resolveChildTools({ tools: "read,subagent_search,subagent_git_inspect", spawning: false }, ["read"]);
   assert.deepEqual(restoreChildTools(saved, ["read", "bash", "subagent", "database_query"]), saved);
-  assert.deepEqual(restoreChildTools(["read"], ["read"]), ["read", "subagent_done"]);
+  assert.deepEqual(restoreChildTools(["read"], ["read"]), ["read", "codemode", "subagent_done"]);
   assert.throws(() => restoreChildTools(["read", "missing_external"], ["read"]), /Unknown tool.*saved tools/);
 });
 

@@ -35,7 +35,6 @@ import {
 
 import { shellEscape, isCmuxAvailable, isWezTermAvailable } from "../pi-extension/subagents/cmux.ts";
 import {
-  resolveChildActiveTools,
   validateSubagentDoneParams,
 } from "../pi-extension/subagents/subagent-done.ts";
 import {
@@ -606,39 +605,6 @@ describe("subagent-done.ts", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("preserves preset-selected tools and activates registered child lifecycle tools", () => {
-    assert.deepEqual(
-      resolveChildActiveTools(
-        ["read", "bash", "subagent"],
-        [],
-        ["read", "bash", "subagent", "subagent_done", "set_pane_title", "set_tab_title"],
-      ),
-      ["read", "bash", "subagent", "subagent_done", "set_pane_title"],
-    );
-  });
-
-  it("keeps an explicit child tool lock while restoring mandatory lifecycle tools", () => {
-    assert.deepEqual(
-      resolveChildActiveTools(
-        ["read", "bash", "edit", "web_search"],
-        ["read", "bash"],
-        ["read", "bash", "edit", "web_search", "subagent_done"],
-      ),
-      ["read", "bash", "subagent_done"],
-    );
-  });
-
-  it("does not activate child tools that were denied and therefore not registered", () => {
-    assert.deepEqual(
-      resolveChildActiveTools(
-        ["read", "bash"],
-        [],
-        ["read", "bash", "subagent_done"],
-      ),
-      ["read", "bash", "subagent_done"],
-    );
-  });
-
   it("validates structured completion and resolves artifact paths", () => {
     mkdirSync(join(dir, "context"), { recursive: true });
     writeFileSync(join(dir, "context", "notes.md"), "details");
@@ -856,22 +822,19 @@ describe("subagent launch environment", () => {
 
 describe("subagent tool allow-list", () => {
   it("keeps child lifecycle tools available when an agent restricts native tools", () => {
-    const testApi = (subagentsModule as any).__test__;
     const tools = resolveChildTools(
-      { tools: "read,bash,edit,write" }, [],
-      testApi.withChildOnlyTools(["read", "bash", "edit", "write", "write_artifact"]),
+      { tools: "read,bash,edit,write" }, ["read", "bash", "edit", "write", "write_artifact"],
     );
 
     assert.ok(tools.includes("subagent_done"));
-    assert.ok(tools.includes("write_artifact"));
+    assert.ok(tools.includes("codemode"));
+    assert.equal(tools.includes("write_artifact"), false);
     assert.ok(tools.includes("read"));
   });
 
-  it("never denies the mandatory subagent_done lifecycle tool", () => {
-    const testApi = (subagentsModule as any).__test__;
+  it("keeps common interfaces but never grants unselected optional tools", () => {
     const tools = resolveChildTools(
-      { tools: "read,bash", allowTools: "read,bash" }, [],
-      testApi.withChildOnlyTools(["read", "bash", "write_artifact"]),
+      { tools: "read,bash" }, ["read", "bash", "write_artifact"],
     );
 
     assert.ok(tools.includes("subagent_done"));

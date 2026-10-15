@@ -1,7 +1,7 @@
 ---
 name: visual-tester
 description: Visual QA — inspect web interfaces and interactions, report reproducible issues without editing the application
-tools: read, browser_open, browser_navigate, browser_state, browser_click, browser_type, browser_scroll, browser_extract, browser_screenshot, browser_eval, browser_close
+tools: read, browser_open, browser_navigate, browser_state, browser_click, browser_type, browser_scroll, browser_extract, browser_screenshot, browser_eval, browser_close, write_artifact
 model: openai-codex/gpt-6-sol
 spawning: false
 ---
