@@ -229,7 +229,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
 }
 
 describe("native discovery and child execution permissions", () => {
-  it("keeps common codemode/handback reachable without owning discovery across turns and reload", async () => {
+  it("honours native exposure at startup, then leaves discoveries intact throughout a run", async () => {
     const dir = mkdtempSync(join(tmpdir(), "child-native-discovery-"));
     configureChildEnv({ runId: "native-discovery" });
     process.env.PI_SUBAGENT_TOOLS = "read,tool_search,codemode,browser_navigate,subagent_done";
@@ -237,7 +237,7 @@ describe("native discovery and child execution permissions", () => {
     for (const name of ["read", "tool_search", "codemode", "browser_navigate"]) {
       h.tools.set(name, { name, exposure: name === "browser_navigate" ? "deferred" : "direct" });
     }
-    h.pi.setActiveTools(["read", "tool_search", "codemode"]);
+    h.pi.setActiveTools(["read", "tool_search", "codemode", "browser_navigate"]);
     try {
       await h.emit("session_start");
       assert.deepEqual(h.pi.getActiveTools(), ["read", "tool_search", "codemode", "subagent_done"]);
@@ -263,8 +263,8 @@ describe("native discovery and child execution permissions", () => {
       await h.emit("session_shutdown", { reason: "reload" });
       const updates = h.activeToolUpdates.length;
       await h.emit("session_start", { reason: "reload" });
-      assert.ok(h.pi.getActiveTools().includes("browser_navigate"));
-      assert.equal(h.activeToolUpdates.length, updates, "An active handback tool needs no startup reset");
+      assert.ok(!h.pi.getActiveTools().includes("browser_navigate"), "Restarted children rediscover deferred schemas instead of replaying a custom loadout");
+      assert.equal(h.activeToolUpdates.length, updates + 1, "Only the startup exposure adjustment is needed");
       assert.equal(h.entries.some(entry => entry.type === "custom"), false, "Discovery must not persist custom entries");
     } finally {
       await h.emit("session_shutdown", { reason: "reload" });

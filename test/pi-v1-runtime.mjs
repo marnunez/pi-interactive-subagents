@@ -53,9 +53,7 @@ try {
   const noCustomVisibility = () => assert.ok(!sessionManager.getEntries().some(entry=>entry.type==='custom' && entry.customType==='subagent_tool_loadout'));
   await start();
   assert.ok(session.getActiveToolNames().includes('codemode'));
-  // --tools is also Pi's native declaration selection. Exercise its own active
-  // controls, not a second extension policy, to defer a tool for this conversation.
-  session.setActiveToolsByName(config.tools.filter(name=>name!=='probe_browser_navigate'));
+  assert.ok(!session.getActiveToolNames().includes('probe_browser_navigate'), 'Exact native permission names must not eagerly declare deferred schemas');
   for (const name of ['forbidden','mcp__unselected__read','list_mcp_resources']) assert.ok(!session.getAllTools().some(tool=>tool.name===name));
   const requests = [];
   faux.setResponses([
@@ -74,10 +72,10 @@ try {
   assert.ok(!session.getActiveToolNames().includes('probe_browser_navigate'));
   await session.navigateTree(discoveredLeaf,{summarize:false});
   await session.reload();
-  assert.ok(session.getActiveToolNames().includes('probe_browser_navigate'));
+  assert.ok(!session.getActiveToolNames().includes('probe_browser_navigate'), 'Reload returns deferred tools to on-demand discovery');
   session.dispose();
   await start();
-  assert.ok(session.getActiveToolNames().includes('probe_browser_navigate'), 'Pi restores discovery on resume without extension snapshots');
+  assert.ok(!session.getActiveToolNames().includes('probe_browser_navigate'), 'Resumed sessions keep deferred capabilities without eagerly declaring schemas');
   await session.navigateTree(initialSystem.id,{summarize:false});
   faux.setResponses([toolCall('codemode',{code:'return await tools.probe_browser_navigate({});'}),ai.fauxAssistantMessage('done')]);
   await session.prompt('Call the permitted tool through codemode.');

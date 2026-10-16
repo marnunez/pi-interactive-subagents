@@ -164,9 +164,11 @@ Forks copy validated active conversation history, not the parent's orchestration
 
 ### Native discovery and codemode (Pi v1)
 
-Permissions and schema visibility are different concerns, but only **Pi** manages visibility. The subagent extension has no `initialTools`, declaration snapshots, branch restoration, hiding hook or retry queue. Every child gets codemode. Scripts can discover permitted tools with `searchTools`/`describeTool` and call them without declaring their schemas directly. A role may additionally list `tool_search` to use native direct-tool discovery. `subagent_done` stays model-only so scripts cannot end a delegation.
+Permissions and schema visibility are different concerns. There is no `initialTools`, declaration snapshot, branch restoration, hiding hook or retry queue. Every child gets codemode. Scripts can discover permitted tools with `searchTools`/`describeTool` and call them without declaring their schemas directly. A role may additionally list `tool_search` to use native direct-tool discovery. `subagent_done` stays model-only so scripts cannot end a delegation.
 
-Launches pass one capability list to native `--tools` so unselected extension tools are absent from the registry. Pi also uses that option as its initial declaration selection: this extension does not promise to hide explicitly selected tools. Use Pi's native exposure, active-tool controls and `codemode.mode: "only"` when a smaller model-facing tool surface is wanted. Pi's transcript owns discoveries, tree navigation, reload and resume.
+Launches pass one exact capability list to native `--tools` so unselected extension tools are absent from the registry. Pi 1.1 also treats exact names as initial declarations, even for deferred tools. At child startup, a small adapter deactivates tools whose native exposure is `deferred` or `codemode`, then ensures common codemode/handback remain reachable. It does not widen the registry, save another loadout or run before every request.
+
+Discoveries remain active during the run and native tree navigation still works. Reload/resume starts optional schemas unloaded again; the capabilities remain available to codemode and native discovery, so no replay/retry machinery is needed. Ordinary direct-tool presentation can also use Pi's native `codemode.mode: "only"`; that setting alone does not hide explicitly activated deferred schemas.
 
 Unselected MCP tools/resources are explicitly excluded where Pi's implicit MCP retention would otherwise bypass the registry selection. A call-time check enforces the saved capability ceiling equally on direct and nested calls, even if an extension changes active tools. Discovery and role selection cannot expand a nested child's permissions.
 

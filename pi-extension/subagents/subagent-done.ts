@@ -4,6 +4,7 @@
  * - Provides a mandatory structured `subagent_done` lifecycle tool
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ToolMetadata } from "./config.ts";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { registerInspectionTools } from "./inspection-tools.ts";
@@ -417,7 +418,13 @@ export default function (pi: ExtensionAPI) {
       });
     });
 
-    // Keep common interfaces reachable without replacing Pi's discovered tools.
+    // Native --tools also declares exact names, although this launch list is a
+    // capability ceiling. Honour extension exposure once at startup; after that
+    // native discovery owns declarations. No saved loadout or per-turn reset.
+    const deferred = new Set((pi.getAllTools() as ToolMetadata[]).filter((tool) =>
+      tool.exposure === "deferred" || tool.exposure === "codemode").map((tool) => tool.name));
+    const active = pi.getActiveTools();
+    if (active.some((name) => deferred.has(name))) pi.setActiveTools(active.filter((name) => !deferred.has(name)));
     ensureCommonTools();
 
     ipc?.start();
