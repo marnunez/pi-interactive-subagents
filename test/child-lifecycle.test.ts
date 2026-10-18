@@ -258,6 +258,7 @@ describe("native discovery and child execution permissions", () => {
       h.pi.setActiveTools(["read", "browser_navigate"]); // A preset hid the common interfaces.
       await h.emit("before_agent_start");
       assert.ok(h.pi.getActiveTools().includes("codemode"));
+      assert.ok(h.pi.getActiveTools().includes("tool_search"));
       assert.ok(h.pi.getActiveTools().includes("subagent_done"));
       assert.ok(h.pi.getActiveTools().includes("browser_navigate"), "Re-adding common interfaces must preserve discoveries");
       await h.emit("session_shutdown", { reason: "reload" });

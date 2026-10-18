@@ -4,7 +4,7 @@
  * - Provides a mandatory structured `subagent_done` lifecycle tool
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { ToolMetadata } from "./config.ts";
+import { COMMON_CHILD_TOOLS, type ToolMetadata } from "./config.ts";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { registerInspectionTools } from "./inspection-tools.ts";
@@ -201,7 +201,7 @@ export default function (pi: ExtensionAPI) {
   const ensureCommonTools = () => {
     const active = pi.getActiveTools();
     const missing = pi.getAllTools().map((tool) => tool.name).filter((name) =>
-      (name === "subagent_done" || name === "codemode")
+      COMMON_CHILD_TOOLS.some((tool) => tool === name)
       && (!allowedTools || allowedTools.has(name)) && !active.includes(name));
     if (missing.length) pi.setActiveTools([...active, ...missing]);
   };

@@ -59,7 +59,7 @@ describe("agent configuration", () => {
     writeAgent(profile, "empty-tools", "tools: []");
     const defaults = loadAgentDefaults("empty-tools", cwd)!;
     assert.equal(defaults.tools, "");
-    assert.deepEqual(resolveChildTools(defaults, ["read", "bash"]), ["codemode", "subagent_done"]);
+    assert.deepEqual(resolveChildTools(defaults, ["read", "bash"]), ["codemode", "subagent_done", "tool_search"]);
   });
   it("uses trusted project definitions before profile definitions", () => {
     const cwd = temporaryDirectory("cwd");
@@ -190,10 +190,10 @@ describe("child tool policy", () => {
     assert.ok(["codemode", "subagent_done", "write_artifact"].every((name) => tools.includes(name)));
   });
 
-  it("roles have a positive allowlist with only common codemode and handback added", () => {
+  it("roles have a positive allowlist with common execution, discovery and handback added", () => {
     assert.deepEqual(resolveChildTools({ tools: "read,database_query" }, registered),
-      ["read", "database_query", "codemode", "subagent_done"]);
-    assert.deepEqual(resolveChildTools({ tools: "" }, registered), ["codemode", "subagent_done"]);
+      ["read", "database_query", "codemode", "subagent_done", "tool_search"]);
+    assert.deepEqual(resolveChildTools({ tools: "" }, registered), ["codemode", "subagent_done", "tool_search"]);
   });
 
   it("new extensions never expand a restricted role", () => {
@@ -204,20 +204,20 @@ describe("child tool policy", () => {
 
   it("spawning false excludes the orchestration family even when listed", () => {
     assert.deepEqual(resolveChildTools({ tools: "read,subagent,subagents_list,subagent_resume,subagent_kill,subagent_message", spawning: false }, registered),
-      ["read", "codemode", "subagent_done"]);
+      ["read", "codemode", "subagent_done", "tool_search"]);
   });
 
   it("child-only conveniences must be explicitly selected by restricted roles", () => {
     assert.deepEqual(resolveChildTools({ tools: "write_artifact,set_pane_title" }, []),
-      ["write_artifact", "set_pane_title", "codemode", "subagent_done"]);
+      ["write_artifact", "set_pane_title", "codemode", "subagent_done", "tool_search"]);
   });
 
   it("recognises the legacy pane alias only when explicitly selected or saved", () => {
     assert.equal(resolveChildTools({}, [...registered, "set_tab_title"]).includes("set_tab_title"), false);
     const legacy = resolveChildTools({ tools: "set_tab_title" }, []);
-    assert.deepEqual(legacy, ["set_tab_title", "codemode", "subagent_done"]);
+    assert.deepEqual(legacy, ["set_tab_title", "codemode", "subagent_done", "tool_search"]);
     assert.deepEqual(restoreChildTools(legacy, []), legacy);
-    assert.deepEqual(restoreChildTools(["read", "subagent_done"], registered), ["read", "subagent_done", "codemode"]);
+    assert.deepEqual(restoreChildTools(["read", "subagent_done"], registered), ["read", "subagent_done", "codemode", "tool_search"]);
   });
 
   it("rejects unknown explicit tool names", () => {

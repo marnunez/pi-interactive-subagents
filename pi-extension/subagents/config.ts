@@ -42,7 +42,7 @@ const CHILD_TOOLS = [
   "write_artifact",
   "read_artifact",
 ] as const;
-export const COMMON_CHILD_TOOLS = ["codemode", "subagent_done"] as const;
+export const COMMON_CHILD_TOOLS = ["codemode", "subagent_done", "tool_search"] as const;
 const LEGACY_CHILD_TOOLS = ["set_tab_title"] as const;
 
 const moduleDir = dirname(fileURLToPath(import.meta.url));
