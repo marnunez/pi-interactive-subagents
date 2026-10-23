@@ -516,9 +516,9 @@ export default function (pi: ExtensionAPI) {
     label: "Subagent Done",
     exposure: "model-only",
     description:
-      "Finish the current subagent run with success, failed, or blocked. Each run accepts one terminal result. " +
-      "Persists a structured result, ends the current run after parent acknowledgement, and leaves the session resumable. " +
-      "Exiting without calling this tool is a protocol failure.",
+      "Send your final result back to the parent agent and finish the delegated task. " +
+      "Include a summary and any detailed findings, indicating success, failure, or a blocker. " +
+      "You must call this even if you cannot complete the task; an ordinary reply or pause does not finish it.",
     parameters: DoneParams,
     async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
       const params = rawParams as DoneParamsValue;
