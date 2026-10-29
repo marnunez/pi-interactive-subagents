@@ -126,7 +126,7 @@ test('deferred permissions survive launch and resume without inheriting a broade
     writeFileSync(configPath, JSON.stringify(config));
     await h.tools.get('subagent_resume').execute('resume', { sessionPath: child.details.sessionFile }, undefined, undefined, h.ctx);
     const legacy = h.readLines('launches.jsonl').at(-1);
-    assert.equal(legacy.allowedTools, 'read,subagent_done,codemode,tool_search');
+    assert.equal(legacy.allowedTools, 'read,subagent_done,codemode,tool_search,message_parent');
     assert.equal(legacy.initialTools, undefined);
   });
 });
@@ -200,7 +200,7 @@ test('reviewer resume preserves its positive allowlist without adding convenienc
     assert.doesNotMatch(task, /FIRST action|set_tab_title|set_pane_title/);
     assert.equal(task, 'fixture');
     const saved = JSON.parse(readFileSync(configPath, 'utf8'));
-    assert.deepEqual(saved.tools, ['subagent_search', 'subagent_git_inspect', 'codemode', 'subagent_done', 'tool_search']);
+    assert.deepEqual(saved.tools, ['subagent_search', 'subagent_git_inspect', 'codemode', 'subagent_done', 'tool_search', 'message_parent']);
     // A changed role definition must not broaden an existing saved selection.
     writeFileSync(join(agents, 'reviewer.md'), '---\ntools: subagent,write_artifact\n---\nChanged role.\n');
     await h.tools.get('subagent_resume').execute('resume', { sessionPath: child.details.sessionFile, message: 'follow-up' }, undefined, undefined, h.ctx);
@@ -222,10 +222,10 @@ test('legacy role/tool snapshots retain only their explicitly selected pane alia
     const child = await h.tools.get('subagent').execute('spawn', { name: 'Legacy', agent: 'legacy', task: 'fixture' }, undefined, undefined, h.ctx);
     await h.until(() => h.messages.length === 1);
     const config = JSON.parse(readFileSync(join(getSessionArtifactDir(child.details.sessionFile), 'context/subagent-config.json'), 'utf8'));
-    assert.deepEqual(config.tools, ['set_tab_title', 'codemode', 'subagent_done', 'tool_search']);
+    assert.deepEqual(config.tools, ['set_tab_title', 'codemode', 'subagent_done', 'tool_search', 'message_parent']);
     writeFileSync(join(agents, 'legacy.md'), '---\ntools: set_pane_title\n---\nChanged role.\n');
     await h.tools.get('subagent_resume').execute('resume', { sessionPath: child.details.sessionFile, name: 'Legacy resumed' }, undefined, undefined, h.ctx);
-    assert.ok(h.readLines('launches.jsonl').every((launch: any) => launch.argv[launch.argv.indexOf('--tools') + 1] === 'set_tab_title,codemode,subagent_done,tool_search'));
+    assert.ok(h.readLines('launches.jsonl').every((launch: any) => launch.argv[launch.argv.indexOf('--tools') + 1] === 'set_tab_title,codemode,subagent_done,tool_search,message_parent'));
   });
 });
 

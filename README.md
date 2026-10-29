@@ -70,7 +70,37 @@ Use the exact `runId` from `subagent` or `subagent_resume` to contact an **activ
 subagent_message({ runId: "<active-run-id>", message: "Please also check the error path." });
 ```
 
-The tool returns only when the child acknowledges accepting the message into Pi as a **custom advisory message**. It steers an active turn or triggers a new one when idle; it does **not** confirm that the child read, followed, or completed the request. The stored message is marked as agent-originated, and each child receives a system-level instruction that it is not user approval. **Pi's model adapter nevertheless presents custom messages with a user role**: do not rely on the model role or this instruction as an approval boundary; actual tool permissions must require confirmation through Pi's UI. Names, past session IDs, completed runs and another parent's runs are not valid addresses. The parent retries unacknowledged messages for up to 10 seconds, including across brief IPC disconnects; a timeout or shutdown reports uncertain delivery, not success. Duplicate frames are suppressed while the child's extension stays loaded; a reload/crash between dispatch and acknowledgement can lead to a repeated advisory message. Do not use messaging as a status poll or for non-idempotent instructions.
+The tool returns only when the child acknowledges accepting the message into Pi as a **custom advisory message**. It steers an active turn or triggers a new one when idle, except that an uncorrelated advisory does not wake a child waiting for clarification; it does **not** confirm that the child read, followed, or completed the request. The stored message is marked as agent-originated, and each child receives a system-level instruction that it is not user approval. **Pi's model adapter nevertheless presents custom messages with a user role**: do not rely on the model role or this instruction as an approval boundary; actual tool permissions must require confirmation through Pi's UI. Names, past session IDs, completed runs and another parent's runs are not valid addresses. The parent retries unacknowledged messages for up to 10 seconds, including across brief IPC disconnects; a timeout or shutdown reports uncertain delivery, not success. Accepted messages are journaled by run/message ID, so retries are deduplicated across reload. Journaled messages not yet committed to the model transcript are replayed; this is not an exactly-once execution guarantee. Do not use messaging as a status poll or for non-idempotent instructions.
+
+### Child-to-parent messages and clarification
+
+A child can send findings without finishing its delegation:
+
+```typescript
+message_parent({ message: "The old endpoint is still in use." });
+```
+
+To ask a question and pause, call the tool **on its own**, not alongside other tools:
+
+```typescript
+message_parent({ message: "Should I preserve the old endpoint?", waitForReply: true });
+```
+
+The child journals the message before sending it. The tool waits up to 10 seconds for **receipt acknowledgement**, not the answer. `waitForReply` defaults to `false`; with `true`, the tool stops automatic follow-up and the parent shows **waiting for parent**. The pane, session and run stay open, and further child tool calls are blocked until the question is answered. This does not emit `subagent_done` or a blocked/failed result. Work already performed by other tools is not undone.
+
+The parent receives an agent-originated steering message containing the exact run and message IDs. It can answer directly or ask the human for clarification, then reply:
+
+```typescript
+subagent_message({
+  runId: "<child-run-id>",
+  replyTo: "<question-message-id>",
+  message: "Yes, preserve compatibility.",
+});
+```
+
+Only a matching `replyTo` clears the pending question and wakes the child. An ordinary advisory is retained as context but does not release the pause. Wrong-run, stale and mismatched answers are rejected. There is one outstanding clarification per child; a human approval dialog remains a separate, higher-priority waiting state.
+
+Messages are limited to 16,000 characters. Receipt acknowledgements, accepted messages and pending questions survive `/reload`; unacknowledged child messages and journaled-but-uncommitted model messages are replayed. Interrupted/timed-out delivery is reported as uncertain, and a pending clarification remains paused rather than silently continuing. Cancelling the delegation remains available to the parent. Full parent-process crash/adoption limitations below still apply. Both directions carry agent text, **never human approval**, even when Pi's model adapter uses a user role.
 
 ## Completion protocol
 
@@ -107,7 +137,8 @@ Results include run/session IDs, the session path and elapsed time. The model re
 - `subagents_list`: list effective definitions.
 - `subagent_resume`: reuse a session with optional `name` and `message`. Without a message it opens interactively. Saved role/model/tools are restored; automatic exit is disabled.
 - `subagent_kill`: cancel by ID, name match or `all`. Omit the target only for an explicit user request to inspect running children—not polling.
-- `subagent_message`: send an advisory note to one connected, active child by its exact run ID; wait for delivery acknowledgement, not task completion.
+- `subagent_message`: send an advisory note or a correlated clarification answer (`replyTo`) to one connected, active child; wait for receipt, not completion.
+- `message_parent`: child-only finding, warning or question; `waitForReply: true` pauses the run for a correlated answer without completing it.
 - `subagent_done`: child-only terminal result.
 - `set_pane_title`: optional child-only pane progress title; initial naming is automatic.
 - `set_tab_title`: backward-compatible pane-only alias, available only when explicitly selected or restored from a saved selection.
@@ -146,25 +177,25 @@ Supported frontmatter:
 
 - `model`, `thinking`: model and reasoning defaults; explicit tool-call model overrides the definition.
 - `tools`: **positive capability allowlist across built-ins, extension and MCP tools**. A restricted role gains nothing when an extension adds new tools; no denylist maintenance is needed. If absent, the child is a trusted peer inheriting the parent's permitted registry, regardless of which schemas are active. Nested children inherit the parent's saved permission ceiling, and role selection intersects it. Hidden tools are never inherited or granted.
-- `spawning: false`: exclude the spawn/list/resume/kill/message family even if listed.
+- `spawning: false`: exclude the spawn/list/resume/kill/child-message family even if listed; `message_parent` remains available.
 - `skills` (or `skill`): comma-separated skills to load.
 - `cwd`: default working directory.
 - `max-instances`: per-parent simultaneous instances for this agent.
 - `env`: whitespace-separated `KEY=value` assignments; reserved run identity, policy and lease variables cannot be overridden.
 
-`codemode`, native `tool_search` and `subagent_done` form the common child interface, including for restricted roles and resumed legacy sessions. Codemode uses Pi's QuickJS sandbox and nested calls still pass through the same permission check; it does not grant additional tools. To enable codemode in primary sessions too, configure Pi's native `defaultTools`/preset selection separately.
+`codemode`, native `tool_search`, `message_parent` and `subagent_done` form the common child interface, including for restricted roles and resumed legacy sessions. Codemode uses Pi's QuickJS sandbox and nested calls still pass through the same permission check; it does not grant additional tools. To enable codemode in primary sessions too, configure Pi's native `defaultTools`/preset selection separately.
 
 Restricted roles must explicitly list optional capabilities such as `set_pane_title`, `write_artifact` and `read_artifact`. Trusted peers retain the ordinary artifact/title conveniences. The legacy `set_tab_title` alias is never automatically inherited; select it explicitly only for compatibility. Unknown explicit tool names fail. The bundled scout and visual tester explicitly list their artifact writer; the reviewer does not have one.
 
-Agent bodies and `systemPrompt` supply role instructions for fresh and forked runs. Every child also receives a short common system instruction: complete the delegated task, explicitly hand it back with `subagent_done`, do not treat pauses as completion, and do not treat parent-agent messages as user approval. The task message contains the task, not another copy of the protocol. Terminal layout details stay in runtime code and this README, not model instructions.
+Agent bodies and `systemPrompt` supply role instructions for fresh and forked runs. Every child also receives a short common system instruction: complete the delegated task, explicitly hand it back with `subagent_done`, use `message_parent` for findings or clarification, do not treat pauses as completion, and do not treat parent-agent messages as user approval. The task message contains the task, not another copy of the protocol. Terminal layout details stay in runtime code and this README, not model instructions.
 
-Forks copy validated active conversation history, not the parent's orchestration ledger. Resume restores the saved **capability ceiling**, adding only common codemode/discovery/handback; it does not add optional conveniences, inherit new parent tools or reread changed role defaults. Version 3 snapshots store capabilities and launch settings only. Version 1/2 snapshots are validated; obsolete declaration/automatic-exit fields are discarded without broadening their saved tools. An unavailable saved extension tool, or a selection exceeding the resuming parent's ceiling, fails closed. Sessions without snapshots still resolve role defaults. Ancestor policy and lease variables are cleared before launch.
+Forks copy validated active conversation history, not the parent's orchestration ledger. Resume restores the saved **capability ceiling**, adding only common codemode/discovery/parent-messaging/handback; it does not add optional conveniences, inherit new parent tools or reread changed role defaults. Version 3 snapshots store capabilities and launch settings only. Version 1/2 snapshots are validated; obsolete declaration/automatic-exit fields are discarded without broadening their saved tools. An unavailable saved extension tool, or a selection exceeding the resuming parent's ceiling, fails closed. Sessions without snapshots still resolve role defaults. Ancestor policy and lease variables are cleared before launch.
 
-**Migration:** remove `allow-tools`, `deny-tools`, `initial-tools` and `auto-exit` from agent definitions. They now fail with an explicit configuration error rather than silently weakening a role or falling through to a broader definition. Express the intended permissions in `tools`; `tools: []` grants only codemode, native tool search and handback. Add `write_artifact` explicitly where a role's workflow writes artifacts. Old per-call `tools`/`initialTools` arguments are rejected; select a role instead.
+**Migration:** remove `allow-tools`, `deny-tools`, `initial-tools` and `auto-exit` from agent definitions. They now fail with an explicit configuration error rather than silently weakening a role or falling through to a broader definition. Express the intended permissions in `tools`; `tools: []` grants only codemode, native tool search, parent messaging and handback. Add `write_artifact` explicitly where a role's workflow writes artifacts. Old per-call `tools`/`initialTools` arguments are rejected; select a role instead.
 
 ### Native discovery and codemode (Pi v1)
 
-Permissions and schema visibility are different concerns. There is no `initialTools`, declaration snapshot, branch restoration, hiding hook or retry queue. Every child gets both discovery routes: codemode's `searchTools`/`describeTool` for scripts, and native `tool_search` for normal direct calls. The latter loads matching permitted schemas into the active tool set; scripts do not need to activate schemas. `subagent_done` stays model-only so scripts cannot end a delegation.
+Permissions and schema visibility are different concerns. There is no `initialTools`, declaration snapshot, branch restoration, hiding hook or retry queue. Every child gets both discovery routes: codemode's `searchTools`/`describeTool` for scripts, and native `tool_search` for normal direct calls. The latter loads matching permitted schemas into the active tool set; scripts do not need to activate schemas. `subagent_done` and `message_parent` stay model-only so scripts cannot complete or pause a delegation.
 
 Launches pass one exact capability list to native `--tools` so unselected extension tools are absent from the registry. Pi 1.1 also treats exact names as initial declarations, even for deferred tools. At child startup, a small adapter deactivates tools whose native exposure is `deferred` or `codemode`, then ensures common codemode/handback remain reachable. It does not widen the registry, save another loadout or run before every request.
 
@@ -225,7 +256,7 @@ npm test
 PI_OFFLINE=1 PI_V1_SDK_PATH=/path/to/pi/dist/index.js npm run test:pi-v1
 ```
 
-The Pi v1 integration uses a scripted local faux provider: no remote model calls, user credentials, live services or GUI operations. It verifies native tool selection/search and direct/nested codemode execution, filtering of forbidden extension/MCP tools, late permitted tools, tree navigation, reload and resume, without custom discovery snapshots. Standard regressions cover legacy launch migration, positive role allowlists, new extensions not widening restricted roles, nested ceilings, obsolete argument rejection and pauses/interruption never completing a delegation.
+The Pi v1 integration uses a scripted local faux provider: no remote model calls, user credentials, live services or GUI operations. It verifies native tool selection/search and direct/nested codemode execution, filtering of forbidden extension/MCP tools, late permitted tools, tree navigation, reload and resume, without custom discovery snapshots. It also verifies clarification pauses, advisory non-wakeup and correlated reply wakeup after reload against the native tool loop. Standard regressions cover legacy launch migration, positive role allowlists, new extensions not widening restricted roles, nested ceilings, obsolete argument rejection and pauses/interruption never completing a delegation.
 
 Tests cover session lineage, run-scoped persistence, completion retry/acknowledgement, reload recovery, cancellation, nested orchestration sockets, tool policy, profile discovery, artifacts and UI-state monitoring. Inspection regressions cover explicit child role selection, saved allowlists on resume, literal search, adversarial paths/args, bounded output, symlinks, nested cwd and linked worktrees, huge ignored dependency/nested trees, tracked links and directory-to-link replacements, hostile inherited Git environment, disabled execution hooks/diff/textconv/clean/process filters (including local, conditional and worktree config), unchanged index bytes/mtime, invalid-byte filename/ignored-Unicode alias prevention, discovered control/backslash names, malformed-config refusal without ignored-secret fallback, and catalogue overflow. Launch/resume integration tests execute fake mux/Pi processes with real IPC: they assert journal-before-execution, direct argument handling, five concurrent children packed 2/2/1 in the origin window with parent/foreign panes untouched, direct targeted launch failures, reload, resume, startup acknowledgement and cancellation. Unit tests cover live moves, dead/completed children, foreign windows, full/mixed tabs and unchanged tmux argv. No paid model calls or live desktop operations are used.
 
@@ -250,7 +281,7 @@ Keep actual Pi smoke sessions outside the extension checkout: Pi auto-discovers 
 
 - `launch.ts`, `worktree.ts`, `launch-process.ts/.mjs`, `terminal-launch.ts`, `terminal-title.mjs`: session preparation, opt-in Git checkout, private direct process launch, safe pane titles and parent-owned dedicated tab labels.
 - `controller.ts`, `runtime.ts`, `types.ts`: orchestration, recovery, cancellation, IPC events and instance-owned state.
-- `message-tool.ts`: addressed parent-to-child messaging and delivery acknowledgement.
+- `message-tool.ts`, `parent-messages.ts`: addressed messaging, clarification correlation, durable inbox/outbox recovery and receipt acknowledgement.
 - `spawn-tool.ts`, `resume-tool.ts`, `management-tools.ts`, `commands.ts`: tool/command registration and input handling.
 - `presentation.ts`, `widget.ts`, `renderers.ts`: result text, status widgets and TUI rendering.
 - `config.ts`, `policy.ts`, `launch-config.ts`: agent discovery, capabilities, guidance and resume settings.

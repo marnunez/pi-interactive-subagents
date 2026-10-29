@@ -13,6 +13,7 @@ import { type SubagentResult, type PendingUiRequest, type RunningSubagent } from
 import { buildSubagentResultContent, MAX_DISPLAY_UI_REQUESTS, parsePendingUiRequest, parsePendingUiRequestCount } from "./presentation.ts";
 import { type RunRuntime, IPC_FINISH_ENTRY } from "./runtime.ts";
 import { createWidget } from "./widget.ts";
+import { CHILD_MESSAGE_RECEIVED, PARENT_REQUEST_RESOLVED, isChildMessage, messageKey, restoreParentMailbox, validMessageId, type ChildMessage } from "./parent-messages.ts";
 
 export function createController(pi: ExtensionAPI, runtime: RunRuntime) {
   const { updateWidget, startWidgetRefresh } = createWidget(runtime);
@@ -20,13 +21,35 @@ export function createController(pi: ExtensionAPI, runtime: RunRuntime) {
   const reportChildren = () => pi.events?.emit("subagent:children", runtime.runningSubagents.size);
   let unsubscribeChildren: (() => void) | undefined;
   const connectionFailureTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  const pendingMessages = new Map<string, { run: RunningSubagent; stop: (error?: Error) => void }>();
+  const pendingMessages = new Map<string, { run: RunningSubagent; replyTo?: string; stop: (error?: Error) => void }>();
+  let mailbox = restoreParentMailbox([]);
+  const dispatchedChildMessages = new Set<string>();
+  const updateRunState = (running: RunningSubagent, state: "idle" | "running") => {
+    running.state = (running.pendingUiRequestCount ?? 0) > 0 ? "waiting_input"
+      : running.pendingParentRequestId ? "waiting_parent" : state;
+  };
+  const resolveParentRequest = (running: RunningSubagent, messageId: string) => {
+    if (running.pendingParentRequestId !== messageId) return;
+    pi.appendEntry(PARENT_REQUEST_RESOLVED, { runId: running.runId, messageId });
+    running.pendingParentRequestId = undefined;
+    mailbox.questions.delete(running.runId);
+    updateRunState(running, "idle");
+    updateWidget();
+  };
+  const deliverChildMessage = (message: ChildMessage & { name: string }) => pi.sendMessage({
+    customType: "subagent_child_message",
+    content: `[Message from subagent ${JSON.stringify(message.name)}, not the user; this is not user approval]\n${message.text}\n\nRun ID: ${message.runId}\nMessage ID: ${message.messageId}\n${message.waitForReply ? "Waiting for parent clarification; the run is still open. Reply using subagent_message with this runId and replyTo set to this messageId." : "Advisory only; this is not task completion."}`,
+    display: true, details: message,
+  }, { triggerTurn: true, deliverAs: "steer" });
 
-  const sendToChild = (runId: string, text: string): Promise<void> => {
+  const sendToChild = (runId: string, text: string, replyTo?: string): Promise<void> => {
     const running = runtime.runningSubagents.get(runId);
     if (!runtime.acceptIpcResults || !running || running.runId !== runId ||
         !running.connected || !runtime.parentIpcServer?.isConnected(runId)) {
       throw new Error("No connected, active child with that exact run ID.");
+    }
+    if (replyTo !== undefined && (!validMessageId(replyTo) || running.pendingParentRequestId !== replyTo)) {
+      throw new Error("replyTo must identify this child's pending clarification request.");
     }
     const epoch = runtime.epoch;
     const messageId = randomUUID();
@@ -47,12 +70,12 @@ export function createController(pi: ExtensionAPI, runtime: RunRuntime) {
           return;
         }
         if (runtime.parentIpcServer?.isConnected(runId)) {
-          runtime.parentIpcServer.send(runId, "parent_message", { runId, messageId, text });
+          runtime.parentIpcServer.send(runId, "parent_message", { runId, messageId, text, ...(replyTo ? { replyTo } : {}) });
         }
       };
       const retry = setInterval(retrySend, 250);
       const deadline = setTimeout(() => stop(new Error("No child delivery acknowledgement within 10 seconds; delivery is uncertain.")), 10_000);
-      pendingMessages.set(messageId, { run: running, stop });
+      pendingMessages.set(messageId, { run: running, replyTo, stop });
       retrySend();
     });
   };
@@ -285,7 +308,10 @@ export function createController(pi: ExtensionAPI, runtime: RunRuntime) {
       const payload = message.payload as { runId?: unknown; messageId?: unknown } | undefined;
       const pending = typeof payload?.messageId === "string" ? pendingMessages.get(payload.messageId) : undefined;
       if (pending && pending.run.id === message.childId && pending.run.runId === payload?.runId &&
-          runtime.runningSubagents.get(message.childId) === pending.run) pending.stop();
+          runtime.runningSubagents.get(message.childId) === pending.run) {
+        if (pending.replyTo) resolveParentRequest(pending.run, pending.replyTo);
+        pending.stop();
+      }
       return;
     }
     if (message.type === "shutdown_ready") {
@@ -302,6 +328,37 @@ export function createController(pi: ExtensionAPI, runtime: RunRuntime) {
       return;
     }
     const payload = message.payload as any;
+
+    if (message.type === "child_message") {
+      if (!isChildMessage(payload, running.runId)) return;
+      const key = messageKey(running.runId, payload.messageId);
+      const previous = mailbox.received.get(key);
+      if (previous && (previous.text !== payload.text || previous.waitForReply !== payload.waitForReply)) return;
+      if (!previous) {
+        if (payload.waitForReply && running.pendingParentRequestId && running.pendingParentRequestId !== payload.messageId) return;
+        const accepted = { runId: running.runId, messageId: payload.messageId, text: payload.text,
+          waitForReply: payload.waitForReply, name: running.name };
+        // Journal first: queued model delivery can be recovered after /reload.
+        pi.appendEntry(CHILD_MESSAGE_RECEIVED, accepted);
+        mailbox.received.set(key, accepted);
+        if (payload.waitForReply) {
+          running.pendingParentRequestId = payload.messageId;
+          mailbox.questions.set(running.runId, payload.messageId);
+          updateRunState(running, "idle");
+        }
+      }
+      if (!mailbox.delivered.has(key) && !dispatchedChildMessages.has(key)) {
+        deliverChildMessage(mailbox.received.get(key)!);
+        dispatchedChildMessages.add(key);
+      }
+      runtime.parentIpcServer?.send(running.runId, "child_message_ack", { runId: running.runId, messageId: payload.messageId });
+      updateWidget();
+      return;
+    }
+    if (message.type === "parent_request_resolved") {
+      if (payload?.runId === running.runId && validMessageId(payload.messageId)) resolveParentRequest(running, payload.messageId);
+      return;
+    }
 
     if (message.type === "hello" || message.type === "ready") {
       running.connected = true;
@@ -324,21 +381,18 @@ export function createController(pi: ExtensionAPI, runtime: RunRuntime) {
           .slice(-MAX_DISPLAY_UI_REQUESTS);
         if (pendingCount === undefined) running.pendingUiRequestCount = (running.uiRequests ?? []).length;
       }
-      if ((running.pendingUiRequestCount ?? 0) > 0) {
-        running.state = "waiting_input";
-      } else if (payload?.state === "idle" || payload?.state === "running") {
-        running.state = payload.state;
-      }
+      if (validMessageId(payload?.pendingParentRequestId)) running.pendingParentRequestId = payload.pendingParentRequestId;
+      updateRunState(running, payload?.state === "running" ? "running" : "idle");
       updateWidget();
       return;
     }
     if (message.type === "running") {
-      running.state = (running.pendingUiRequestCount ?? 0) > 0 ? "waiting_input" : "running";
+      updateRunState(running, "running");
       updateWidget();
       return;
     }
     if (message.type === "settled") {
-      running.state = (running.pendingUiRequestCount ?? 0) > 0 ? "waiting_input" : "idle";
+      updateRunState(running, "idle");
       updateWidget();
       return;
     }
@@ -365,13 +419,7 @@ export function createController(pi: ExtensionAPI, runtime: RunRuntime) {
       );
       running.pendingUiRequestCount = parsePendingUiRequestCount(payload?.pendingUiRequestCount)
         ?? Math.max(0, (running.pendingUiRequestCount ?? 1) - 1);
-      if (running.pendingUiRequestCount > 0) {
-        running.state = "waiting_input";
-      } else if (payload?.state === "idle" || payload?.state === "running") {
-        running.state = payload.state;
-      } else {
-        running.state = "running";
-      }
+      updateRunState(running, payload?.state === "idle" ? "idle" : "running");
       updateWidget();
       return;
     }
@@ -437,7 +485,10 @@ export function createController(pi: ExtensionAPI, runtime: RunRuntime) {
     await runtime.parentIpcServer?.close().catch(() => { });
     runtime.parentIpcSocketPath = getIpcSocketPath(ctx.sessionManager.getSessionId());
 
-    const ledger = restoreRunLedger(ctx.sessionManager.getEntries());
+    const entries = ctx.sessionManager.getEntries();
+    const ledger = restoreRunLedger(entries);
+    mailbox = restoreParentMailbox(entries);
+    dispatchedChildMessages.clear();
     completedRuns.clear();
     for (const [id, finish] of ledger.finishes) {
       if (finish.result) completedRuns.set(id, finish.result);
@@ -455,6 +506,8 @@ export function createController(pi: ExtensionAPI, runtime: RunRuntime) {
         childSessionId: data.childSessionId ?? sessionCorrelation?.childSessionId ?? data.id,
         mode: data.mode ?? "fresh",
       } as RunningSubagent;
+      restored.pendingParentRequestId = mailbox.questions.get(restored.runId);
+      if (restored.pendingParentRequestId) restored.state = "waiting_parent";
       runtime.runningSubagents.set(restored.id, restored);
     }
 
@@ -488,6 +541,12 @@ export function createController(pi: ExtensionAPI, runtime: RunRuntime) {
     await runtime.parentIpcServer.start();
     runtime.acceptIpcResults = true;
     for (const result of ledger.pendingResults) deliverResult(result);
+    for (const [key, message] of mailbox.received) {
+      if (!mailbox.delivered.has(key) && runtime.runningSubagents.has(message.runId)) {
+        deliverChildMessage(message);
+        dispatchedChildMessages.add(key);
+      }
+    }
     // A crash can occur after committing a terminal outcome but before closing
     // its pane. Reap only journalled, still-open surfaces, deepest descendants first.
     for (const run of ledger.openSurfaces as RunningSubagent[]) {

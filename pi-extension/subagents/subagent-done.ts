@@ -22,6 +22,7 @@ import {
   type SubagentDoneResult,
 } from "./session.ts";
 import { ChildIpcClient, type IpcEnvelope } from "./ipc.ts";
+import { ChildParentMessages } from "./parent-messages.ts";
 import {
   monitorExtensionUi,
   PendingExtensionUiRequests,
@@ -179,7 +180,7 @@ export default function (pi: ExtensionAPI) {
   let runState: "idle" | "running" = "idle";
   let stopUiMonitor: (() => void) | null = null;
   const pendingUiRequests = new PendingExtensionUiRequests();
-  const receivedParentMessages = new Set<string>();
+  let parentMessages: ChildParentMessages | undefined;
 
   // Read subagent identity and IPC configuration from env vars set by the parent.
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
@@ -195,7 +196,7 @@ export default function (pi: ExtensionAPI) {
   const toolsCsv = process.env.PI_SUBAGENT_TOOLS;
   const allowedTools = toolsCsv === undefined ? null : new Set([
     ...toolsCsv.split(",").map((value) => value.trim()).filter(Boolean),
-    "subagent_done",
+    "subagent_done", "message_parent",
   ]);
 
   const ensureCommonTools = () => {
@@ -221,11 +222,13 @@ export default function (pi: ExtensionAPI) {
             ? `${latestCtx.model.provider}/${latestCtx.model.id}`
             : undefined,
           autoExit,
-          state: pendingUiRequests.snapshot().pendingUiRequestCount > 0 ? "waiting_input" : runState,
+          state: pendingUiRequests.snapshot().pendingUiRequestCount > 0 ? "waiting_input" : parentMessages?.waitingForReply ? "waiting_parent" : runState,
+          pendingParentRequestId: parentMessages?.waitingForReply,
           ...pendingUiRequests.snapshot(),
         }),
         onConnect: () => {
           if (pendingCompletion) ipc?.send("completion", pendingCompletion);
+          parentMessages?.reconnect();
         },
         onMessage: (message: IpcEnvelope) => {
           // Only the authenticated parent's socket may steer this run. A parent
@@ -240,20 +243,10 @@ export default function (pi: ExtensionAPI) {
             pendingCompletion = null;
             clearCompletionDeliveryTimers();
             requestCompletionShutdown();
+          } else if (message.type === "child_message_ack") {
+            parentMessages?.acknowledge(payload);
           } else if (message.type === "parent_message") {
-            if (payload?.runId !== runId || typeof payload.messageId !== "string" ||
-                !payload.messageId || typeof payload.text !== "string" || !payload.text.trim() ||
-                completionSent || !latestCtx) return;
-            if (!receivedParentMessages.has(payload.messageId)) {
-              pi.sendMessage({
-                customType: "subagent_parent_message",
-                content: `[Message from parent agent, not the user; this is not user approval]\n${payload.text}`,
-                display: true,
-                details: { runId, messageId: payload.messageId, text: payload.text },
-              }, { triggerTurn: true, deliverAs: "steer" });
-              receivedParentMessages.add(payload.messageId);
-            }
-            ipc?.send("parent_message_ack", { runId, messageId: payload.messageId });
+            parentMessages?.receive(message.payload);
           } else if (message.type === "abort") {
             void latestCtx?.abort();
           } else if (message.type === "shutdown") {
@@ -267,6 +260,12 @@ export default function (pi: ExtensionAPI) {
         },
       })
     : null;
+
+  if (ipc) {
+    parentMessages = new ChildParentMessages(pi, runId,
+      (type, payload) => ipc.send(type, payload), () => !!latestCtx && !completionSent);
+    parentMessages.register();
+  }
 
   function clearCompletionDeliveryTimers(): void {
     if (completionRetryTimer) clearInterval(completionRetryTimer);
@@ -314,6 +313,7 @@ export default function (pi: ExtensionAPI) {
 
   function cleanupSessionResources(): void {
     clearCompletionDeliveryTimers();
+    parentMessages?.stop();
     pendingCompletion = null;
     stopUiMonitor?.();
     stopUiMonitor = null;
@@ -377,7 +377,6 @@ export default function (pi: ExtensionAPI) {
   // Show widget + status bar, observe generic Pi UI requests, and establish parent IPC.
   pi.on("session_start", (_event, ctx) => {
     cleanupSessionResources();
-    receivedParentMessages.clear();
     registerChildListener();
     latestCtx = ctx;
     if (runId && ctx.mode === "tui") {
@@ -399,6 +398,7 @@ export default function (pi: ExtensionAPI) {
       ? readRunCompletion(sessionFile, runId)
       : undefined;
     completionSent = !!persistedCompletion;
+    if (!completionSent) parentMessages?.start(ctx.sessionManager.getEntries());
 
     stopUiMonitor = monitorExtensionUi(ctx.ui, (event) => {
       if (event.phase === "started") {
@@ -431,7 +431,8 @@ export default function (pi: ExtensionAPI) {
     ipc?.send("ready", {
       sessionId: ctx.sessionManager.getSessionId(),
       sessionFile,
-      state: runState,
+      state: parentMessages?.waitingForReply ? "waiting_parent" : runState,
+      pendingParentRequestId: parentMessages?.waitingForReply,
       ...pendingUiRequests.snapshot(),
     });
     if (persistedCompletion) beginCompletionDelivery(persistedCompletion);
@@ -462,7 +463,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_start", () => {
     runState = "running";
-    ipc?.send("running", { timestamp: Date.now() });
+    ipc?.send("running", { timestamp: Date.now(), pendingParentRequestId: parentMessages?.waitingForReply });
   });
 
   pi.on("message_end", (_event, ctx) => {
@@ -476,7 +477,7 @@ export default function (pi: ExtensionAPI) {
     runState = "idle";
     // A pause, interrupt, or ordinary final reply is not a delegation result.
     // Only subagent_done can persist and deliver a terminal completion.
-    ipc?.send("settled", { timestamp: Date.now(), autoExit });
+    ipc?.send("settled", { timestamp: Date.now(), autoExit, pendingParentRequestId: parentMessages?.waitingForReply });
   });
 
   pi.on("session_shutdown", async (event, ctx) => {
@@ -496,10 +497,11 @@ export default function (pi: ExtensionAPI) {
   // Applies equally to direct calls and nested codemode calls, even if another
   // extension activates a forbidden tool or discovery finds its declaration.
   pi.on("tool_call", (event) => {
+    if (completionSent) return { block: true, reason: "This run is already complete; resume the session as a new run.", terminate: true };
+    if (parentMessages?.waitingForReply) return { block: true, reason: `Waiting for parent reply to ${parentMessages.waitingForReply}; the run is still open.`, terminate: true };
     if (allowedTools && !allowedTools.has(event.toolName)) {
       return { block: true, reason: `Tool ${event.toolName} is not allowed for this subagent run.` };
     }
-    if (completionSent) return { block: true, reason: "This run is already complete; resume the session as a new run.", terminate: true };
   });
 
   // Toggle expand/collapse with Ctrl+J
@@ -523,6 +525,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
       const params = rawParams as DoneParamsValue;
       refreshChildren();
+      if (parentMessages?.waitingForReply) throw new Error("Waiting for a parent reply; this run is not complete.");
       if (pendingChildren > 0) throw new Error("Finish or cancel this run's children before calling subagent_done.");
       if (completionSent) {
         throw new Error("subagent_done has already been called for this run.");

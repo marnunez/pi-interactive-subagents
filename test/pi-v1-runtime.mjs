@@ -9,6 +9,7 @@ import { pathToFileURL } from 'node:url';
 import childExtension from '../pi-extension/subagents/subagent-done.ts';
 import { childLaunchSpec } from '../pi-extension/subagents/launch.ts';
 import { createRunRuntime } from '../pi-extension/subagents/runtime.ts';
+import { ParentIpcServer } from '../pi-extension/subagents/ipc.ts';
 
 const sdkPath = process.env.PI_V1_SDK_PATH;
 if (!sdkPath) throw new Error('Set PI_V1_SDK_PATH to Pi v1 dist/index.js.');
@@ -111,8 +112,70 @@ try {
   assert.ok(lateRequest?.includes('codemode') && !lateRequest.includes('probe_late'));
   assert.equal(calls,3,JSON.stringify(session.messages.slice(-3)));
   noCustomVisibility();
+  // Real native tool-loop test: receipt pauses, an advisory does not wake, and
+  // a correlated answer wakes the same run, including across extension reload.
+  session.dispose();
+  config.tools = ['read', 'message_parent', 'subagent_done'];
+  sessionManager = sdk.SessionManager.inMemory();
+  process.env.PI_SUBAGENT_ID = 'offline-child';
+  process.env.PI_SUBAGENT_SOCKET = join(root, 'parent.sock');
+  process.env.PI_SUBAGENT_TOKEN = 'offline-token';
+  let question, answerImmediately = false;
+  const parent = new ParentIpcServer({ socketPath:process.env.PI_SUBAGENT_SOCKET, onMessage:frame=>{
+    if (frame.type === 'child_message') {
+      question = frame.payload;
+      if (answerImmediately) parent.send("offline-child", "parent_message", {
+        runId:"offline-child",messageId:`fast-${question.messageId}`,replyTo:question.messageId,text:"Fast answer",
+      });
+      parent.send('offline-child', 'child_message_ack', frame.payload);
+    }
+  }});
+  parent.registerChild('offline-child','offline-token');
+  await parent.start();
+  const until = async predicate => {
+    const deadline = Date.now()+3000;
+    while (!predicate()) {
+      if (Date.now()>deadline) throw new Error('Timed out waiting for native clarification lifecycle');
+      await new Promise(resolve=>setTimeout(resolve,10));
+    }
+  };
+  try {
+    await start();
+    assert.ok(session.getActiveToolNames().includes('message_parent'));
+    let extraRequests = 0;
+    faux.setResponses([toolCall('message_parent',{message:'Which API?',waitForReply:true}),()=>{
+      extraRequests++; return ai.fauxAssistantMessage('unexpected continuation');
+    }]);
+    await session.prompt('Ask the parent which API to use.');
+    assert.ok(question);
+    assert.equal(extraRequests,0,'Waiting must terminate the native automatic tool follow-up');
+    assert.ok(!sessionManager.getEntries().some(entry=>entry.customType==='subagent_done_result'));
+    await session.reload();
+    await until(()=>parent.isConnected('offline-child'));
+    parent.send('offline-child','parent_message',{runId:'offline-child',messageId:'advisory',text:'Additional context'});
+    await new Promise(resolve=>setTimeout(resolve,50));
+    assert.equal(extraRequests,0,'An uncorrelated advisory must not wake the paused child');
+    faux.setResponses([context=>{
+      assert.ok(JSON.stringify(context.messages).includes('Use v2'));
+      return ai.fauxAssistantMessage('clarification received');
+    }]);
+    parent.send('offline-child','parent_message',{runId:'offline-child',messageId:'answer',replyTo:question.messageId,text:'Use v2'});
+    await until(()=>session.getLastAssistantText()==='clarification received');
+    await session.waitForIdle();
+    assert.ok(!sessionManager.getEntries().some(entry=>entry.customType==='subagent_done_result'));
+    answerImmediately = true;
+    faux.setResponses([toolCall('message_parent',{message:'Another question',waitForReply:true}),
+      ai.fauxAssistantMessage('fast clarification received')]);
+    await session.prompt('Ask another question.');
+    await until(()=>session.getLastAssistantText()==='fast clarification received');
+    await session.waitForIdle();
+  } finally {
+    await session.extensionRunner.emit({type:"session_shutdown",reason:"quit"});
+    session.dispose();
+    await parent.close();
+  }
   assert.deepEqual(errors,[], 'Extension hooks must not fail silently');
-  console.log('Pi v1: native discovery/tree/reload/resume, common codemode, late tools and permission filtering passed (offline).');
+  console.log('Pi v1: native discovery/permissions and clarification pause/advisory/reload/reply passed (offline).');
 } finally {
   session?.dispose();
   for (const [key,value] of savedEnv) { if (value===undefined) delete process.env[key]; else process.env[key]=value; }

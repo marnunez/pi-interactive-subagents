@@ -849,7 +849,7 @@ describe("parent waiting guidance", () => {
 
     assert.match(testApi.SUBAGENT_ASYNC_GUIDANCE, /never poll child status/i);
     assert.match(testApi.SUBAGENT_ASYNC_GUIDANCE, /end the current turn silently/i);
-    assert.match(testApi.SUBAGENT_ASYNC_GUIDANCE, /first child completion will trigger the next turn/i);
+    assert.match(testApi.SUBAGENT_ASYNC_GUIDANCE, /child message or completion will trigger the next turn/i);
     assert.match(testApi.SUBAGENT_KILL_GUIDANCE, /only when the user explicitly asks/i);
     assert.match(testApi.SUBAGENT_KILL_GUIDANCE, /never use this tool to poll/i);
   });

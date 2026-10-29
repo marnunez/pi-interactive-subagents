@@ -26,7 +26,7 @@ export interface SubagentResult {
   error?: string;
 }
 
-export type SubagentRunState = "idle" | "running" | "waiting_input";
+export type SubagentRunState = "idle" | "running" | "waiting_input" | "waiting_parent";
 
 export interface PendingUiRequest {
   id: string;
@@ -64,6 +64,7 @@ export interface RunningSubagent {
   config?: ChildRunConfig;
   connected?: boolean;
   state?: SubagentRunState;
+  pendingParentRequestId?: string;
   pendingUiRequestCount?: number;
   uiRequests?: PendingUiRequest[];
 }

@@ -24,23 +24,23 @@ test("trusted peers inherit capabilities independent of native tool exposure", (
 
 test("a positive role allowlist excludes new tools and optional helpers, not codemode", () => {
   const tools = resolveChildTools({ tools: "read,browser_navigate", spawning: false }, registered, { metadata });
-  assert.deepEqual(tools, ["read", "browser_navigate", "codemode", "subagent_done", "tool_search"]);
+  assert.deepEqual(tools, ["read", "browser_navigate", "codemode", "subagent_done", "tool_search", "message_parent"]);
   assert.deepEqual(resolveChildTools({ tools: "read,browser_navigate", spawning: false }, [...registered, "send_email"], { metadata }), tools);
   assert.throws(() => resolveChildTools({ tools: "withdrawn" }, registered, { metadata }), /Hidden tools/);
 });
 
 test("nested role selection intersects the parent's saved permissions, not its active schemas", () => {
-  const ceiling = ["read", "tool_search", "browser_navigate", "codemode", "subagent_done"];
+  const ceiling = ["read", "tool_search", "browser_navigate", "codemode", "subagent_done", "message_parent"];
   assert.deepEqual(resolveChildTools({}, registered, { metadata, ceiling }), ceiling);
-  assert.deepEqual(resolveChildTools({ tools: "read,bash" }, registered, { metadata, ceiling }), ["read", "codemode", "subagent_done", "tool_search"]);
+  assert.deepEqual(resolveChildTools({ tools: "read,bash" }, registered, { metadata, ceiling }), ["read", "codemode", "subagent_done", "tool_search", "message_parent"]);
   assert.throws(() => restoreChildTools(["read", "web_search"], registered, ceiling), /exceed the parent/);
-  assert.deepEqual(restoreChildTools(["read", "browser_navigate"], registered, ceiling), ["read", "browser_navigate", "codemode", "subagent_done", "tool_search"]);
-  assert.deepEqual(parentToolCeiling({ PI_SUBAGENT_ID: "child", PI_SUBAGENT_TOOLS: "read,tool_search" }), ["read", "tool_search", "codemode", "subagent_done"]);
+  assert.deepEqual(restoreChildTools(["read", "browser_navigate"], registered, ceiling), ["read", "browser_navigate", "codemode", "subagent_done", "tool_search", "message_parent"]);
+  assert.deepEqual(parentToolCeiling({ PI_SUBAGENT_ID: "child", PI_SUBAGENT_TOOLS: "read,tool_search" }), ["read", "tool_search", "codemode", "subagent_done", "message_parent"]);
   assert.equal(parentToolCeiling({ PI_SUBAGENT_TOOLS: "read" }), undefined);
 });
 
 test("nested named roles intersect before validating against an already-filtered registry", () => {
-  const ceiling = ["read", "codemode", "subagent_done", "tool_search"];
+  const ceiling = ["read", "codemode", "subagent_done", "tool_search", "message_parent"];
   const filtered = metadata.filter(tool => ceiling.includes(tool.name));
   assert.deepEqual(resolveChildTools({ tools: "read,bash,browser_navigate" }, filtered.map(tool => tool.name), { metadata: filtered, ceiling }), ceiling);
   assert.ok(!resolveChildTools({ tools: "bash" }, filtered.map(tool => tool.name), { metadata: filtered, ceiling }).includes("bash"));

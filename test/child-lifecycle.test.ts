@@ -541,6 +541,57 @@ describe("parent-to-child messaging", () => {
   });
 });
 
+describe("child-to-parent clarification lifecycle", () => {
+  it("keeps paused runs open, blocks work until an answer and restores the question across reload", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "child-clarification-"));
+    const sessionFile = createSessionFile(dir);
+    const socketPath = join(dir, "parent.sock"), runId = "clarification", token = "g".repeat(64);
+    const frames: any[] = [];
+    const server = new ParentIpcServer({ socketPath, onMessage(frame) {
+      frames.push(frame);
+      if (frame.type === "child_message") server.send(runId, "child_message_ack", frame.payload);
+    } });
+    server.registerChild(runId, token); await server.start();
+    configureChildEnv({ runId, socketPath, token });
+    process.env.PI_SUBAGENT_TOOLS = "read,subagent_done"; // Legacy ceiling still gets parent communication.
+    let h = createExtensionHarness(sessionFile);
+    try {
+      await h.emit("session_start");
+      await waitFor(() => server.isConnected(runId));
+      const call = await h.tools.get("message_parent").execute("question", { message: "Which branch?", waitForReply: true });
+      assert.equal(call.terminate, true);
+      const questionId = call.details.messageId;
+      await h.emit("agent_settled");
+      await waitFor(() => frames.some(f => f.type === "settled" && f.payload.pendingParentRequestId === questionId));
+      assert.equal(h.shutdownCount(), 0);
+      assert.equal(readRunCompletion(sessionFile, runId), undefined);
+      let gate = h.handlers.get("tool_call")![0];
+      assert.equal((await gate({ toolName: "read", parentToolCallId: "script/1" }, h.ctx) as any).terminate, true);
+      await assert.rejects(() => h.tools.get("subagent_done").execute("done", { status: "blocked", summary: "Question" }, undefined, undefined, h.ctx), /Waiting for a parent reply/);
+      await h.emit("session_shutdown", { reason: "reload" });
+      await waitFor(() => !server.isConnected(runId));
+      h = createExtensionHarness(sessionFile);
+      await h.emit("session_start");
+      await waitFor(() => server.isConnected(runId));
+      gate = h.handlers.get("tool_call")![0];
+      assert.equal((await gate({ toolName: "read" }, h.ctx) as any).block, true);
+      server.send(runId, "parent_message", { runId, messageId: "advice", text: "Take care" });
+      await waitFor(() => h.messages.length === 1);
+      assert.equal(h.messages[0].options.triggerTurn, false);
+      assert.equal((await gate({ toolName: "read" }, h.ctx) as any).block, true);
+      server.send(runId, "parent_message", { runId, messageId: "reply", replyTo: questionId, text: "Use main" });
+      await waitFor(() => h.messages.length === 2);
+      assert.equal(h.messages[1].options.triggerTurn, true);
+      assert.equal(await gate({ toolName: "read" }, h.ctx), undefined);
+      assert.equal(readRunCompletion(sessionFile, runId), undefined);
+      assert.equal(h.shutdownCount(), 0);
+    } finally {
+      await h.emit("session_shutdown", { reason: "reload" });
+      await server.close(); rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("child completion delivery", () => {
   it("persists once, retries until a matching acknowledgement, then shuts down", async () => {
     const dir = mkdtempSync(join(tmpdir(), "child-lifecycle-ipc-"));

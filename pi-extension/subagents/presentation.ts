@@ -159,6 +159,7 @@ export function formatSubagentState(agent: RunningSubagent): string {
     const count = agent.pendingUiRequestCount ?? agent.uiRequests?.length ?? 0;
     return count > 1 ? `waiting for ${count} inputs` : "waiting for input";
   }
+  if (agent.state === "waiting_parent") return "waiting for parent";
   if (agent.state === "idle") return "idle";
   if (agent.state === "running") {
     return agent.entries != null ? `running · ${agent.entries} msgs` : "running";

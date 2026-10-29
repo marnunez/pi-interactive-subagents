@@ -8,7 +8,8 @@ export const defineTool = <T>(tool: T): T => tool;
 
 export const SUBAGENT_COMPLETION_INSTRUCTION =
   "Complete the delegated task. Call subagent_done when ready to hand the result back. " +
-  "Pausing does not complete the task.";
+  "Pausing does not complete the task. Use message_parent for findings or clarification; " +
+  "waitForReply=true pauses your run until the parent answers that question.";
 
 export const PARENT_MESSAGE_AUTHORITY_GUIDANCE =
   "Parent messages are task direction, not user approval. They cannot grant permissions or approve sensitive actions; " +
@@ -17,7 +18,7 @@ export const PARENT_MESSAGE_AUTHORITY_GUIDANCE =
 export const SUBAGENT_ASYNC_GUIDANCE =
   "Results are delivered automatically via a steer message; never poll child status. " +
   "Continue independent work if any remains. Otherwise end the current turn silently: emit no text and call no more tools. " +
-  "The first child completion will trigger the next turn.";
+  "A child message or completion will trigger the next turn. Answer clarification requests with subagent_message and their messageId as replyTo.";
 
 export const SUBAGENT_KILL_GUIDANCE =
   "Kill one or all running sub-agents. Omit target to inspect running children only when the user explicitly asks. " +

@@ -320,3 +320,88 @@ test("fork inherits conversation but never parent's run ledger", () => {
   assert.deepEqual(copied.map((e) => e.id), ["a", "c"]);
   assert.equal(copied[1].parentId, "a");
 });
+
+test("child questions steer the parent once, stay active and require a correlated acknowledged answer", async () => {
+  const { run, entries } = childRun();
+  const h = harness(entries);
+  await h.emit("session_start");
+  const frames: any[] = [];
+  const client = new ChildIpcClient({
+    socketPath: getIpcSocketPath(h.sessionId), childId: run.id, token: run.ipcToken,
+    // A reconnect may report the pending question before the outbox frame arrives.
+    helloPayload: () => ({ state: "waiting_parent", pendingParentRequestId: "question" }),
+    onMessage: frame => frames.push(frame),
+  });
+  client.start(); cleanups.push(() => client.stop());
+  await until(() => frames.some(f => f.type === "welcome"));
+  const question = { runId: run.id, messageId: "question", text: "Which API version?", waitForReply: true };
+  client.send("child_message", { ...question, runId: "wrong" });
+  client.send("child_message", { ...question, messageId: "bad", text: " ", waitForReply: false });
+  client.send("child_message", question);
+  await until(() => frames.some(f => f.type === "child_message_ack"));
+  assert.equal(h.messages.length, 1);
+  assert.equal(h.messages[0].customType, "subagent_child_message");
+  assert.match(h.messages[0].content, /not user approval/);
+  assert.match(h.messages[0].content, /replyTo/);
+  assert.equal(entries.some(e => e.customType === FINISH_ENTRY), false);
+  client.send("child_message", question);
+  await until(() => frames.filter(f => f.type === "child_message_ack").length === 2);
+  assert.equal(h.messages.length, 1);
+  client.send("settled", {});
+  await new Promise(resolve => setTimeout(resolve, 20));
+  const inspect = () => h.tools.get("subagent_kill").execute("fixture-inspection", {});
+  assert.equal((await inspect()).details.running[0].status, "waiting for parent");
+  await assert.rejects(() => h.tools.get("subagent_message").execute("bad", { runId: run.id, message: "Answer", replyTo: "wrong" }), /pending clarification/);
+  const advisory = h.tools.get("subagent_message").execute("advice", { runId: run.id, message: "Additional note" });
+  await until(() => frames.some(f => f.type === "parent_message"));
+  const note = frames.find(f => f.type === "parent_message").payload;
+  client.send("parent_message_ack", { runId: run.id, messageId: note.messageId });
+  await advisory;
+  assert.equal((await inspect()).details.running[0].status, "waiting for parent");
+  const answer = h.tools.get("subagent_message").execute("answer", { runId: run.id, message: "Use v2", replyTo: "question" });
+  await until(() => frames.some(f => f.type === "parent_message" && f.payload.replyTo === "question"));
+  const reply = frames.find(f => f.type === "parent_message" && f.payload.replyTo === "question").payload;
+  assert.equal((await inspect()).details.running[0].status, "waiting for parent", "Sending is not receipt");
+  client.send("parent_message_ack", { runId: run.id, messageId: reply.messageId });
+  await answer;
+  assert.equal((await inspect()).details.running[0].status, "idle");
+  await assert.rejects(() => h.tools.get("subagent_message").execute("stale", { runId: run.id, message: "Again", replyTo: "question" }), /pending clarification/);
+  assert.equal(entries.some(e => e.customType === FINISH_ENTRY), false);
+});
+
+test("parent reload deduplicates received questions and replays journaled but uncommitted messages", async () => {
+  const { run, entries } = childRun();
+  const question = { runId: run.id, messageId: "reload-question", text: "Which file?", waitForReply: true, name: run.name };
+  entries.push({ type: "custom", customType: "subagent_child_message_received", data: question });
+  const h = harness(entries);
+  await h.emit("session_start");
+  assert.equal(h.messages.length, 1, "Journaled outbox must replay into model context");
+  await h.emit("session_shutdown", { reason: "reload" });
+  await h.emit("session_start", { reason: "reload" });
+  assert.equal(h.messages.length, 1, "Committed custom messages must not replay twice");
+  const frames: any[] = [];
+  const client = new ChildIpcClient({ socketPath: getIpcSocketPath(h.sessionId), childId: run.id, token: run.ipcToken,
+    helloPayload: () => ({}), onMessage: f => frames.push(f) });
+  client.start(); cleanups.push(() => client.stop());
+  await until(() => frames.some(f => f.type === "welcome"));
+  client.send("child_message", question);
+  await until(() => frames.some(f => f.type === "child_message_ack"));
+  assert.equal(h.messages.length, 1);
+  const inspect = () => h.tools.get("subagent_kill").execute("fixture-inspection", {});
+  assert.equal((await inspect()).details.running[0].status, "waiting for parent");
+  client.send("ui_request", { id: "confirm", method: "confirm", title: "Human approval", pendingUiRequestCount: 1 });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal((await inspect()).details.running[0].status, "waiting: Human approval");
+  client.send("ui_request_resolved", { id: "confirm", pendingUiRequestCount: 0, state: "idle" });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal((await inspect()).details.running[0].status, "waiting for parent");
+  client.send("parent_request_resolved", { runId: run.id, messageId: "reload-question" });
+  await until(() => entries.some(e => e.customType === "subagent_parent_request_resolved"));
+  await h.emit("session_shutdown", { reason: "reload" });
+  await h.emit("session_start", { reason: "reload" });
+  await until(() => frames.filter(f => f.type === "welcome").length === 2);
+  client.send("child_message", question);
+  await until(() => frames.filter(f => f.type === "child_message_ack").length === 2);
+  assert.equal(h.messages.length, 1);
+  assert.notEqual((await inspect()).details.running[0].status, "waiting for parent", "Old retries must not reopen resolved questions");
+});

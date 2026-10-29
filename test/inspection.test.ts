@@ -64,7 +64,7 @@ test("inspection tools are explicit child-only capabilities; spawning false stil
 test("resume preserves a reviewer's positive allowlist and fails closed on unavailable tools", () => {
   const saved = resolveChildTools({ tools: "read,subagent_search,subagent_git_inspect", spawning: false }, ["read"]);
   assert.deepEqual(restoreChildTools(saved, ["read", "bash", "subagent", "database_query"]), saved);
-  assert.deepEqual(restoreChildTools(["read"], ["read"]), ["read", "codemode", "subagent_done", "tool_search"]);
+  assert.deepEqual(restoreChildTools(["read"], ["read"]), ["read", "codemode", "subagent_done", "tool_search", "message_parent"]);
   assert.throws(() => restoreChildTools(["read", "missing_external"], ["read"]), /Unknown tool.*saved tools/);
 });
 
