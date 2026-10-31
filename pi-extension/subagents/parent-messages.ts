@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 import { Type } from "typebox";
+import { messageToolRenderers } from "./message-renderers.ts";
 
 export const CHILD_MESSAGE_SENT = "subagent_child_message_sent";
 export const CHILD_MESSAGE_RECEIVED = "subagent_child_message_received";
@@ -204,6 +205,7 @@ export class ChildParentMessages {
     const tool = {
       name: "message_parent",
       label: "Message Parent",
+      ...messageToolRenderers(true),
       exposure: "model-only",
       executionMode: "sequential" as const,
       promptGuidelines: ["Call message_parent with waitForReply=true on its own, not alongside other tools. It pauses, not completes, the run."],

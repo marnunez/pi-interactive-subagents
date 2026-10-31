@@ -23,6 +23,7 @@ import {
 } from "./session.ts";
 import { ChildIpcClient, type IpcEnvelope } from "./ipc.ts";
 import { ChildParentMessages } from "./parent-messages.ts";
+import { registerParentMessageRenderer } from "./message-renderers.ts";
 import {
   monitorExtensionUi,
   PendingExtensionUiRequests,
@@ -160,6 +161,7 @@ export function validateSubagentDoneParams(
 
 export default function (pi: ExtensionAPI) {
   registerInspectionTools(pi);
+  registerParentMessageRenderer(pi);
   let denied: string[] = [];
   let expanded = false;
   let completionSent = false;

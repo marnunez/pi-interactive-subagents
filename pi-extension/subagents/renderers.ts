@@ -2,8 +2,10 @@ import { type ExtensionAPI, keyHint } from "@earendil-works/pi-coding-agent";
 import { Box, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { type SubagentResult } from "./types.ts";
 import { formatElapsed } from "./presentation.ts";
+import { registerChildMessageRenderer } from "./message-renderers.ts";
 
 export function registerRenderers(pi: ExtensionAPI) {
+  registerChildMessageRenderer(pi);
   // ── subagent_result message renderer ──
   pi.registerMessageRenderer("subagent_result", (message, options, theme) => {
     const details = message.details as SubagentResult | undefined;

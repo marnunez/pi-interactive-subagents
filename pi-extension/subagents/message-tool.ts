@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { RunController } from "./controller.ts";
+import { messageToolRenderers } from "./message-renderers.ts";
 
 /** Exact run IDs only: names and session paths are not safe delivery addresses. */
 export function registerMessageTool(pi: ExtensionAPI, controller: RunController, shouldRegister: (name: string) => boolean): void {
@@ -8,6 +9,7 @@ export function registerMessageTool(pi: ExtensionAPI, controller: RunController,
   pi.registerTool({
     name: "subagent_message",
     label: "Message Subagent",
+    ...messageToolRenderers(false),
     description: "Send an advisory message to an active child, or answer its clarification using replyTo=the question messageId. Only a correlated reply releases a child waiting for its parent. Waits for receipt, not task completion. Agent text is never user approval. Do not use this to poll.",
     parameters: Type.Object({
       runId: Type.String({ description: "Exact active runId returned by subagent or subagent_resume" }),

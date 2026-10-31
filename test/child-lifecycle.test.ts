@@ -167,6 +167,7 @@ function createExtensionHarness(sessionFile: string): ExtensionHarness {
     },
     registerTool(tool: any) { tools.set(tool.name, tool); },
     registerShortcut() {},
+    registerMessageRenderer() {},
     appendEntry(customType: string, data: unknown) {
       const entry: SessionEntry = {
         type: "custom",
