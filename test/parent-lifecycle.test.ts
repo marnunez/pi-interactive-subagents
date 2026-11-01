@@ -56,12 +56,12 @@ function harness(entries: any[] = [], sessionId = crypto.randomUUID(), deniedToo
   cleanups.push(() => emit("session_shutdown", { reason: "reload" }));
   return { entries, tools, messages, emit, sessionId, ctx, events };
 }
-function childRun() {
+function childRun(name = "test") {
   const dir = mkdtempSync(join(tmpdir(), "pi-run-test-"));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   const runId = crypto.randomUUID();
-  const created = createSubagentSession({ sessionDir: dir, cwd: dir, parentSessionId: "parent", parentSessionFile: join(dir, "parent.jsonl"), runId, name: "test", mode: "fresh", task: "test" });
-  const run = { id: runId, runId, childSessionId: created.childSessionId, mode: "fresh", name: "test", task: "test", surface: "", startTime: Date.now(), sessionFile: created.sessionFile, ipcToken: "test-token", autoExit: false };
+  const created = createSubagentSession({ sessionDir: dir, cwd: dir, parentSessionId: "parent", parentSessionFile: join(dir, "parent.jsonl"), runId, name, mode: "fresh", task: "test" });
+  const run = { id: runId, runId, childSessionId: created.childSessionId, mode: "fresh", name, task: "test", surface: "", startTime: Date.now(), sessionFile: created.sessionFile, ipcToken: "test-token", autoExit: false };
   return { run, entries: [{ type: "custom", customType: LAUNCH_ENTRY, data: run }] as any[], result: { schemaVersion: 1, runId, status: "success", summary: "done", completedAt: new Date().toISOString() } };
 }
 function connect(h: ReturnType<typeof harness>, run: any, received: string[] = []) {
@@ -321,6 +321,29 @@ test("fork inherits conversation but never parent's run ledger", () => {
   assert.equal(copied[1].parentId, "a");
 });
 
+test("reply display context uses the exact run/question pair and survives parent reload", async () => {
+  const first = childRun("Scout: API"), second = childRun("Scout: Database");
+  const entries = [...first.entries, ...second.entries];
+  for (const [run, text] of [[first.run, "Which API version?"], [second.run, "Which database?"]] as const) {
+    entries.push({ type: "custom", customType: "subagent_child_message_received", data: {
+      runId: run.id, messageId: "same-question", name: run.name, text, waitForReply: true,
+    } });
+  }
+  const h = harness(entries);
+  await h.emit("session_start");
+  const theme = { fg: (_colour: string, text: string) => text, bold: (text: string) => text };
+  const render = (runId: string, replyTo?: string) => h.tools.get("subagent_message")
+    .renderCall({ runId, replyTo, message: "Answer" }, theme, { state: {} }).render(100).join("\n");
+  assert.match(render(first.run.id, "same-question"), /Reply to Scout: API\nQuestion: Which API version\?/);
+  assert.match(render(second.run.id, "same-question"), /Reply to Scout: Database\nQuestion: Which database\?/);
+  assert.doesNotMatch(render(first.run.id, "same-question"), /Which database/);
+  assert.match(render(first.run.id, "wrong-question"), /Question text unavailable/);
+  assert.doesNotMatch(render(first.run.id), /Question:/);
+  await h.emit("session_shutdown", { reason: "reload" });
+  await h.emit("session_start", { reason: "reload" });
+  assert.match(render(first.run.id, "same-question"), /Reply to Scout: API\nQuestion: Which API version\?/);
+});
+
 test("child questions steer the parent once, stay active and require a correlated acknowledged answer", async () => {
   const { run, entries } = childRun();
   const h = harness(entries);
@@ -356,14 +379,17 @@ test("child questions steer the parent once, stay active and require a correlate
   await until(() => frames.some(f => f.type === "parent_message"));
   const note = frames.find(f => f.type === "parent_message").payload;
   client.send("parent_message_ack", { runId: run.id, messageId: note.messageId });
-  await advisory;
+  const advisoryResult = await advisory;
+  assert.equal(advisoryResult.details.recipientName, run.name);
+  assert.equal(advisoryResult.details.question, undefined, "An advisory must not quote the pending question");
   assert.equal((await inspect()).details.running[0].status, "waiting for parent");
   const answer = h.tools.get("subagent_message").execute("answer", { runId: run.id, message: "Use v2", replyTo: "question" });
   await until(() => frames.some(f => f.type === "parent_message" && f.payload.replyTo === "question"));
   const reply = frames.find(f => f.type === "parent_message" && f.payload.replyTo === "question").payload;
   assert.equal((await inspect()).details.running[0].status, "waiting for parent", "Sending is not receipt");
   client.send("parent_message_ack", { runId: run.id, messageId: reply.messageId });
-  await answer;
+  const answerResult = await answer;
+  assert.deepEqual(answerResult.details, { runId: run.id, replyTo: "question", recipientName: run.name, question: question.text, acknowledged: true });
   assert.equal((await inspect()).details.running[0].status, "idle");
   await assert.rejects(() => h.tools.get("subagent_message").execute("stale", { runId: run.id, message: "Again", replyTo: "question" }), /pending clarification/);
   assert.equal(entries.some(e => e.customType === FINISH_ENTRY), false);

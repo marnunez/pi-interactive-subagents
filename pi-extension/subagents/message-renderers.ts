@@ -1,6 +1,7 @@
 import { getMarkdownTheme, keyHint, type ExtensionAPI, type Theme, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Markdown, Text, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { renderSubagentCard } from "./card.ts";
+import type { SubagentMessageContext } from "./types.ts";
 
 /** Keep routing and authority instructions in model context, not the default UI. */
 function messageCard(message: any, options: { expanded: boolean; outputPad?: number }, theme: Theme, fromChild: boolean) {
@@ -42,31 +43,70 @@ export function registerParentMessageRenderer(pi: ExtensionAPI): void {
 }
 
 /** Shared presentation for both directions; delivery/pausing semantics stay in the tools. */
-export function messageToolRenderers(toParent: boolean): Pick<ToolDefinition, "renderCall" | "renderResult"> {
+export function messageToolRenderers(
+  toParent: boolean,
+  resolveTarget?: (runId: string, replyTo?: string) => SubagentMessageContext,
+): Pick<ToolDefinition, "renderCall" | "renderResult"> {
   return {
     renderCall(rawArgs, theme, context) {
       const args = rawArgs as { message?: string; waitForReply?: boolean; replyTo?: string; runId?: string };
-      const title = toParent ? args.waitForReply ? "Ask parent" : "Update parent"
-        : args.replyTo ? "Reply to subagent" : "Message subagent";
+      const state = context?.state as { messageTarget?: SubagentMessageContext } | undefined;
       return {
         invalidate() {},
         render(width: number): string[] {
           if (width <= 0) return [];
+          const matches = (target?: SubagentMessageContext) => target && target.runId === args.runId && target.replyTo === args.replyTo ? target : undefined;
+          const live = !toParent && args.runId ? matches(resolveTarget?.(args.runId, args.replyTo)) : undefined;
+          const saved = matches(state?.messageTarget);
+          const recipientName = live?.recipientName ?? saved?.recipientName;
+          const question = live?.question ?? saved?.question;
+          const recipient = recipientName?.replace(/\s+/g, " ").trim()
+            || (args.runId ? `subagent ${args.runId.slice(0, 8)}` : "subagent");
+          const title = toParent ? args.waitForReply ? "Ask parent" : "Update parent"
+            : `${args.replyTo ? "Reply to" : "Message"} ${recipient}`;
           const heading = "▸ " + theme.fg("toolTitle", theme.bold(title));
           const message = typeof args.message === "string" ? args.message : "";
+          if (state && args.runId && (recipientName || question)) {
+            state.messageTarget = { runId: args.runId, replyTo: args.replyTo, recipientName, question };
+          }
           if (context?.expanded) {
-            const lines = [heading, message];
+            const lines = [heading];
+            if (!toParent && args.replyTo) lines.push(theme.fg("muted", "Question: ") + (question ?? "Question text unavailable"));
+            lines.push(toParent ? message : theme.fg("muted", args.replyTo ? "Reply: " : "Message: ") + theme.fg("toolOutput", message));
             if (args.runId) lines.push(theme.fg("dim", `Run: ${args.runId}`));
             if (args.replyTo) lines.push(theme.fg("dim", `Reply to: ${args.replyTo}`));
             return new Text(lines.join("\n"), 0, 0).render(width);
           }
-          const preview = message.replace(/\s+/g, " ").trim();
-          return [truncateToWidth(`${heading}${preview ? ` — ${theme.fg("dim", preview)}` : ""}`, width)];
+          if (toParent) {
+            const preview = message.replace(/\s+/g, " ").trim();
+            return [truncateToWidth(`${heading}${preview ? ` — ${theme.fg("dim", preview)}` : ""}`, width)];
+          }
+          const lines = [truncateToWidth(heading, width)];
+          if (args.replyTo) {
+            const quote = question?.replace(/\s+/g, " ").trim() || "Question text unavailable";
+            lines.push(truncateToWidth(theme.fg("muted", "Question: ") + theme.fg("dim", quote), width));
+          }
+          const body = wrapTextWithAnsi(theme.fg("muted", args.replyTo ? "Reply: " : "Message: ") + theme.fg("toolOutput", message), width);
+          lines.push(...body.slice(0, 3));
+          if (body.length > 3) lines[lines.length - 1] = truncateToWidth(lines.at(-1)!, width - 1, "") + theme.fg("muted", "…");
+          return lines;
         },
       };
     },
     renderResult(result, options, theme, context) {
-      const details = result.details as { acknowledged?: boolean; waitingForReply?: boolean } | undefined;
+      const details = result.details as (Partial<SubagentMessageContext> & { acknowledged?: boolean; waitingForReply?: boolean }) | undefined;
+      // Pi calls both render hooks before drawing. Shared per-call state lets the
+      // heading recover persisted names/questions even after the child has exited.
+      if (!toParent && context?.state && typeof details?.runId === "string") {
+        const previous = context.state.messageTarget as SubagentMessageContext | undefined;
+        const sameTarget = previous?.runId === details.runId && previous?.replyTo === details.replyTo;
+        context.state.messageTarget = {
+          runId: details.runId,
+          replyTo: details.replyTo,
+          recipientName: typeof details.recipientName === "string" ? details.recipientName : sameTarget ? previous?.recipientName : undefined,
+          question: typeof details.question === "string" ? details.question : sameTarget ? previous?.question : undefined,
+        };
+      }
       const raw = result.content.filter(part => part.type === "text").map(part => part.text).join("\n");
       const failed = context?.isError || (result as { isError?: boolean }).isError || details?.acknowledged === false;
       if (options.isPartial && !failed) return new Text(theme.fg("dim", "Sending…"), 0, 0);

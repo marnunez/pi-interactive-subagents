@@ -10,6 +10,7 @@ import childExtension from '../pi-extension/subagents/subagent-done.ts';
 import { childLaunchSpec } from '../pi-extension/subagents/launch.ts';
 import { createRunRuntime } from '../pi-extension/subagents/runtime.ts';
 import { ParentIpcServer } from '../pi-extension/subagents/ipc.ts';
+import { messageToolRenderers } from '../pi-extension/subagents/message-renderers.ts';
 
 const sdkPath = process.env.PI_V1_SDK_PATH;
 if (!sdkPath) throw new Error('Set PI_V1_SDK_PATH to Pi v1 dist/index.js.');
@@ -30,6 +31,24 @@ process.env.PI_SUBAGENT_ID = 'offline-child';
 const names = context => ai.getCurrentTools(context.messages).map(tool => tool.name);
 const toolCall = (name, args) => ai.fauxAssistantMessage(ai.fauxToolCall(name, args), {stopReason:'toolUse'});
 try {
+  // Exercise Pi's real call/result rendering order, including a history replay
+  // where no live child/controller exists to resolve the recipient or question.
+  sdk.initTheme('dark', false);
+  const { ToolExecutionComponent } = await import(new URL('./modes/interactive/components/tool-execution.js', pathToFileURL(sdkPath)).href);
+  const replayArgs = { runId:'historical-run', replyTo:'historical-question', message:'Use Compact.' };
+  const card = new ToolExecutionComponent('subagent_message','replay',replayArgs,{showImages:false},
+    messageToolRenderers(false),{requestRender() {}},root);
+  card.updateResult({isError:false,content:[{type:'text',text:'Receipt confirmed.'}],details:{
+    ...replayArgs,recipientName:'Display demo',question:'Which label should I use?',acknowledged:true,
+  }},false);
+  const rendered = () => card.render(120).map(line=>line.replace(/\x1b\[[0-9;]*m/g,'').trimEnd()).join('\n');
+  assert.match(rendered(),/Reply to Display demo/);
+  assert.match(rendered(),/Question: Which label should I use\?/);
+  assert.match(rendered(),/Reply: Use Compact\./);
+  card.setExpanded(true);
+  assert.match(rendered(),/Run: historical-run/);
+  assert.match(rendered(),/Reply to: historical-question/);
+
   const runtime = await sdk.ModelRuntime.create({ authPath:join(agentDir,'auth.json'), modelsPath:null, modelsStorePath:join(agentDir,'models.json'), refreshOnCreate:false });
   const faux = ai.fauxProvider(); runtime.registerNativeProvider(faux.provider);
   const settings = sdk.SettingsManager.inMemory({ retry:{enabled:false} });
@@ -175,7 +194,7 @@ try {
     await parent.close();
   }
   assert.deepEqual(errors,[], 'Extension hooks must not fail silently');
-  console.log('Pi v1: native discovery/permissions and clarification pause/advisory/reload/reply passed (offline).');
+  console.log('Pi v1: reply-card history replay, native discovery/permissions and clarification pause/advisory/reload/reply passed (offline).');
 } finally {
   session?.dispose();
   for (const [key,value] of savedEnv) { if (value===undefined) delete process.env[key]; else process.env[key]=value; }

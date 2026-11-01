@@ -5,6 +5,14 @@ import { type SubagentDoneResult, type SubagentSessionMode } from "./session.ts"
 
 export type SubagentProtocolStatus = "completed" | "failed" | "cancelled";
 
+/** Persisted display context for a parent message, correlated by exact IDs. */
+export interface SubagentMessageContext {
+  runId: string;
+  replyTo?: string;
+  recipientName?: string;
+  question?: string;
+}
+
 export interface SubagentResult {
   /** Parent-side orchestration id; omitted from older persisted results. */
   id?: string;

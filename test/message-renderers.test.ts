@@ -79,8 +79,8 @@ test("messaging tool calls are compact, expandable, and tolerate partial argumen
     const args = { message: "First line\nSecond line", runId: "private-run-id", waitForReply: true, replyTo: "private-message-id" };
     const compact = renderer.renderCall!(args, theme, { expanded: false } as any).render(45).join("\n");
     assert.match(compact, toParent ? /Ask parent/ : /Reply to subagent/);
-    assert.doesNotMatch(compact, /private-/);
-    assert.equal(compact.split("\n").length, 1);
+    assert.doesNotMatch(compact, /private-run-id|private-message-id/);
+    assert.ok(compact.split("\n").length <= (toParent ? 1 : 5));
     assert.match(renderer.renderCall!(args, theme, { expanded: true } as any).render(80).map(line => line.trimEnd()).join("\n"), /First line\nSecond line/);
     assert.doesNotThrow(() => renderer.renderCall!({}, theme, {} as any).render(10));
   }

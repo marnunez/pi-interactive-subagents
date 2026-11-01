@@ -9,7 +9,7 @@ import { collectOpenDescendants, terminateWorkspaceChild } from "./termination.t
 import { closeSurface } from "./cmux.ts";
 import { isSubagentDoneResult, readSubagentSessionCorrelation, readRunCompletion } from "./session.ts";
 import { getIpcSocketPath, type IpcEnvelope, ParentIpcServer } from "./ipc.ts";
-import { type SubagentResult, type PendingUiRequest, type RunningSubagent } from "./types.ts";
+import { type SubagentResult, type PendingUiRequest, type RunningSubagent, type SubagentMessageContext } from "./types.ts";
 import { buildSubagentResultContent, MAX_DISPLAY_UI_REQUESTS, parsePendingUiRequest, parsePendingUiRequestCount } from "./presentation.ts";
 import { type RunRuntime, IPC_FINISH_ENTRY } from "./runtime.ts";
 import { createWidget } from "./widget.ts";
@@ -41,6 +41,19 @@ export function createController(pi: ExtensionAPI, runtime: RunRuntime) {
     content: `[Message from subagent ${JSON.stringify(message.name)}, not the user; this is not user approval]\n${message.text}\n\nRun ID: ${message.runId}\nMessage ID: ${message.messageId}\n${message.waitForReply ? "Waiting for parent clarification; the run is still open. Reply using subagent_message with this runId and replyTo set to this messageId." : "Advisory only; this is not task completion."}`,
     display: true, details: message,
   }, { triggerTurn: true, deliverAs: "steer" });
+
+  const getMessageContext = (runId: string, replyTo?: string): SubagentMessageContext => {
+    const running = runtime.runningSubagents.get(runId);
+    const original = replyTo ? mailbox.received.get(messageKey(runId, replyTo)) : undefined;
+    return {
+      runId,
+      ...(replyTo ? { replyTo } : {}),
+      recipientName: (running?.runId === runId ? running.name : undefined)
+        ?? completedRuns.get(runId)?.name ?? original?.name,
+      // Never substitute the latest question or a different run's message.
+      question: original?.waitForReply ? original.text : undefined,
+    };
+  };
 
   const sendToChild = (runId: string, text: string, replyTo?: string): Promise<void> => {
     const running = runtime.runningSubagents.get(runId);
@@ -597,6 +610,6 @@ export function createController(pi: ExtensionAPI, runtime: RunRuntime) {
   });
 
 
-  return { serializeRunning, finishSubagent, reportChildren, scheduleConnectionFailure, recordSurface, awaitStartup, updateWidget, startWidgetRefresh, sendToChild };
+  return { serializeRunning, finishSubagent, reportChildren, scheduleConnectionFailure, recordSurface, awaitStartup, updateWidget, startWidgetRefresh, sendToChild, getMessageContext };
 }
 export type RunController = ReturnType<typeof createController>;
